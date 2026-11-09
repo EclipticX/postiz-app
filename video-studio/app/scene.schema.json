@@ -1,0 +1,38 @@
+{
+  "type": "object",
+  "properties": {
+    "scenes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "scene_id": {"type": "string"},
+          "characters": {"type": "array", "items": {"type": "string"}},
+          "place": {"type": "string"},
+          "items": {"type": "array", "items": {"type": "string"}},
+          "action": {"type": "string"},
+          "camera": {"type": "string"},
+          "dialogue": {"type": "string"},
+          "dialogue_lines": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "speaker_id": {"type": "string"},
+                "text": {"type": "string"},
+                "voice_style_id": {"type": "string"}
+              },
+              "required": ["speaker_id", "text"],
+              "additionalProperties": false
+            }
+          },
+          "duration": {"type": "integer", "enum": [4, 5]}
+        },
+        "required": ["scene_id", "characters", "place", "action", "camera", "dialogue", "duration"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["scenes"],
+  "additionalProperties": false
+}

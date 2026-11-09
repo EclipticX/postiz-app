@@ -1,0 +1,65 @@
+{
+  "id": "kids_3d",
+  "name": "Kids 3D Shorts",
+  "description": "Warm, original animated micro-stories about small discoveries and acts of kindness.",
+  "style_guide": "Use a soft toy-like 3D look, rounded shapes, matte clay materials, pastel colors, warm daylight, and gentle shadows. Keep one readable action per shot and frame the main subject near the center of the vertical composition. Use steady camera movement and leave the lower part of the frame clear for subtitles.",
+  "audience_rules": [
+    "Use short, concrete dialogue and calm, expressive movement suitable for a young audience.",
+    "Keep the stories gentle and avoid frightening imagery, sudden flashes, unsafe imitation, or requests for personal information.",
+    "Show the character solving small problems through curiosity, care, or cooperation."
+  ],
+  "brand_rules": [
+    "Keep asset colors, shapes, and relative proportions consistent with their reference guides across scenes.",
+    "Use original characters and props without logos, watermarks, or names from existing franchises.",
+    "Leave all on-screen text to the subtitle and final render stages."
+  ],
+  "sample_prompt": "Create a short about Tavi noticing a thirsty flower and giving it a gentle drink. Open with a clear visual hook and end on a small moment of delight.",
+  "few_shot": [
+    {
+      "prompt": "Tavi spots a drooping flower in Pebble Garden.",
+      "scenes": [
+        {
+          "scene_id": "scene_01",
+          "characters": ["tavi_seed_sprite"],
+          "place": "pebble_garden",
+          "action": "Tavi sees the drooping flower, tilts their head, and reaches for the blue watering can.",
+          "camera": "Vertical medium shot with a slow push toward Tavi and the flower.",
+          "dialogue": "You look thirsty!",
+          "duration": 4
+        },
+        {
+          "scene_id": "scene_02",
+          "characters": ["tavi_seed_sprite"],
+          "place": "pebble_garden",
+          "action": "Tavi gently waters the soil. The flower perks up and Tavi smiles.",
+          "camera": "Steady vertical close-up of Tavi, the blue watering can, and the flower.",
+          "dialogue": "There you go!",
+          "duration": 4
+        }
+      ]
+    }
+  ],
+  "assets": [
+    {
+      "id": "tavi_seed_sprite",
+      "kind": "character",
+      "name": "Tavi the Seed Sprite",
+      "description": "A small seed sprite with a pear-shaped mint body, two green leaves on top, dark oval eyes, two peach cheeks, and short mint arms and feet. Tavi wears no clothes or accessories.",
+      "reference_image": "niches/kids_3d/references/tavi_seed_sprite.svg"
+    },
+    {
+      "id": "pebble_garden",
+      "kind": "place",
+      "name": "Pebble Garden",
+      "description": "A sunny garden with mint grass, a cream path curving toward two round green shrubs, and a single terracotta pot with a yellow flower beside the foreground path.",
+      "reference_image": "niches/kids_3d/references/pebble_garden.svg"
+    },
+    {
+      "id": "blue_watering_can",
+      "kind": "item",
+      "name": "Blue Watering Can",
+      "description": "A small rounded sky-blue watering can with a round teal handle, a short rising spout, and a white round sprinkler head. Its side is plain and unmarked.",
+      "reference_image": "niches/kids_3d/references/blue_watering_can.svg"
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+services:
+  studio:
+    build: .
+    ports:
+      - "127.0.0.1:${STUDIO_PORT:-8090}:8090"
+    environment:
+      STUDIO_POSTIZ_URL: "${STUDIO_POSTIZ_URL:-http://host.docker.internal:4007}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - studio-data:/studio/data
+
+volumes:
+  studio-data:

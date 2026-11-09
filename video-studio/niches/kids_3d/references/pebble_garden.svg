@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="360" height="360" viewBox="0 0 360 360" role="img" aria-labelledby="title description">
+  <title id="title">Pebble Garden</title>
+  <desc id="description">Original vector reference guide. A cream path winds across mint grass to two rounded shrubs. A yellow flower sits in a terracotta pot by the path.</desc>
+  <defs>
+    <linearGradient id="grass" x2="0" y2="100%">
+      <stop offset="0" stop-color="#c1e8c5"/>
+      <stop offset="1" stop-color="#8dc7a0"/>
+    </linearGradient>
+  </defs>
+  <rect width="360" height="360" fill="#dbeef5"/>
+  <circle cx="285" cy="68" r="31" fill="#ffeab0"/>
+  <path d="M0 162Q80 130 149 150Q231 172 360 137V360H0Z" fill="url(#grass)"/>
+  <path d="M111 360C105 309 235 270 220 223C210 190 140 181 164 151L188 150C170 179 233 187 253 221C293 287 175 317 198 360Z" fill="#f7e8c8"/>
+  <ellipse cx="119" cy="178" rx="50" ry="11" fill="#7eb995"/>
+  <ellipse cx="250" cy="174" rx="45" ry="10" fill="#7eb995"/>
+  <circle cx="119" cy="150" r="35" fill="#65a67a"/>
+  <circle cx="246" cy="144" r="32" fill="#76af75"/>
+  <circle cx="109" cy="139" r="15" fill="#80b78c"/>
+  <circle cx="237" cy="132" r="13" fill="#90c28a"/>
+  <ellipse cx="68" cy="297" rx="39" ry="9" fill="#7db491"/>
+  <path d="M46 262H91L84 295H53Z" fill="#c97556"/>
+  <ellipse cx="68" cy="262" rx="24" ry="6" fill="#a65e46"/>
+  <path d="M68 259Q66 239 75 218" fill="none" stroke="#4c8957" stroke-width="4"/>
+  <path d="M69 245Q56 230 48 237Q51 248 69 248Z" fill="#5d9b66"/>
+  <path d="M69 247Q78 231 90 233Q88 245 69 249Z" fill="#5d9b66"/>
+  <circle cx="75" cy="216" r="15" fill="#ffdb76"/>
+  <circle cx="75" cy="216" r="6" fill="#e9a54f"/>
+</svg>

@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="360" height="360" viewBox="0 0 360 360" role="img" aria-labelledby="title description">
+  <title id="title">Tavi the Seed Sprite</title>
+  <desc id="description">Original vector reference guide. A pear-shaped mint sprite has two green leaves, peach cheeks, and stubby feet.</desc>
+  <defs>
+    <radialGradient id="body" cx="35%" cy="25%" r="75%">
+      <stop offset="0" stop-color="#c7f1d9"/>
+      <stop offset="1" stop-color="#69ba96"/>
+    </radialGradient>
+  </defs>
+  <rect width="360" height="360" rx="24" fill="#f0f7ed"/>
+  <ellipse cx="181" cy="283" rx="98" ry="15" fill="#d4e5d9"/>
+  <path d="M181 120C161 105 150 81 154 58C176 61 190 77 188 100C195 80 213 72 235 76C232 100 210 116 181 120Z" fill="#468858"/>
+  <ellipse cx="115" cy="211" rx="24" ry="17" fill="#75bc9b" transform="rotate(-27 115 211)"/>
+  <ellipse cx="245" cy="211" rx="24" ry="17" fill="#75bc9b" transform="rotate(27 245 211)"/>
+  <ellipse cx="144" cy="266" rx="24" ry="16" fill="#76bd9a"/>
+  <ellipse cx="217" cy="266" rx="24" ry="16" fill="#76bd9a"/>
+  <path d="M180 113C225 113 255 161 257 215C260 251 226 270 180 270C134 270 101 251 104 215C106 161 135 113 180 113Z" fill="url(#body)"/>
+  <ellipse cx="151" cy="189" rx="6" ry="10" fill="#253c36"/>
+  <ellipse cx="209" cy="189" rx="6" ry="10" fill="#253c36"/>
+  <ellipse cx="134" cy="207" rx="12" ry="7" fill="#f2a887"/>
+  <ellipse cx="225" cy="207" rx="12" ry="7" fill="#f2a887"/>
+  <path d="M172 207Q180 217 188 207" fill="none" stroke="#253c36" stroke-width="3" stroke-linecap="round"/>
+</svg>
