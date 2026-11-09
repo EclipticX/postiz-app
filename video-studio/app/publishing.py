@@ -40,7 +40,8 @@ class StudioPublishing:
             )
             return [dict(row, metrics=json.loads(row["metrics_json"])) for row in rows]
 
-    def approve(self, job_id, channel_id, title, caption, hashtags, local_time, timezone_name, draft):
+    def approve(self, job_id, channel_id, title, caption, hashtags, local_time, timezone_name, draft, *,
+                expected_preview_path=None):
         channel = next((channel for channel in self.channels() if channel["id"] == channel_id), None)
         if channel is None:
             raise ValueError("Select a connected Postiz channel.")
@@ -61,7 +62,10 @@ class StudioPublishing:
                 raise ValueError("Choose a future publication time.")
 
         tags = [tag.strip().lstrip("#") for tag in hashtags.replace(",", " ").split()]
-        return self.posts.queue(job_id, channel, title, caption, [tag for tag in tags if tag], scheduled, draft)
+        return self.posts.queue(
+            job_id, channel, title, caption, [tag for tag in tags if tag], scheduled, draft,
+            expected_preview_path=expected_preview_path,
+        )
 
     def process(self, now):
         try:
@@ -82,8 +86,10 @@ class StudioPublishing:
                 self.posts.defer_analytics(request["id"], now)
 
     def _send(self, client, request, now):
-        if not request["draft"] and datetime.fromisoformat(request["scheduled_at"]) <= now:
-            self.posts.fail(request["id"], "The approved publication time passed before Postiz handoff.", False)
+        deadline = None if request["draft"] else datetime.fromisoformat(request["scheduled_at"])
+        expired_message = "The approved publication time passed before Postiz handoff."
+        if deadline is not None and deadline <= max(now, datetime.now(timezone.utc)):
+            self.posts.fail(request["id"], expired_message)
             return
         root = self.media_root.resolve()
         preview = (root / request["preview_path"]).resolve()
@@ -93,6 +99,9 @@ class StudioPublishing:
         channel = {"id": request["channel_id"], "identifier": request["identifier"], "name": request["channel_name"]}
         try:
             media = client.upload(preview)
+            if deadline is not None and deadline <= max(now, datetime.now(timezone.utc)):
+                self.posts.fail(request["id"], expired_message)
+                return
             post_id = client.create_post(
                 channel, media, request["title"], request["caption"], request["hashtags"],
                 request["scheduled_at"], draft=bool(request["draft"]),

@@ -39,7 +39,8 @@ class PublishingStore:
     def __init__(self, store):
         self.store = store
 
-    def queue(self, job_id, channel, title, caption, hashtags, scheduled_at, draft=False):
+    def queue(self, job_id, channel, title, caption, hashtags, scheduled_at, draft=False, *,
+              expected_preview_path=None):
         if not isinstance(channel, dict):
             raise ValueError("Choose a connected Postiz channel.")
         channel_id, identifier = channel.get("id"), channel.get("identifier")
@@ -64,11 +65,16 @@ class PublishingStore:
             job = db.execute("SELECT status, preview_path FROM jobs WHERE id = ?", (job_id,)).fetchone()
             if job is None:
                 raise LookupError("Video job not found.")
+            preview_path = job["preview_path"]
+            if expected_preview_path is not None and (
+                not expected_preview_path or expected_preview_path != preview_path
+            ):
+                raise ValueError("The video preview changed. Reload the workspace and review it before approving.")
             existing = db.execute(
                 "SELECT * FROM publishing_requests WHERE job_id = ? AND channel_id = ?",
                 (job_id, channel_id),
             ).fetchone()
-            if existing is not None:
+            if existing is not None and (existing["status"] != "failed" or existing["post_id"] is not None):
                 if (
                     existing["title"] != title or existing["caption"] != caption
                     or existing["hashtags_json"] != hashtags_json
@@ -76,8 +82,22 @@ class PublishingStore:
                 ):
                     raise ValueError("This video already has a publishing request for this channel.")
                 return existing["id"]
-            if job["status"] not in PUBLISHABLE or not job["preview_path"]:
+            if job["status"] not in PUBLISHABLE or not preview_path:
                 raise ValueError("Wait for the final video preview before approving publishing.")
+            if existing is not None:
+                db.execute(
+                    """
+                    UPDATE publishing_requests
+                    SET identifier = ?, channel_name = ?, preview_path = ?, title = ?, caption = ?,
+                        hashtags_json = ?, scheduled_at = ?, draft = ?, status = 'queued', error = NULL
+                    WHERE id = ?
+                    """,
+                    (
+                        identifier, channel_name, preview_path, title, caption, hashtags_json,
+                        scheduled_at, draft, existing["id"],
+                    ),
+                )
+                return existing["id"]
             return db.execute(
                 """
                 INSERT INTO publishing_requests (
@@ -86,7 +106,7 @@ class PublishingStore:
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    job_id, channel_id, identifier, channel_name, job["preview_path"], title,
+                    job_id, channel_id, identifier, channel_name, preview_path, title,
                     caption, hashtags_json, scheduled_at, draft,
                 ),
             ).lastrowid

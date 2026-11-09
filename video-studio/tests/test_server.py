@@ -5,12 +5,47 @@ import unittest
 from datetime import datetime, timezone
 from http.client import HTTPConnection
 from pathlib import Path
+from unittest.mock import Mock, patch
 from urllib.parse import urlencode
 
 from app.db import StudioStore
 from app.niche import load_profile
-from app.server import StudioServer
+from app.server import StudioServer, run_schedule_clock
 from test_asset_library import REQUIRES_FFMPEG, png, wav
+
+
+class StudioScheduleClockTests(unittest.TestCase):
+    def test_later_stages_and_next_tick_run_after_one_stage_fails(self):
+        server = Mock()
+        stopped = Mock()
+        stopped.is_set.side_effect = [False, False, True]
+        server.production.advance.side_effect = [TypeError("Unexpected production response"), None]
+
+        with self.assertLogs(level="ERROR") as logs:
+            run_schedule_clock(server, stopped)
+
+        self.assertEqual(server.production.advance.call_count, 2)
+        self.assertEqual(server.publishing.process.call_count, 2)
+        self.assertEqual(stopped.wait.call_count, 2)
+        self.assertIn("media production", logs.output[0])
+
+    def test_publishing_uses_the_time_after_production(self):
+        server = Mock()
+        stopped = Mock()
+        stopped.is_set.side_effect = [False, True]
+        before = datetime(2026, 11, 9, 3, 0, tzinfo=timezone.utc)
+        after = datetime(2026, 11, 9, 3, 1, tzinfo=timezone.utc)
+        with patch("app.server.datetime") as clock:
+            clock.now.return_value = before
+
+            def advance(now):
+                self.assertEqual(now, before)
+                clock.now.return_value = after
+
+            server.production.advance.side_effect = advance
+            run_schedule_clock(server, stopped)
+
+        server.publishing.process.assert_called_once_with(after)
 
 
 class StudioHTTPTest(unittest.TestCase):
@@ -123,6 +158,32 @@ class StudioHTTPTest(unittest.TestCase):
         )
         self.assertIn("Load connected Postiz channels", self.request("GET", f"/workspace?job={job_id}")[1])
         self.assertEqual(self.request("GET", f"/media/{job_id}/.env")[0], 404)
+
+    def test_publishing_approval_rejects_a_stale_preview_form(self):
+        idea = self.store.add_idea("A garden tale")
+        self.store.decide_idea(idea, "accept")
+        job_id = self.store.list_jobs()[0]["id"]
+        original = f"{job_id}/preview.mp4"
+        replacement = f"{job_id}/preview.revised.mp4"
+        with self.store._connection(write=True) as db:
+            db.execute("UPDATE jobs SET status = 'preview_ready', preview_path = ? WHERE id = ?", (original, job_id))
+
+        channels = [{"id": "youtube", "identifier": "youtube", "name": "YouTube"}]
+        with patch("app.publishing.StudioPublishing.channels", return_value=channels):
+            _, html = self.request("GET", f"/workspace?job={job_id}&channels=1")
+            reviewed = re.search(r'name="preview_path" value="([^"]+)"', html).group(1)
+            self.assertEqual(reviewed, original)
+            with self.store._connection(write=True) as db:
+                db.execute("UPDATE jobs SET preview_path = ? WHERE id = ?", (replacement, job_id))
+
+            fields = {"channel": "youtube", "mode": "draft", "title": "A garden tale"}
+            path = f"/workspace/{job_id}/publish"
+            self.assertEqual(self.post(path, preview_path=reviewed, **fields), 400)
+            self.assertEqual(self.post(path, **fields), 400)
+            self.assertEqual(self.post(path, preview_path=replacement, **fields), 303)
+        with self.store._connection() as db:
+            previews = db.execute("SELECT preview_path FROM publishing_requests").fetchall()
+        self.assertEqual([row["preview_path"] for row in previews], [replacement])
 
     @REQUIRES_FFMPEG
     def test_asset_upload_and_per_video_options_through_http(self):

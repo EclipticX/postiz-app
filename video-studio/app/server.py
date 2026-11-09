@@ -7,7 +7,6 @@ import mimetypes
 import os
 import re
 import secrets
-import sqlite3
 import threading
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -188,7 +187,12 @@ class StudioHandler(BaseHTTPRequestHandler):
             self.send_error(HTTPStatus.NOT_FOUND)
             return
 
-        with path.open("rb") as media:
+        try:
+            media_file = path.open("rb")
+        except FileNotFoundError:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        with media_file as media:
             size = os.fstat(media.fileno()).st_size
             header = media.read(12)
             content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
@@ -392,6 +396,7 @@ class StudioHandler(BaseHTTPRequestHandler):
                     self.server.publishing.approve(
                         job_id, field("channel"), field("title").strip(), field("caption").strip(),
                         field("hashtags"), field("scheduled_at"), field("timezone"), mode == "draft",
+                        expected_preview_path=field("preview_path"),
                     )
                 else:
                     self.server.production.revise(job_id, field("feedback"))
@@ -423,17 +428,20 @@ class StudioHandler(BaseHTTPRequestHandler):
 
 
 def run_schedule_clock(server, stopped):
+    stages = (
+        ("prompt schedule", server.store.dispatch_due),
+        ("idea schedule", server.planning.dispatch_idea_schedule),
+        ("idea generation", server.planning.process_ideas),
+        ("scene planning", server.planning.process_plan),
+        ("media production", server.production.advance),
+        ("publishing", server.publishing.process),
+    )
     while not stopped.is_set():
-        try:
-            now = datetime.now(timezone.utc)
-            server.store.dispatch_due(now)
-            server.planning.dispatch_idea_schedule(now)
-            server.planning.process_ideas(now)
-            server.planning.process_plan(now)
-            server.production.advance(now)
-            server.publishing.process(now)
-        except sqlite3.Error:
-            logging.exception("Studio queue processing failed")
+        for name, process in stages:
+            try:
+                process(datetime.now(timezone.utc))
+            except Exception:
+                logging.exception("Studio queue stage failed: %s", name)
         stopped.wait(15)
 
 

@@ -42,7 +42,7 @@ class EvoLinkAdapter:
             code = error.get('code') if isinstance(error, dict) else None
             raise ProviderError(
                 'EvoLink reported that generation failed.', terminal=True,
-                retryable=code in _RETRYABLE_TASK_ERRORS,
+                retryable=isinstance(code, str) and code in _RETRYABLE_TASK_ERRORS,
             )
         if status != 'completed':
             raise ProviderError('EvoLink returned an unknown task status.')

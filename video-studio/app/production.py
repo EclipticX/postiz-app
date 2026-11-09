@@ -1,9 +1,13 @@
 """Run approved scene plans through keyframes, clips, and local rendering."""
 
 import json
+import logging
+import re
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
+from uuid import uuid4
 
 from app.media_routes import adapter_for, download_artifact, eligible_routes, estimated_micros, local_image
 from app.media_store import MediaStore
@@ -39,6 +43,7 @@ class StudioProduction:
         self.planner = planner
         self.library = planner.library
         self.root = store.path.parent / "media"
+        self._qa_round = deque()
 
     def recover_interrupted(self):
         self.media.recover_interrupted()
@@ -254,9 +259,12 @@ class StudioProduction:
         self.settings.settle(task["reservation_id"])
         self.media.complete(task["id"], path.as_posix())
 
-    def _take_job(self, status, running):
+    def _take_job(self, status, running, *, job_id=None):
         with self.store._connection(write=True) as db:
-            job = db.execute("SELECT * FROM jobs WHERE status = ? ORDER BY id LIMIT 1", (status,)).fetchone()
+            job = db.execute(
+                "SELECT * FROM jobs WHERE status = ? AND (? IS NULL OR id = ?) ORDER BY id LIMIT 1",
+                (status, job_id, job_id),
+            ).fetchone()
             if job:
                 db.execute("UPDATE jobs SET status = ? WHERE id = ?", (running, job["id"]))
             return job
@@ -275,7 +283,7 @@ class StudioProduction:
             if lines:
                 paths = [self.root / line["local_path"] for line in lines]
                 voices[scene["scene_id"]] = paths if scene.get("dialogue_lines") else paths[0]
-        preview = Path(str(job["id"])) / "preview.mp4"
+        preview = Path(str(job["id"])) / f"preview.{uuid4().hex}.mp4"
         music = self.store.path.parent / "music.mp3"
         try:
             presets = self._job_profile(job).get("render_presets", {})
@@ -296,9 +304,24 @@ class StudioProduction:
                 "UPDATE jobs SET status = 'qa_pending', preview_path = ?, stage_error = NULL WHERE id = ?",
                 (preview.as_posix(), job["id"]),
             )
+        for previous in (self.root / preview.parent).glob("preview.*"):
+            if previous.stem != preview.stem and re.fullmatch(r"preview(?:\.[0-9a-f]{32})?\.(?:mp4|srt)", previous.name):
+                try:
+                    previous.unlink(missing_ok=True)
+                except OSError:
+                    logging.warning("Could not remove superseded preview file %s", previous)
 
     def _review(self, now):
-        job = self._take_job("qa_pending", "qa_running")
+        # Give each pending job one turn before retrying jobs blocked by budget or settings.
+        if not self._qa_round:
+            with self.store._connection() as db:
+                self._qa_round.extend(
+                    row["id"] for row in db.execute("SELECT id FROM jobs WHERE status = 'qa_pending' ORDER BY id")
+                )
+        if not self._qa_round:
+            return
+
+        job = self._take_job("qa_pending", "qa_running", job_id=self._qa_round.popleft())
         if job is None:
             return
         try:

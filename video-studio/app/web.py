@@ -212,6 +212,7 @@ def _publishing_section(job, posts, channels, metrics, csrf_token):
         form = f'''
         <form class="stack" method="post" action="/workspace/{job_id}/publish">
           {_csrf(csrf_token)}
+          <input type="hidden" name="preview_path" value="{_text(job['preview_path'])}">
           <label>Channel<select name="channel" required>{options}</select></label>
           <label>Title<input name="title" value="{_text(job['title'])}" maxlength="100" required></label>
           <label>Caption<textarea name="caption" rows="3"></textarea></label>

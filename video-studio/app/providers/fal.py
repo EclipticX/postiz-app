@@ -44,10 +44,11 @@ class FalAdapter:
             return ProviderResult('pending', task_id=task_id)
         if status != 'COMPLETED':
             raise ProviderError('fal.ai returned an unknown task status.')
-        if current.get('error') or current.get('error_type'):
+        code = current.get('error_type')
+        if current.get('error') or code:
             raise ProviderError(
                 'fal.ai reported that generation failed.', terminal=True,
-                retryable=current.get('error_type') in _RETRYABLE_TASK_ERRORS,
+                retryable=isinstance(code, str) and code in _RETRYABLE_TASK_ERRORS,
             )
         result = request_json('queue.fal.run', path, self.headers)
         media = result.get(self.output)

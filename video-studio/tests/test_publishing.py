@@ -1,6 +1,6 @@
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -76,10 +76,11 @@ class PublishingFlowTests(unittest.TestCase):
         with patch("app.publishing.PostizClient") as cls:
             client = cls.return_value
             client.channels.return_value = [{"id": "youtube", "identifier": "youtube", "name": "YouTube"}]
-            self.approve("youtube", False)
+            approved = self.approve("youtube", False)
             client.upload.return_value = {"id": "uploaded", "path": "http://localhost/media.mp4"}
             client.create_post.side_effect = PostizError("Postiz response was interrupted", uncertain=True)
             self.publishing.process(NOW)
+            self.assertEqual(self.approve("youtube", False), approved)
             self.publishing.process(NOW)
             client.create_post.assert_called_once()
             post, = self.publishing.posts.job_posts(self.job)
@@ -97,3 +98,22 @@ class PublishingFlowTests(unittest.TestCase):
             client.create_post.assert_not_called()
             post, = self.publishing.posts.job_posts(self.job)
             self.assertEqual(post["status"], "failed")
+
+    def test_schedule_expiring_during_upload_does_not_create_post(self):
+        self.set_preview()
+        scheduled = datetime(2099, 1, 1, 3, tzinfo=timezone.utc)
+        before = scheduled - timedelta(seconds=1)
+        after = scheduled + timedelta(seconds=1)
+        with patch("app.publishing.PostizClient") as cls, patch("app.publishing.datetime", wraps=datetime) as clock:
+            client = cls.return_value
+            client.channels.return_value = [{"id": "youtube", "identifier": "youtube", "name": "YouTube"}]
+            clock.now.return_value = before
+            self.approve("youtube", False)
+            clock.now.side_effect = (before, after)
+            client.upload.return_value = {"id": "uploaded", "path": "http://localhost/media.mp4"}
+            self.publishing.process(before)
+            client.upload.assert_called_once()
+            client.create_post.assert_not_called()
+            post, = self.publishing.posts.job_posts(self.job)
+            self.assertEqual(post["status"], "failed")
+            self.assertIn("time passed", post["error"])

@@ -231,6 +231,19 @@ class ProviderTests(unittest.TestCase):
         self.assertTrue(caught.exception.retryable)
         self.assertNotIn(_KEY, str(caught.exception))
 
+    def test_malformed_error_codes_are_terminal_without_retry(self):
+        for adapter, payload in (
+            (FalAdapter(_KEY, 'fal-veo'), {'status': 'COMPLETED', 'error_type': [_KEY]}),
+            (EvoLinkAdapter(_KEY), {'status': 'failed', 'error': {'code': {'secret': _KEY}}}),
+        ):
+            with self.subTest(adapter=type(adapter).__name__):
+                self.connection.getresponse.return_value = response(payload)
+                with self.assertRaises(ProviderError) as caught:
+                    adapter.poll('task-42')
+                self.assertTrue(caught.exception.terminal)
+                self.assertFalse(caught.exception.retryable)
+                self.assertNotIn(_KEY, str(caught.exception))
+
     def test_errors_keep_secrets_and_ambiguous_submissions_out_of_retries(self):
         adapter = FalAdapter(_KEY, 'fal-elevenlabs')
         for status, retryable, uncertain in ((302, False, False), (429, True, False), (503, False, True)):

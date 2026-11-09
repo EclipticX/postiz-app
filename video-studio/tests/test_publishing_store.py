@@ -26,10 +26,10 @@ class PublishingStoreTests(unittest.TestCase):
         with self.store._connection(write=True) as db:
             db.execute("UPDATE jobs SET status = ?, preview_path = ? WHERE id = ?", (status, path, self.job))
 
-    def approve(self, channel=None, *, draft=False):
+    def approve(self, channel=None, *, draft=False, expected_preview_path=None):
         return self.posts.queue(
             self.job, channel or self.channel, "A story", "Caption", ["garden"],
-            None if draft else self.when, draft,
+            None if draft else self.when, draft, expected_preview_path=expected_preview_path,
         )
 
     def test_only_final_preview_can_be_approved(self):
@@ -75,6 +75,44 @@ class PublishingStoreTests(unittest.TestCase):
         post, = self.posts.job_posts(self.job)
         self.assertEqual(post["status"], "failed")
         self.assertIn("preview changed", post["error"])
+
+    def test_explicit_approval_rejects_missing_or_stale_preview_path(self):
+        self.preview(path="1/revised.mp4")
+        for path in ("", "1/preview.mp4"):
+            with self.subTest(path=path), self.assertRaisesRegex(ValueError, "Reload the workspace"):
+                self.approve(expected_preview_path=path)
+        self.assertEqual(self.posts.job_posts(self.job), [])
+        approved = self.approve(expected_preview_path="1/revised.mp4")
+        self.assertEqual(self.posts.next_request()["id"], approved)
+
+    def test_confirmed_failure_can_be_reapproved_with_updated_details(self):
+        self.preview()
+        approved = self.approve(expected_preview_path="1/preview.mp4")
+        self.assertEqual(self.posts.next_request()["id"], approved)
+        self.posts.fail(approved, "Upload failed.")
+        self.preview(path="1/revised.mp4")
+
+        with self.assertRaisesRegex(ValueError, "Reload the workspace"):
+            self.approve(expected_preview_path="1/preview.mp4")
+        self.assertEqual(self.posts.job_posts(self.job)[0]["status"], "failed")
+
+        channel = {**self.channel, "name": "Updated Stories"}
+        later = self.when + timedelta(hours=1)
+        reapproved = self.posts.queue(
+            self.job, channel, "Updated story", "New caption", ["updated"],
+            later, expected_preview_path="1/revised.mp4",
+        )
+        self.assertEqual(reapproved, approved)
+        post = self.posts.next_request()
+        self.assertEqual(post["id"], approved)
+        self.assertEqual(post["preview_path"], "1/revised.mp4")
+        self.assertEqual(post["channel_name"], "Updated Stories")
+        self.assertEqual(post["title"], "Updated story")
+        self.assertEqual(post["caption"], "New caption")
+        self.assertEqual(post["hashtags"], ["updated"])
+        self.assertEqual(datetime.fromisoformat(post["scheduled_at"]), later)
+        self.assertIsNone(post["error"])
+        self.assertIsNone(self.posts.next_request())
 
     def test_interrupt_and_uncertainty_never_trigger_automatic_resubmission(self):
         self.preview()
