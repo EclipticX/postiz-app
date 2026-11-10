@@ -10,10 +10,11 @@ def _label(value):
     return _text(value.replace('_', ' ').capitalize())
 
 
-def _page(title, active, content, notice, *, heading_action=''):
+def _page(title, active, content, notice, *, script=None, heading_action=''):
     links = (
         ('/', 'Idea Inbox'), ('/workspace', 'Video Workspace'), ('/published-posts', 'Published Posts'),
-        ('/watch-dog', 'Watch Dog'), ('/settings', 'Settings'),
+        ('/characters', 'Characters'),
+        ('/providers', 'Providers'), ('/watch-dog', 'Watch Dog'), ('/settings', 'Settings'),
     )
     navigation_links = []
     for path, label in links:
@@ -25,6 +26,7 @@ def _page(title, active, content, notice, *, heading_action=''):
     if heading_action:
         heading = f'<div class="inbox-heading">{heading}{heading_action}</div>'
     notice_html = f'<p class="notice" role="status">{_text(notice)}</p>' if notice else ''
+    script_html = f'<script src="{_text(script)}" defer></script>' if script else ''
     return f'''<!doctype html>
 <html lang="en">
 <head>
@@ -32,6 +34,7 @@ def _page(title, active, content, notice, *, heading_action=''):
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{title} · Video Studio</title>
   <link rel="stylesheet" href="/studio.css">
+  {script_html}
 </head>
 <body>
   <header class="studio-sidebar">
@@ -115,7 +118,7 @@ def _scene_dialogue(scene, asset_names):
 
 def workspace_page(
     jobs, job=None, notice='', tasks=(), csrf_token='', *, posts=(), channels=(), metrics=(),
-    assets=(), presets=(), production_options=None,
+    assets=(), presets=(), production_options=None, production_options_open=False,
 ) -> str:
     if job is not None:
         from app.library_view import production_options_section
@@ -179,7 +182,7 @@ def workspace_page(
           <h3>Production prompt</h3>
           <p class="prompt">{_text(job['prompt'])}</p>
           {error_html}
-          {production_options_section(job, assets, presets, production_options, csrf_token)}
+          {production_options_section(job, assets, presets, production_options, csrf_token, expanded=production_options_open)}
           {'<h3>Scene plan</h3><ol>' + scenes_html + '</ol>' if scenes_html else ''}
           {'<h3>Keyframes</h3><div class="keyframes">' + frames + '</div>' if frames else ''}
           {'<ul class="notice">' + errors + '</ul>' if errors else ''}

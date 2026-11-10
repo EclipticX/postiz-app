@@ -85,7 +85,8 @@ class StudioProduction:
                 raise LookupError("Video job not found.")
             if options is not None:
                 previous = json.loads(job["production_options_json"])
-                if all(previous.get(group, {}) == value for group, value in options.items()):
+                defaults = {"characters": []}
+                if all(previous.get(group, defaults.get(group, {})) == value for group, value in options.items()):
                     return
             allowed = {"review_keyframes", "preview_ready", "needs_review"}
             if options is not None:

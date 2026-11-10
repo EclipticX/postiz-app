@@ -91,7 +91,7 @@ class StudioHTTPTest(unittest.TestCase):
     def post(self, path, **fields):
         return self.request("POST", path, {"csrf_token": self.csrf, **fields})[0]
 
-    def upload(self, path, fields, files):
+    def upload(self, path, fields, files, *, accept=None):
         boundary = "studio-test-form-boundary"
         body = bytearray()
         for name, value in {"csrf_token": self.csrf, **fields}.items():
@@ -100,8 +100,10 @@ class StudioHTTPTest(unittest.TestCase):
             body.extend(f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'.encode())
             body.extend(b"Content-Type: application/octet-stream\r\n\r\n" + data + b"\r\n")
         body.extend(f"--{boundary}--\r\n".encode())
-        return self.request("POST", path, headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
-                            payload=bytes(body))[0]
+        headers = {"Content-Type": f"multipart/form-data; boundary={boundary}"}
+        if accept:
+            headers["Accept"] = accept
+        return self.request("POST", path, headers=headers, payload=bytes(body))[0]
 
     def test_inbox_approval_and_job_workspace(self):
         self.assertEqual(self.post("/ideas", title="A forest visit", prompt="<script>"), 303)
@@ -211,17 +213,19 @@ class StudioHTTPTest(unittest.TestCase):
         self.assertEqual(self.request("GET", "/", headers={"Host": "other.example"})[0], 403)
         self.assertEqual(self.store.list_ideas(), [])
 
-    def test_settings_add_replace_and_remove_keys_with_masking(self):
+    def test_providers_add_replace_and_remove_keys_with_masking(self):
         path = "/settings/keys/ANTHROPIC_API_KEY"
         self.assertEqual(self.post(path, action="save", value="fixture-first"), 303)
-        status, html = self.request("GET", "/settings")
+        status, html = self.request("GET", "/providers")
         self.assertEqual(status, 200)
+        self.assertIn('href="/providers" aria-current="page"', html)
         self.assertIn("Configured · ••••••••", html)
         self.assertNotIn("fixture-first", html)
+        self.assertNotIn("Save key", self.request("GET", "/settings")[1])
         self.assertEqual(self.post(path, action="save", value="fixture-replacement"), 303)
         self.assertEqual(self.post(path, action="remove"), 303)
-        self.assertNotIn("fixture-replacement", self.request("GET", "/settings")[1])
-        self.assertNotIn("Configured · ••••••••", self.request("GET", "/settings")[1])
+        self.assertNotIn("fixture-replacement", self.request("GET", "/providers")[1])
+        self.assertNotIn("Configured · ••••••••", self.request("GET", "/providers")[1])
 
     def test_workspace_preview_supports_byte_ranges_and_only_serves_registered_media(self):
         idea = self.store.add_idea("A preview test")
@@ -269,28 +273,77 @@ class StudioHTTPTest(unittest.TestCase):
         self.assertEqual([row["preview_path"] for row in previews], [replacement])
 
     @REQUIRES_FFMPEG
-    def test_asset_upload_and_per_video_options_through_http(self):
-        self.assertEqual(self.post("/settings/assets", asset_id="mother", kind="character", name="Mother",
-                                   description="Clay character with blue glasses"), 303)
-        ref_path = "/settings/assets/mother/references"
+    def test_character_profile_upload_and_per_video_options_through_http(self):
+        self.assertEqual(self.request("GET", "/characters/new/profile")[0], 200)
+        self.assertEqual(self.post("/characters", asset_id="mother", name="Mother",
+                                   description="Clay character with blue glasses", dress_color="#7c3aed"), 303)
+        base = "/characters/mother"
+        self.assertIn("Needs a reference image", self.request("GET", base)[1])
+        self.assertIn('href="/characters/mother"', self.request("GET", "/characters?q=MOTH")[1])
+        self.assertNotIn('href="/characters/mother"', self.request("GET", "/characters?q=Tavi")[1])
+        self.assertEqual(self.request("GET", "/settings?asset=mother")[0], 303)
+        ref_path = f"{base}/references"
         fields = {"angle": "front", "variant_id": "", "primary": "yes"}
         self.assertEqual(self.upload(ref_path, {**fields, "csrf_token": "wrong"}, {"image": ("mother.png", png())}), 403)
         self.assertEqual(self.upload(ref_path, fields, {"image": ("../../untrusted.png", png())}), 303)
-        self.assertEqual(self.upload(ref_path, {**fields, "angle": "side", "primary": ""},
-                                     {"image": ("side.png", png(70))}), 303)
-        status, html = self.request("GET", "/settings")
+        side_fields = {**fields, "angle": "side", "primary": "", "upload_id": "ref_" + "e" * 32}
+        for _ in range(2):
+            self.assertEqual(self.upload(
+                ref_path, side_fields, {"image": ("side.png", png(70))}, accept="application/json",
+            ), 201)
+        self.assertEqual(self.upload(
+            ref_path, fields, {"image": ("bad.png", b"invalid")}, accept="application/json",
+        ), 400)
+        status, html = self.request("GET", base)
         self.assertEqual(status, 200)
-        self.assertIn("Asset Library", html)
+        self.assertIn('href="/characters" aria-current="page"', html)
+        self.assertIn("character-gallery", html)
+        self.assertIn("#7C3AED", html)
+        self.assertNotIn('name="image"', html)
         references = re.findall(r'src="(/asset-reference/mother/[^" ]+)"', html)
         self.assertEqual(len(references), 2)
         self.assertEqual(self.request("GET", references[0], binary=True), (200, png()))
-        self.assertEqual(self.post("/settings/assets/mother/voices", style_id="warm", name="Warm", voice="Rachel",
+        self.assertEqual(self.post(f"{base}/variants", variant_id="blue", name="Blue outfit",
+                                   description="Blue coat", dress_color="#1122ee"), 303)
+        reference_id = references[1].rsplit("/", 1)[1]
+        self.assertEqual(self.post(f"{ref_path}/{reference_id}", angle="side", variant_id="blue", primary="yes"), 303)
+        self.assertEqual(self.post(f"{base}/outfit-color", variant_id="blue", dress_color="#0000ff"), 303)
+        self.assertEqual(self.post(f"{base}/edit", name="Mother (updated)", description="Clay character",
+                                   dress_color="#FFCCAA"), 303)
+        self.assertIn("Mother (updated)", self.request("GET", base)[1])
+        self.assertEqual(self.post(f"{base}/voices", style_id="warm", name="Warm", voice="Rachel",
                                    speed="0.95", expressiveness="0.2", is_default="yes"), 303)
+        self.assertEqual(self.upload(f"{base}/audio", {}, {"audio": ("mother.wav", wav())}), 303)
+        self.assertIn('src="/character-audio/mother"', self.request("GET", base)[1])
+        self.assertEqual(self.request("GET", "/character-audio/mother", binary=True), (200, wav()))
+        self.assertEqual(
+            self.request("GET", "/character-audio/mother", headers={"Range": "bytes=0-3"}, binary=True), (206, b"RIFF"),
+        )
+        self.assertEqual(self.post(f"{base}/audio-link", url="https://example.com/mother.mp3"), 303)
+        self.assertIn('href="https://example.com/mother.mp3"', self.request("GET", base)[1])
+        self.assertEqual(self.request("GET", "/character-audio/mother")[0], 404)
+        self.assertEqual(self.post(f"{base}/audio-remove"), 303)
+        self.assertIn("No voice reference added", self.request("GET", base)[1])
         self.assertEqual(self.upload("/settings/presets/audio", {"preset_id": "opening", "name": "Opening"},
                                      {"sfx": ("opening.wav", wav())}), 303)
         self.assertEqual(self.post("/settings/presets/audio/opening/default"), 303)
         idea = self.store.add_idea("A garden story")
         self.store.decide_idea(idea, "accept")
         job = self.store.list_jobs()[0]["id"]
-        self.assertEqual(self.post(f"/workspace/{job}/options", **{"voice.mother": "warm", "preset.audio": "opening"}), 303)
-        self.assertIn('value="warm" selected', self.request("GET", f"/workspace?job={job}")[1])
+        status, invalid_options = self.request("POST", f"/workspace/{job}/options", {
+            "csrf_token": self.csrf, "characters": "mother", "variant.mother": "missing", "voice.mother": "warm",
+        })
+        self.assertEqual(status, 400)
+        self.assertIn('class="record production-options" open', invalid_options)
+        self.assertIn('name="characters" value="mother" checked', invalid_options)
+        self.assertIn('value="warm" selected', invalid_options)
+        self.assertEqual(self.post(f"/workspace/{job}/options", **{
+            "characters": "mother", "variant.mother": "blue", "voice.mother": "warm", "preset.audio": "opening",
+        }), 303)
+        workspace = self.request("GET", f"/workspace?job={job}")[1]
+        self.assertIn('name="characters" value="mother" checked', workspace)
+        self.assertIn('value="warm" selected', workspace)
+        self.assertEqual(self.post(f"/workspace/{job}/options", **{"variant.mother": "blue"}), 303)
+        self.assertNotIn(
+            'name="characters" value="mother" checked', self.request("GET", f"/workspace?job={job}")[1],
+        )

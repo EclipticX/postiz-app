@@ -7,8 +7,10 @@ from pathlib import Path
 from app.db import StudioStore
 from app.niche import load_profile
 from app.planning import StudioPlanner
+from app.production import StudioProduction
 from app.providers import ProviderError, ProviderResult
 from app.settings import StudioSettings
+from test_asset_library import REQUIRES_FFMPEG, png
 
 
 NOW = datetime(2026, 11, 9, 3, 30, tzinfo=timezone.utc)
@@ -95,6 +97,35 @@ class PlanningTests(unittest.TestCase):
         self.planner.process_plan(NOW)
         self.assertEqual(len(self.requests), 1)
         self.assertEqual(self.store.get_job(job_id)["status"], "needs_review")
+
+    @REQUIRES_FFMPEG
+    def test_cast_missing_a_reference_stays_queued_until_reference_is_restored(self):
+        job_id = self.queue_job()
+        production = StudioProduction(self.store, self.settings, self.planner)
+        assets = self.planner.library.assets
+        niche_id = "kids_3d"
+        assets.create_asset(niche_id, "mother", "character", "Mother", "A clay figure.")
+        assets.add_variant(niche_id, "mother", "coat", "Coat", "Rain coat")
+        reference = assets.add_reference(niche_id, "mother", "front", "", True, png())
+        production.configure(job_id, {"presets": {}, "variants": {}, "voices": {}, "characters": ["mother"]})
+
+        assets.update_reference(niche_id, "mother", reference, "front", "coat", True)
+        self.planner.process_plan(NOW)
+        job = self.store.get_job(job_id)
+        self.assertEqual(job["status"], "queued")
+        self.assertIn("Add a reference image for Mother", job["stage_error"])
+        self.assertEqual(job["plan_attempts"], 0)
+        self.assertIsNone(job["production_context_json"])
+        self.assertEqual(self.requests, [])
+
+        assets.update_reference(niche_id, "mother", reference, "front", "", True)
+        plan = self.valid_plan()
+        for scene in plan["scenes"]:
+            scene["characters"] = ["mother"]
+        self.responses = [plan]
+        self.planner.process_plan(NOW)
+        self.assertEqual(self.store.get_job(job_id)["status"], "planned")
+        self.assertEqual(len(self.requests), 1)
 
     def test_planner_stops_after_two_correction_retries(self):
         job_id = self.queue_job()

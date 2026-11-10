@@ -1,12 +1,14 @@
-"""Persistent visual references, variants, and voices for Studio assets."""
+"""Persistent profiles, media references, variants, and voices for Studio assets."""
 
 import json
 import math
 import os
 import re
 import subprocess
+from contextlib import suppress
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from app.niche import STUDIO_ROOT
@@ -14,7 +16,7 @@ from app.niche import STUDIO_ROOT
 
 ASSET_ID = re.compile(r"[a-z][a-z0-9_]{0,63}")
 ASSET_KINDS = ("character", "place", "item")
-REFERENCE_ANGLES = ("front", "three-quarter", "side", "back", "other")
+REFERENCE_ANGLES = ("front", "three-quarter", "side", "back", "full-body", "other")
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_AUDIO_BYTES = 20 * 1024 * 1024
 MAX_IMAGE_EDGE = 4096
@@ -42,6 +44,42 @@ def _number(value, label, minimum, maximum):
     if not minimum <= number <= maximum:
         raise ValueError(f"{label} must be between {minimum} and {maximum}.")
     return number
+
+
+def _dress_color(value):
+    if value == "":
+        return ""
+    if not isinstance(value, str) or not re.fullmatch(r"#[0-9a-fA-F]{6}", value):
+        raise ValueError("Enter a dress color in #RRGGBB format.")
+    return value.upper()
+
+
+def _audio_url(url):
+    if (
+        not isinstance(url, str) or not 1 <= len(url) <= 4096 or "\\" in url
+        or any(not 33 <= ord(char) <= 126 for char in url)
+    ):
+        raise ValueError("Enter an HTTPS audio link without credentials.")
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+        if (
+            parts.scheme != "https" or not parts.hostname or parts.username is not None
+            or not re.fullmatch(r"[a-zA-Z0-9.:-]+", parts.hostname) or port == 0
+        ):
+            raise ValueError
+    except ValueError:
+        raise ValueError("Enter an HTTPS audio link without credentials.") from None
+    return url
+
+
+def _validate_reference_fields(angle, variant_id, primary):
+    if angle not in REFERENCE_ANGLES:
+        raise ValueError("Choose a valid reference angle.")
+    if variant_id:
+        _valid_id(variant_id, "Variant ID")
+    if type(primary) is not bool:
+        raise ValueError("Choose whether the reference is primary.")
 
 
 def _references(raw):
@@ -136,7 +174,7 @@ def _write_upload(directory, filename, data):
 
 
 def save_audio_upload(root, data):
-    """Save validated music or effects and return its local basename."""
+    """Save validated audio and return its local basename."""
     if not isinstance(data, bytes) or not 1 <= len(data) <= MAX_AUDIO_BYTES:
         raise ValueError("Upload an MP3 or WAV audio file up to 20 MiB.")
     if data.startswith(b"RIFF") and data[8:12] == b"WAVE":
@@ -148,6 +186,12 @@ def save_audio_upload(root, data):
     _probe_upload(data, extension, input_format, "a")
     path = _write_upload(Path(root), f"audio_{uuid4().hex}{extension}", data)
     return path.name
+
+
+def _local_audio_file(directory, audio):
+    if audio and audio["source"] == "upload" and re.fullmatch(r"audio_[0-9a-f]{32}\.(mp3|wav)", audio["path"]):
+        return directory / audio["path"]
+    return None
 
 
 class AssetLibrary:
@@ -177,6 +221,8 @@ class AssetLibrary:
             "references": _references(row["reference_images_json"]),
             "variants": metadata.get("variants", []),
             "voice_styles": metadata.get("voice_styles", []),
+            "dress_color": metadata.get("dress_color", ""),
+            "audio": metadata.get("audio"),
         }
 
     @staticmethod
@@ -188,59 +234,101 @@ class AssetLibrary:
             raise LookupError("Asset not found.")
         return row
 
-    def create_asset(self, niche_id, asset_id, kind, name, description):
+    def _character_row(self, db, niche_id, asset_id):
+        row = self._asset_row(db, niche_id, asset_id)
+        if row["type"] != "character":
+            raise LookupError("Character not found.")
+        return row
+
+    def _asset_directory(self, niche_id, asset_id):
+        root = self.root.resolve()
+        directory = (root / niche_id / asset_id).resolve()
+        if not directory.is_relative_to(root):
+            raise ValueError("Asset storage is outside the Studio data directory.")
+        return directory
+
+    def get_character(self, niche_id, asset_id):
+        _valid_id(niche_id, "Niche ID")
+        _valid_id(asset_id, "Character ID")
+        with self.store._connection() as db:
+            return self._asset_record(self._character_row(db, niche_id, asset_id))
+
+    def update_character(self, niche_id, asset_id, name, description, dress_color, variant_id=""):
+        _valid_id(niche_id, "Niche ID")
+        _valid_id(asset_id, "Character ID")
+        dress_color = _dress_color(dress_color)
+        with self.store._connection(write=True) as db:
+            row = self._character_row(db, niche_id, asset_id)
+            metadata = json.loads(row["metadata_json"])
+            if variant_id:
+                _valid_id(variant_id, "Variant ID")
+                variant = next((item for item in metadata.get("variants", []) if item["id"] == variant_id), None)
+                if variant is None:
+                    raise LookupError("Appearance not found.")
+                variant["dress_color"] = dress_color
+                name, description = row["name"], row["description"]
+            else:
+                name = _text(name, "Character name", 100)
+                description = _text(description, "Character description", 2000)
+                metadata["dress_color"] = dress_color
+            db.execute(
+                "UPDATE assets SET name = ?, description = ?, metadata_json = ? WHERE niche_id = ? AND id = ?",
+                (name, description, json.dumps(metadata), niche_id, asset_id),
+            )
+
+    def create_asset(self, niche_id, asset_id, kind, name, description, dress_color=""):
         _valid_id(niche_id, "Niche ID")
         _valid_id(asset_id, "Asset ID")
         if kind not in ASSET_KINDS:
             raise ValueError("Choose character, place, or item.")
         name = _text(name, "Asset name", 100)
         description = _text(description, "Asset description", 2000)
+        dress_color = _dress_color(dress_color)
+        if dress_color and kind != "character":
+            raise ValueError("Dress colors belong to characters.")
+        metadata = {"dress_color": dress_color} if dress_color else {}
         with self.store._connection(write=True) as db:
             if db.execute("SELECT 1 FROM niches WHERE id = ?", (niche_id,)).fetchone() is None:
                 raise LookupError("Niche not found.")
             inserted = db.execute(
                 """
-                INSERT INTO assets (id, niche_id, type, name, description)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO assets (id, niche_id, type, name, description, metadata_json)
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT (niche_id, id) DO NOTHING
                 """,
-                (asset_id, niche_id, kind, name, description),
+                (asset_id, niche_id, kind, name, description, json.dumps(metadata)),
             )
             if not inserted.rowcount:
                 raise ValueError("An asset with this ID already exists in this niche.")
         return asset_id
 
-    def add_reference(self, niche_id, asset_id, angle, variant_id, primary, image_bytes):
+    def add_reference(self, niche_id, asset_id, angle, variant_id, primary, image_bytes, upload_id=""):
         _valid_id(niche_id, "Niche ID")
         _valid_id(asset_id, "Asset ID")
-        if angle not in REFERENCE_ANGLES:
-            raise ValueError("Choose a valid reference angle.")
         variant_id = variant_id or ""
-        if variant_id:
-            _valid_id(variant_id, "Variant ID")
-        if type(primary) is not bool:
-            raise ValueError("Choose whether the reference is primary.")
+        _validate_reference_fields(angle, variant_id, primary)
+        if upload_id != "" and (not isinstance(upload_id, str) or not re.fullmatch(r"ref_[a-f0-9]{32}", upload_id)):
+            raise ValueError("Invalid reference upload ID.")
         extension = _image_extension(image_bytes)
-        reference_id = f"ref_{uuid4().hex}"
+        reference_id = upload_id or f"ref_{uuid4().hex}"
         written = None
         try:
             with self.store._connection(write=True) as db:
                 asset = self._asset_record(self._asset_row(db, niche_id, asset_id))
+                references = asset["references"]
+                if upload_id and any(entry["id"] == reference_id for entry in references):
+                    return reference_id
                 if variant_id and not any(variant["id"] == variant_id for variant in asset["variants"]):
                     raise ValueError("Add this variant before uploading its references.")
-                references = asset["references"]
                 group = [entry for entry in references if entry["variant_id"] == variant_id]
                 if primary or not any(entry["primary"] for entry in group):
                     primary = True
                     for entry in group:
                         entry["primary"] = False
-                root = self.root.resolve()
-                directory = (root / niche_id / asset_id).resolve()
-                if not directory.is_relative_to(root):
-                    raise ValueError("Asset storage is outside the Studio data directory.")
+                directory = self._asset_directory(niche_id, asset_id)
                 written = _write_upload(directory, f"{reference_id}{extension}", image_bytes)
                 references.append({
-                    "id": reference_id, "path": written.relative_to(root).as_posix(),
+                    "id": reference_id, "path": written.relative_to(self.root.resolve()).as_posix(),
                     "source": "upload", "angle": angle, "variant_id": variant_id, "primary": primary,
                 })
                 db.execute(
@@ -253,19 +341,94 @@ class AssetLibrary:
             raise
         return reference_id
 
-    def add_variant(self, niche_id, asset_id, variant_id, name, description):
+    def update_reference(self, niche_id, asset_id, reference_id, angle, variant_id, primary):
+        _valid_id(niche_id, "Niche ID")
+        _valid_id(asset_id, "Character ID")
+        _valid_id(reference_id, "Reference ID")
+        variant_id = variant_id or ""
+        _validate_reference_fields(angle, variant_id, primary)
+        with self.store._connection(write=True) as db:
+            asset = self._asset_record(self._character_row(db, niche_id, asset_id))
+            if variant_id and not any(item["id"] == variant_id for item in asset["variants"]):
+                raise ValueError("Add this variant before assigning its references.")
+            references = asset["references"]
+            reference = next((item for item in references if item["id"] == reference_id), None)
+            if reference is None:
+                raise LookupError("Reference image not found.")
+            previous_variant = reference["variant_id"]
+            reference.update(angle=angle, variant_id=variant_id, primary=primary)
+            for group_id in dict.fromkeys((previous_variant, variant_id)):
+                group = [item for item in references if item["variant_id"] == group_id]
+                if group_id == variant_id and primary:
+                    for item in group:
+                        item["primary"] = item is reference
+                elif group and not any(item["primary"] for item in group):
+                    replacement = next((item for item in group if item is not reference), group[0])
+                    replacement["primary"] = True
+            db.execute(
+                "UPDATE assets SET reference_images_json = ? WHERE niche_id = ? AND id = ?",
+                (json.dumps(references), niche_id, asset_id),
+            )
+
+    def save_character_audio(self, niche_id, asset_id, url="", audio_bytes=None):
+        self.get_character(niche_id, asset_id)
+        if url and audio_bytes is not None:
+            raise ValueError("Choose either an audio file or an audio link.")
+        audio = {"source": "link", "url": _audio_url(url)} if url != "" else None
+        directory = self._asset_directory(niche_id, asset_id)
+        written = None
+        try:
+            if audio_bytes is not None:
+                filename = save_audio_upload(directory, audio_bytes)
+                written = directory / filename
+                audio = {"source": "upload", "path": filename}
+            with self.store._connection(write=True) as db:
+                row = self._character_row(db, niche_id, asset_id)
+                metadata = json.loads(row["metadata_json"])
+                previous = _local_audio_file(directory, metadata.get("audio"))
+                metadata["audio"] = audio
+                db.execute(
+                    "UPDATE assets SET metadata_json = ? WHERE niche_id = ? AND id = ?",
+                    (json.dumps(metadata), niche_id, asset_id),
+                )
+        except BaseException:
+            if written is not None:
+                with suppress(OSError):
+                    written.unlink(missing_ok=True)
+            raise
+        if previous is not None:
+            with suppress(OSError):
+                previous.unlink(missing_ok=True)
+
+    def character_audio_path(self, niche_id, asset_id):
+        asset = self.get_character(niche_id, asset_id)
+        directory = self._asset_directory(niche_id, asset_id)
+        audio = _local_audio_file(directory, asset["audio"])
+        if audio is not None:
+            path = audio.resolve()
+            if path.is_relative_to(directory) and path.is_file():
+                return path
+        raise LookupError("Character audio file not found.")
+
+    def add_variant(self, niche_id, asset_id, variant_id, name, description, dress_color=""):
         _valid_id(niche_id, "Niche ID")
         _valid_id(asset_id, "Asset ID")
         _valid_id(variant_id, "Variant ID")
         name = _text(name, "Variant name", 100)
         description = _text(description, "Variant description", 2000)
+        dress_color = _dress_color(dress_color)
         with self.store._connection(write=True) as db:
             row = self._asset_row(db, niche_id, asset_id)
+            if dress_color and row["type"] != "character":
+                raise ValueError("Dress colors belong to characters.")
             metadata = json.loads(row["metadata_json"])
             variants = metadata.setdefault("variants", [])
             if any(entry["id"] == variant_id for entry in variants):
                 raise ValueError("A variant with this ID already exists for this asset.")
-            variants.append({"id": variant_id, "name": name, "description": description})
+            variant = {"id": variant_id, "name": name, "description": description}
+            if dress_color:
+                variant["dress_color"] = dress_color
+            variants.append(variant)
             db.execute(
                 "UPDATE assets SET metadata_json = ? WHERE niche_id = ? AND id = ?",
                 (json.dumps(metadata), niche_id, asset_id),

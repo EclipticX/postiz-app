@@ -13,7 +13,7 @@ from app.production import StudioProduction
 from app.providers import ProviderResult
 from app.scenes import SceneValidationError, validate_scene_plan
 from app.settings import StudioSettings
-from app.studio_library import StudioLibrary
+from app.studio_library import StudioLibrary, select_references
 from test_asset_library import REQUIRES_FFMPEG, png, wav
 
 
@@ -49,6 +49,54 @@ class LibraryMigrationTests(unittest.TestCase):
                 self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
             library = StudioLibrary(store)
             self.assertEqual(library.assets.list_assets()[0]["references"][0]["source"], "bundled")
+
+
+class LibraryReferenceTests(unittest.TestCase):
+    def test_wide_shots_use_full_body_when_available_and_keep_legacy_front_fallback(self):
+        primary = {"angle": "side", "primary": True}
+        front = {"angle": "front", "primary": False}
+        full_body = {"angle": "full-body", "primary": False}
+        self.assertEqual(select_references({"references": [primary, front]}, "Wide shot"), [primary, front])
+        self.assertEqual(
+            select_references({"references": [primary, front, full_body]}, "Wide shot"), [primary, full_body],
+        )
+
+
+class LibraryCastTests(unittest.TestCase):
+    def test_cast_requires_renderable_characters_and_accepts_bundled_references(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = StudioStore(Path(directory) / "studio.sqlite3")
+            store.initialize()
+            store.seed_niche(load_profile())
+            library = StudioLibrary(store)
+            library.assets.create_asset(NICHE, "draft", "character", "Draft", "No images yet")
+            options = {"presets": {}, "variants": {}, "voices": {}}
+            library.validate_options(NICHE, options)
+            library.validate_options(NICHE, dict(options, characters=["tavi_seed_sprite"]))
+            with self.assertRaisesRegex(ValueError, "Add a reference image for Draft"):
+                library.validate_options(NICHE, dict(options, characters=["draft"]))
+            with self.assertRaisesRegex(ValueError, "Choose saved characters"):
+                library.validate_options(NICHE, dict(options, characters=["pebble_garden"]))
+            with self.assertRaisesRegex(ValueError, "Choose each character only once"):
+                library.validate_options(NICHE, dict(options, characters=["tavi_seed_sprite", "tavi_seed_sprite"]))
+
+    def test_bundled_fallback_keeps_edited_profile_fields(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = StudioStore(Path(directory) / "studio.sqlite3")
+            store.initialize()
+            store.seed_niche(load_profile())
+            library = StudioLibrary(store)
+            assets = library.assets
+            asset_id = "tavi_seed_sprite"
+            assets.update_character(NICHE, asset_id, "Tavi", "New description", "#4420bf")
+            assets.add_variant(NICHE, asset_id, "coat", "Coat", "Rain coat")
+            assets.update_reference(NICHE, asset_id, "bundled_1", "side", "coat", True)
+            options = {"presets": {}, "variants": {}, "voices": {}, "characters": [asset_id]}
+            library.validate_options(NICHE, options)
+            character = next(asset for asset in library.profile(NICHE, options)["assets"] if asset["id"] == asset_id)
+            self.assertEqual(character["name"], "Tavi")
+            self.assertEqual(character["description"], "New description\nDress color: #4420BF.")
+            self.assertEqual(assets.reference_path(select_references(character, "front")[0]).suffix, ".svg")
 
 
 @REQUIRES_FFMPEG
@@ -90,7 +138,7 @@ class LibraryPipelineTests(unittest.TestCase):
                 assets.create_asset(NICHE, asset_id, "character", asset_id.title(), "Clay sprite with a round face.")
                 for angle in ("front", "side"):
                     assets.add_reference(NICHE, asset_id, angle, "", angle == "front", png())
-            assets.add_variant(NICHE, "mother", "blue_coat", "Blue coat", "A blue coat and peach shoes.")
+            assets.add_variant(NICHE, "mother", "blue_coat", "Blue coat", "A blue coat and peach shoes.", "#406cbf")
             for angle in ("front", "side"):
                 assets.add_reference(NICHE, "mother", angle, "blue_coat", angle == "front", png(120))
             assets.save_voice_style(NICHE, "mother", "bright", "Bright", "Aria", 1.05, True)
@@ -108,20 +156,29 @@ class LibraryPipelineTests(unittest.TestCase):
             idea = store.add_idea("Mother and Grandpa visit the garden")
             store.decide_idea(idea, "accept")
             job_id = store.list_jobs()[0]["id"]
-            production.configure(job_id, {"presets": {}, "variants": {"mother": "blue_coat"}, "voices": {"mother": "calm"}})
+            options = {
+                "presets": {}, "variants": {"mother": "blue_coat"}, "voices": {"mother": "calm"},
+                "characters": ["mother", "grandpa"],
+            }
+            production.configure(job_id, options)
             planner.process_plan(NOW)
             self.assertIn("Gentle bedtime story", requests[0].prompt)
             self.assertIn("indigo", requests[0].prompt)
             self.assertIn("Blue coat", requests[0].prompt)
+            self.assertIn("Dress color: #406CBF", requests[0].prompt)
+            catalog = {asset["id"] for asset in library.profile(NICHE, options)["assets"]}
+            self.assertEqual(catalog, {"mother", "grandpa", "pebble_garden", "blue_watering_can"})
 
             # A default edited after planning applies to future plans. This job's context is already saved.
             library.add_preset(NICHE, "visual", "day", "Day", {"style": "Glossy", "palette": "yellow"}, {}, True)
+            assets.update_character(NICHE, "mother", "", "", "#EB5300", "blue_coat")
             production.media.queue_keyframes()
             opening = next(task for task in production.media.tasks() if task["scene_id"] == "opening")
             request, refs = production._request(opening)
             self.assertIn("indigo", request.prompt)
             self.assertIn("Mother (mother) from angle side", request.prompt)
             self.assertIn("Grandpa (grandpa) from angle side", request.prompt)
+            self.assertIn("Dress color: #406CBF", request.prompt)
             self.assertEqual([ref["variant_id"] for ref in refs if "/mother/" in ref["path"]], ["blue_coat", "blue_coat"])
             self.assertEqual([ref["angle"] for ref in refs if "/grandpa/" in ref["path"]], ["front", "side"])
             with self.assertRaises(ValueError):

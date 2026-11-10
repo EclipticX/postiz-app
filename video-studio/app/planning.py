@@ -180,17 +180,17 @@ class StudioPlanner:
         if job is None:
             return
 
-        profile = (
-            json.loads(job["production_context_json"]) if job["production_context_json"] else self.library.profile(
-                job["niche_id"] or "kids_3d", json.loads(job["production_options_json"]),
-            )
-        )
-        feedback = json.loads(job["plan_feedback"] or "[]")
-        prompt_text = job["prompt"]
-        if job["revision_feedback"]:
-            prompt_text += "\nRequested revision:\n" + job["revision_feedback"]
-        prompt = planner_prompt(profile, prompt_text, TOTAL_DURATION, feedback)
         try:
+            profile = (
+                json.loads(job["production_context_json"]) if job["production_context_json"] else self.library.profile(
+                    job["niche_id"] or "kids_3d", json.loads(job["production_options_json"]),
+                )
+            )
+            feedback = json.loads(job["plan_feedback"] or "[]")
+            prompt_text = job["prompt"]
+            if job["revision_feedback"]:
+                prompt_text += "\nRequested revision:\n" + job["revision_feedback"]
+            prompt = planner_prompt(profile, prompt_text, TOTAL_DURATION, feedback)
             adapter, reservation = self._claude(job["id"], now)
         except ValueError as error:
             with self.store._connection(write=True) as db:

@@ -4,7 +4,7 @@ import json
 import re
 import sqlite3
 
-from app.asset_library import AssetLibrary, save_audio_upload
+from app.asset_library import ASSET_ID, AssetLibrary, save_audio_upload
 from app.niche import load_profile
 
 
@@ -109,34 +109,70 @@ class StudioLibrary:
             for asset_id, selection in options[group].items():
                 if not any(choice["id"] == selection for choice in assets.get(asset_id, {}).get(field, [])):
                     raise ValueError("Choose a saved variant or voice style for that asset.")
+        characters = options.get("characters", [])
+        if (
+            not isinstance(characters, list)
+            or any(not isinstance(asset_id, str) or not ASSET_ID.fullmatch(asset_id) for asset_id in characters)
+            or len(set(characters)) != len(characters)
+        ):
+            raise ValueError("Choose each character only once from the character list.")
+        if characters:
+            self.profile(niche_id, options)
 
     def profile(self, niche_id="kids_3d", options=None):
         options = options or {}
         profile = load_profile(niche_id)
         catalog = {asset["id"]: asset for asset in profile["assets"]}
+        characters = set(options.get("characters", ()))
         for asset in self.assets.list_assets(niche_id):
-            if not asset["references"]:
-                continue
-            variant_id = options.get("variants", {}).get(asset["id"])
+            asset_id = asset["id"]
+            variant_id = options.get("variants", {}).get(asset_id)
             variant = next((item for item in asset["variants"] if item["id"] == variant_id), None)
             base = [ref for ref in asset["references"] if not ref["variant_id"]]
             custom = [ref for ref in asset["references"] if variant and ref["variant_id"] == variant_id]
             references = custom or base
-            if not references:
+            fallback = catalog.get(asset_id, {}).get("reference_image")
+            if not references and not fallback:
+                if asset_id in characters and asset["kind"] == "character":
+                    raise ValueError(f"Add a reference image for {asset['name']} or select an outfit with an image.")
                 continue
-            voice_id = options.get("voices", {}).get(asset["id"])
+            voice_id = options.get("voices", {}).get(asset_id)
             voice = next((item for item in asset["voice_styles"] if item["id"] == voice_id), None)
             if voice is None:
                 voice = next((item for item in asset["voice_styles"] if item["is_default"]), None)
             description = asset["description"]
+            dress_color = asset["dress_color"]
             if variant:
                 description += f" Selected appearance {variant['name']}. {variant['description']}"
-            catalog[asset["id"]] = {
-                "id": asset["id"], "kind": asset["kind"], "name": asset["name"],
-                "description": description, "references": references, "voice_styles": asset["voice_styles"],
+                dress_color = variant.get("dress_color") or dress_color
+            if dress_color:
+                description += f"\nDress color: {dress_color}."
+            profile_asset = {
+                "id": asset_id, "kind": asset["kind"], "name": asset["name"],
+                "description": description, "voice_styles": asset["voice_styles"],
                 "selected_voice": voice, "voice_override": bool(voice_id),
             }
-        profile["assets"] = list(catalog.values())
+            if references:
+                profile_asset["references"] = references
+            else:
+                profile_asset["reference_image"] = fallback
+            catalog[asset_id] = profile_asset
+        for asset_id in options.get("characters", ()):
+            asset = catalog.get(asset_id)
+            if not asset or asset["kind"] != "character":
+                raise ValueError("Choose saved characters from the character list.")
+            try:
+                # The bundled profile validates its own references when it loads.
+                for reference in asset.get("references", ()):
+                    self.assets.reference_path(reference)
+            except ValueError:
+                raise ValueError(
+                    f"A reference image for {asset['name']} is unavailable. Check its images or choose a different outfit."
+                ) from None
+        profile["assets"] = [
+            asset for asset in catalog.values()
+            if not characters or asset["kind"] != "character" or asset["id"] in characters
+        ]
 
         selected = {}
         for preset in self.presets(niche_id):
@@ -172,9 +208,12 @@ def select_references(asset, camera):
         ("back", r"\b(?:behind|back view|rear view)\b"),
         ("three-quarter", r"\b(?:three[- ]quarter|3/4)\b"),
         ("side", r"\b(?:side[- ]view|side angle|side shot|side[- ]on|profile)\b"),
+        ("full-body", r"\b(?:full[- ]body|wide shot)\b"),
     ):
         if re.search(terms, camera):
             angle = target
             break
+    if angle == "full-body" and not any(ref["angle"] == "full-body" for ref in references):
+        angle = "front"
     other = next((ref for ref in references if ref["angle"] == angle and ref != primary), None)
     return [primary, other] if other is not None else [primary]

@@ -74,6 +74,24 @@ class AssetLibraryTests(unittest.TestCase):
             self.library.create_asset(self.niche, "tavi_seed_sprite", "character", "Replacement", "Description")
         self.assertEqual(self.asset("tavi_seed_sprite")["name"], "Tavi the Seed Sprite")
 
+    def test_character_updates_keep_the_id_and_separate_appearance_colors(self):
+        self.library.create_asset(self.niche, "mother", "character", "Mother", "Clay figure", "#be9020")
+        self.assertEqual(self.library.get_character(self.niche, "mother")["dress_color"], "#BE9020")
+        self.library.add_variant(self.niche, "mother", "rain_coat", "Rain coat", "Yellow rain coat.", "#eaad0c")
+        self.library.update_character(self.niche, "mother", "Mother Bee", "Clay figure with round glasses", "#aabbcc")
+        self.library.update_character(self.niche, "mother", "", "", "#324aB6", "rain_coat")
+        with self.assertRaisesRegex(ValueError, "#RRGGBB"):
+            self.library.update_character(self.niche, "mother", "Wrong name", "Description", "#faf")
+        with self.assertRaises(LookupError):
+            self.library.get_character(self.niche, "pebble_garden")
+
+        character = self.library.get_character(self.niche, "mother")
+        self.assertEqual(character["id"], "mother")
+        self.assertEqual(character["name"], "Mother Bee")
+        self.assertEqual(character["description"], "Clay figure with round glasses")
+        self.assertEqual(character["dress_color"], "#AABBCC")
+        self.assertEqual(character["variants"][0]["dress_color"], "#324AB6")
+
     @REQUIRES_FFMPEG
     def test_upload_separate_look_alike_characters_and_keep_one_primary_per_variant(self):
         for asset_id, name, detail in (
@@ -129,6 +147,36 @@ class AssetLibraryTests(unittest.TestCase):
         )
 
     @REQUIRES_FFMPEG
+    def test_retrying_a_reference_upload_id_does_not_add_or_replace_an_image(self):
+        asset_id = "tavi_seed_sprite"
+        upload_id = "ref_" + "a" * 32
+        for angle, image in (("front", png()), ("side", png(50))):
+            self.assertEqual(
+                self.library.add_reference(self.niche, asset_id, angle, "", False, image, upload_id=upload_id),
+                upload_id,
+            )
+        uploaded, = [ref for ref in self.asset(asset_id)["references"] if ref["source"] == "upload"]
+        self.assertEqual(uploaded["angle"], "front")
+        self.assertEqual(self.library.reference_path(uploaded).read_bytes(), png())
+
+    @REQUIRES_FFMPEG
+    def test_move_primary_reference_preserves_file_and_selects_replacement(self):
+        asset_id = "tavi_seed_sprite"
+        self.library.add_variant(self.niche, asset_id, "rain_coat", "Rain Coat", "Yellow rain coat.")
+        reference_id = self.library.add_reference(self.niche, asset_id, "side", "", True, png())
+        existing = self.library.add_reference(self.niche, asset_id, "front", "rain_coat", True, png(55))
+        before = next(ref for ref in self.asset(asset_id)["references"] if ref["id"] == reference_id)
+        self.library.update_reference(self.niche, asset_id, reference_id, "full-body", "rain_coat", True)
+        after = {ref["id"]: ref for ref in self.asset(asset_id)["references"]}
+        self.assertTrue(after["bundled_1"]["primary"])
+        self.assertFalse(after[existing]["primary"])
+        self.assertTrue(after[reference_id]["primary"])
+        self.assertEqual(after[reference_id]["angle"], "full-body")
+        self.assertEqual(after[reference_id]["variant_id"], "rain_coat")
+        self.assertEqual(self.library.reference_path(before), self.library.reference_path(after[reference_id]))
+        self.assertEqual(self.library.reference_path(before).read_bytes(), png())
+
+    @REQUIRES_FFMPEG
     def test_invalid_image_payloads_and_paths_are_rejected(self):
         for invalid in (b"<svg/>", png()[:24], png()[:8] + png()[-12:], png(width=4097)):
             with self.subTest(size=len(invalid)):
@@ -175,6 +223,34 @@ class AssetLibraryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             save_audio_upload(audio_root, b"ID3bad media")
         self.assertEqual(list(audio_root.iterdir()), [audio_root / basename])
+
+    @REQUIRES_FFMPEG
+    def test_character_audio_replacement_cleans_old_upload_and_preserves_invalid_attempt(self):
+        asset_id = "tavi_seed_sprite"
+        self.library.save_character_audio(self.niche, asset_id, audio_bytes=wav())
+        path = self.library.character_audio_path(self.niche, asset_id)
+        self.assertEqual(path.read_bytes(), wav())
+        with self.assertRaises(ValueError):
+            self.library.save_character_audio(self.niche, asset_id, audio_bytes=b"bad audio")
+        self.assertEqual(self.library.character_audio_path(self.niche, asset_id), path)
+
+        url = "https://cdn.example.com/mother.wav?clip=sample"
+        self.library.save_character_audio(self.niche, asset_id, url=url)
+        self.assertEqual(self.asset(asset_id)["audio"], {"source": "link", "url": url})
+        self.assertFalse(path.exists())
+        with self.assertRaises(LookupError):
+            self.library.character_audio_path(self.niche, asset_id)
+        self.library.save_character_audio(self.niche, asset_id)
+        self.assertIsNone(self.asset(asset_id)["audio"])
+
+    def test_character_audio_links_require_https_without_credentials_or_controls(self):
+        for invalid in (
+            "http://example.com/sample.wav", "https://", "https://user@example.com/a.wav",
+            "https://example.com/a\n.wav", "https://example.com\\a.wav", "https://example.com:invalid/a.wav",
+        ):
+            with self.subTest(url=invalid), self.assertRaisesRegex(ValueError, "HTTPS audio link"):
+                self.library.save_character_audio(self.niche, "tavi_seed_sprite", url=invalid)
+        self.assertIsNone(self.asset("tavi_seed_sprite")["audio"])
 
 
 if __name__ == "__main__":

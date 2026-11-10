@@ -38,8 +38,12 @@ _ASSETS = [{
         'is_default': True,
     }],
 }, {
-    'id': 'forest', 'kind': 'place', 'name': 'Forest', 'description': 'A shaded path',
-    'references': [], 'variants': [], 'voice_styles': [],
+    'id': 'forest', 'kind': 'place', 'name': 'Forest <b>Path</b>', 'description': 'A shaded path',
+    'references': [{
+        'id': 'ref_02', 'path': '/internal/reference.png', 'source': 'upload',
+        'angle': 'front', 'variant_id': '', 'primary': True,
+    }],
+    'variants': [], 'voice_styles': [],
 }]
 _PRESETS = [{
     'id': 'watercolor', 'kind': 'visual', 'name': 'Watercolor',
@@ -55,28 +59,29 @@ _JOB = {'id': 12, 'title': 'First video', 'status': 'review_keyframes', 'source'
 
 class LibraryViewTests(unittest.TestCase):
     def test_asset_forms_use_expected_fields_and_same_origin_thumbnails(self):
-        html = settings_page([], _BUDGET, _SCHEDULE, 'token', assets=_ASSETS, presets=_PRESETS)
+        html = settings_page(_BUDGET, _SCHEDULE, 'token', assets=_ASSETS, presets=_PRESETS)
         forms = Forms(html).forms
         expected_fields = {
             '/settings/assets': {'asset_id', 'kind', 'name', 'description'},
-            '/settings/assets/pip/references': {'image', 'angle', 'variant_id', 'primary'},
-            '/settings/assets/pip/variants': {'variant_id', 'name', 'description'},
-            '/settings/assets/pip/voices': {'style_id', 'name', 'voice', 'speed', 'expressiveness', 'is_default'},
+            '/settings/assets/forest/references': {'image', 'angle', 'variant_id', 'primary'},
+            '/settings/assets/forest/variants': {'variant_id', 'name', 'description'},
         }
         for action, fields in expected_fields.items():
             with self.subTest(action=action):
                 self.assertEqual(set(forms[action]['fields']), fields | {'csrf_token'})
                 self.assertEqual(forms[action]['attrs']['method'], 'post')
                 self.assertEqual(forms[action]['fields']['csrf_token']['value'], 'token')
-        self.assertEqual(forms['/settings/assets/pip/references']['attrs']['enctype'], 'multipart/form-data')
+        self.assertEqual(forms['/settings/assets/forest/references']['attrs']['enctype'], 'multipart/form-data')
         self.assertNotIn('/settings/assets/forest/voices', forms)
-        self.assertIn('src="/asset-reference/pip/ref_01"', html)
+        self.assertNotIn('/settings/assets/pip/', html)
+        self.assertNotIn('<option value="character">', html)
+        self.assertIn('href="/characters"', html)
+        self.assertIn('src="/asset-reference/forest/ref_02"', html)
         self.assertNotIn('/internal/reference.png', html)
-        self.assertIn('Pip &lt;b&gt;Fox&lt;/b&gt;', html)
-        self.assertIn('0.4 expressiveness', html)
+        self.assertIn('Forest &lt;b&gt;Path&lt;/b&gt;', html)
 
     def test_preset_forms_include_correct_settings_upload_and_default_actions(self):
-        forms = Forms(settings_page([], _BUDGET, _SCHEDULE, 'token', presets=_PRESETS)).forms
+        forms = Forms(settings_page(_BUDGET, _SCHEDULE, 'token', presets=_PRESETS)).forms
         per_kind = {
             'visual': {'style', 'palette'}, 'script': {'tone'},
             'subtitle': {'font_name', 'font_size', 'text_color', 'outline_color', 'position'},
@@ -99,12 +104,17 @@ class LibraryViewTests(unittest.TestCase):
         job = {**_JOB, 'plan_json': json.dumps([scene])}
         html = workspace_page([], job, csrf_token='token', assets=_ASSETS, presets=_PRESETS, production_options={
             'presets': {'visual': 'watercolor'}, 'variants': {'pip': 'raincoat'}, 'voices': {'pip': 'soft'},
+            'characters': ['pip'],
         })
         form = Forms(html).forms['/workspace/12/options']
         self.assertEqual(set(form['fields']), {
             'preset.visual', 'preset.script', 'preset.subtitle', 'preset.audio',
-            'variant.pip', 'voice.pip', 'csrf_token',
+            'characters', 'variant.pip', 'voice.pip', 'csrf_token',
         })
+        self.assertEqual(form['fields']['characters']['value'], 'pip')
+        self.assertIn('checked', form['fields']['characters'])
+        self.assertIn('Choose an outfit with images', html)
+        self.assertNotIn('name="characters" value="forest"', html)
         self.assertEqual(form['fields']['csrf_token']['value'], 'token')
         for identifier in ('watercolor', 'raincoat', 'soft'):
             self.assertIn(f'<option value="{identifier}" selected>', html)

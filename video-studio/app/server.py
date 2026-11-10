@@ -17,6 +17,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+from app.character_view import character_page, characters_page
 from app.db import StudioStore
 from app.inbox_view import create_page, inbox_page, record_page
 from app.niche import load_profile
@@ -27,7 +28,7 @@ from app.published_posts import METRICS, PLATFORMS, group_published_posts, post_
 from app.published_view import published_post_page, published_posts_page
 from app.publishing import StudioPublishing
 from app.settings import StudioSettings
-from app.settings_view import settings_page
+from app.settings_view import providers_page, settings_page
 from app.watchdog import get_issue, list_issues
 from app.watchdog_view import watchdog_issue_page, watchdog_page
 from app.web import workspace_page
@@ -46,6 +47,11 @@ PUBLISHED_ORIGINAL = re.compile(r"/published-posts/([0-9]{1,18})/original/([0-9]
 WATCHDOG_ISSUE = re.compile(r"/watch-dog/([a-z0-9-]{1,80})")
 JOB_MEDIA_PATH = re.compile(r"([0-9]{1,18})/([a-zA-Z0-9_.-]+)")
 ASSET_ID = r"[a-z][a-z0-9_]{0,63}"
+REFERENCE_ID = r"[a-zA-Z0-9_-]{1,80}"
+CHARACTER_PAGE = re.compile(rf"/characters/({ASSET_ID})(/edit)?")
+CHARACTER_ACTION = re.compile(
+    rf"/characters/({ASSET_ID})/(edit|references(?:/{REFERENCE_ID})?|variants|outfit-color|voices|audio|audio-link|audio-remove)"
+)
 
 
 def parse_upload(content_type, body):
@@ -247,10 +253,25 @@ class StudioHandler(BaseHTTPRequestHandler):
 
     def _show_settings(self, status=HTTPStatus.OK, notice="", *, open_asset=None, open_presets=False):
         self._reply(status, settings_page(
-            self.server.settings.list_providers(), self.server.settings.get_budgets(),
+            self.server.settings.get_budgets(),
             self.server.planning.idea_schedule(), self.server.csrf_token, notice,
             assets=self.server.library.assets.list_assets(), presets=self.server.library.presets(),
             open_asset=open_asset, open_presets=open_presets,
+        ))
+
+    def _show_providers(self, status=HTTPStatus.OK, notice=""):
+        self._reply(status, providers_page(
+            self.server.settings.list_providers(), self.server.csrf_token, notice,
+        ))
+
+    def _show_character(self, asset_id=None, *, edit=False, status=HTTPStatus.OK, notice="", values=None):
+        try:
+            asset = self.server.library.assets.get_character("kids_3d", asset_id) if asset_id else None
+        except LookupError:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        self._reply(status, character_page(
+            asset, self.server.csrf_token, edit=edit, notice=notice, values=values,
         ))
 
     def _redirect(self, location):
@@ -259,7 +280,7 @@ class StudioHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
-    def _show_workspace(self, job=None, status=HTTPStatus.OK, notice="", discover=False):
+    def _show_workspace(self, job=None, status=HTTPStatus.OK, notice="", discover=False, *, options_override=None):
         tasks = self.server.production.media.job_tasks(job["id"]) if job else ()
         posts, metrics, channels = (), (), ()
         assets, presets, options = (), (), None
@@ -267,7 +288,7 @@ class StudioHandler(BaseHTTPRequestHandler):
             niche_id = job["niche_id"] or "kids_3d"
             assets = self.server.library.assets.list_assets(niche_id)
             presets = self.server.library.presets(niche_id)
-            options = json.loads(job["production_options_json"])
+            options = options_override if options_override is not None else json.loads(job["production_options_json"])
             posts = self.server.publishing.posts.job_posts(job["id"])
             metrics = self.server.publishing.metrics(job["id"])
             if discover and job["preview_path"] and job["status"] in ("preview_ready", "needs_review"):
@@ -280,10 +301,11 @@ class StudioHandler(BaseHTTPRequestHandler):
         self._reply(status, workspace_page(
             self.server.store.list_jobs(), job, notice, tasks, self.server.csrf_token,
             posts=posts, channels=channels, metrics=metrics, assets=assets, presets=presets, production_options=options,
+            production_options_open=options_override is not None,
         ))
 
     def _serve_reference(self, relative_path):
-        match = re.fullmatch(rf"({ASSET_ID})/([a-zA-Z0-9_-]{{1,80}})", relative_path)
+        match = re.fullmatch(rf"({ASSET_ID})/({REFERENCE_ID})", relative_path)
         if not match:
             self.send_error(HTTPStatus.NOT_FOUND)
             return
@@ -297,6 +319,17 @@ class StudioHandler(BaseHTTPRequestHandler):
             self.send_error(HTTPStatus.NOT_FOUND)
             return
         self._reply(HTTPStatus.OK, image, mimetypes.guess_type(path.name)[0] or "application/octet-stream")
+
+    def _serve_character_audio(self, asset_id):
+        if not re.fullmatch(ASSET_ID, asset_id):
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        try:
+            path = self.server.library.assets.character_audio_path("kids_3d", asset_id)
+        except (LookupError, OSError, ValueError):
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        self._stream_media(path)
 
     def _local_media_file(self, relative_path):
         root = self.server.production.root.resolve()
@@ -399,9 +432,17 @@ class StudioHandler(BaseHTTPRequestHandler):
         elif url.path == "/settings":
             params = parse_qs(url.query)
             asset = params.get("asset", [None])[0]
+            if asset and re.fullmatch(ASSET_ID, asset):
+                try:
+                    self.server.library.assets.get_character("kids_3d", asset)
+                except LookupError:
+                    pass
+                else:
+                    self._redirect(f"/characters/{asset}")
+                    return
             self._show_settings(open_asset=asset, open_presets=params.get("presets") == ["1"])
         elif url.path == "/providers":
-            self._redirect("/settings")
+            self._show_providers()
         elif url.path == "/watch-dog":
             issues = list_issues(self.server.store, self.server.settings)
             self._reply(HTTPStatus.OK, watchdog_page(issues))
@@ -411,6 +452,13 @@ class StudioHandler(BaseHTTPRequestHandler):
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
             self._reply(HTTPStatus.OK, watchdog_issue_page(issue))
+        elif url.path == "/characters":
+            query = parse_qs(url.query).get("q", [""])[0].strip()[:100]
+            self._reply(HTTPStatus.OK, characters_page(self.server.library.assets.list_assets(), query))
+        elif url.path == "/characters/new/profile":
+            self._show_character(edit=True)
+        elif character := CHARACTER_PAGE.fullmatch(url.path):
+            self._show_character(character[1], edit=bool(character[2]))
         elif url.path == "/workspace":
             params = parse_qs(url.query)
             job_id = params.get("job", [None])[0]
@@ -428,11 +476,59 @@ class StudioHandler(BaseHTTPRequestHandler):
             self._serve_media(url.path.removeprefix("/media/"))
         elif url.path.startswith("/asset-reference/"):
             self._serve_reference(url.path.removeprefix("/asset-reference/"))
+        elif url.path.startswith("/character-audio/"):
+            self._serve_character_audio(url.path.removeprefix("/character-audio/"))
         elif url.path == "/studio.css":
             css = (STUDIO_ROOT / "app/static/studio.css").read_text(encoding="utf-8")
             self._reply(HTTPStatus.OK, css, "text/css; charset=utf-8")
+        elif url.path == "/characters.js":
+            script = (STUDIO_ROOT / "app/static/characters.js").read_text(encoding="utf-8")
+            self._reply(HTTPStatus.OK, script, "text/javascript; charset=utf-8")
         else:
             self.send_error(HTTPStatus.NOT_FOUND)
+
+    def _save_asset_details(self, niche_id, asset_id, action, field, files):
+        assets = self.server.library.assets
+        if action == "references":
+            return assets.add_reference(
+                niche_id, asset_id, field("angle"), field("variant_id"), field("primary") == "yes", files.get("image"),
+                upload_id=field("upload_id"),
+            )
+        if action == "variants":
+            assets.add_variant(niche_id, asset_id, field("variant_id"), field("name"), field("description"),
+                               field("dress_color"))
+        elif action == "voices":
+            assets.save_voice_style(
+                niche_id, asset_id, field("style_id"), field("name"), field("voice"), field("speed"),
+                field("is_default") == "yes", field("expressiveness") or None,
+            )
+
+    def _save_character(self, niche_id, asset_id, action, field, files):
+        assets = self.server.library.assets
+        if action == "edit":
+            assets.update_character(niche_id, asset_id, field("name"), field("description"), field("dress_color"))
+        elif action == "outfit-color":
+            if not field("variant_id"):
+                raise ValueError("Choose an outfit.")
+            assets.update_character(niche_id, asset_id, "", "", field("dress_color"), field("variant_id"))
+        elif action.startswith("references/"):
+            assets.update_reference(
+                niche_id, asset_id, action.removeprefix("references/"), field("angle"), field("variant_id"),
+                field("primary") == "yes",
+            )
+        elif action == "audio":
+            if "audio" not in files:
+                raise ValueError("Choose an MP3 or WAV audio file.")
+            assets.save_character_audio(niche_id, asset_id, audio_bytes=files["audio"])
+        elif action == "audio-link":
+            if not field("url").strip():
+                raise ValueError("Enter a direct HTTPS audio link.")
+            assets.save_character_audio(niche_id, asset_id, url=field("url"))
+        elif action == "audio-remove":
+            assets.save_character_audio(niche_id, asset_id)
+        else:
+            assets.get_character(niche_id, asset_id)
+            return self._save_asset_details(niche_id, asset_id, action, field, files)
 
     def do_POST(self):
         if not self._is_local_host():
@@ -442,15 +538,24 @@ class StudioHandler(BaseHTTPRequestHandler):
         content_type = self.headers.get_content_type()
         asset_route = re.fullmatch(rf"/settings/assets/({ASSET_ID})/(references|variants|voices)", path)
         preset_route = re.fullmatch(r"/settings/presets/(visual|script|subtitle|audio)", path)
-        upload = (asset_route and asset_route[2] == "references") or (preset_route and preset_route[1] == "audio")
+        character_route = CHARACTER_ACTION.fullmatch(path)
+        character_reference = character_route and character_route[2] == "references"
+        character_audio = character_route and character_route[2] == "audio"
+        upload_json = character_reference and self.headers.get("Accept") == "application/json"
+        upload = (character_reference or character_audio or (asset_route and asset_route[2] == "references")
+                  or (preset_route and preset_route[1] == "audio"))
         expected = "multipart/form-data" if upload else "application/x-www-form-urlencoded"
         if content_type != expected:
             self.send_error(HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
             return
 
+        maximum = MAX_FORM_SIZE
+        if character_audio:
+            maximum = 21 * 1024 * 1024
+        elif upload:
+            maximum = (42 if preset_route else 11) * 1024 * 1024
         try:
             length = int(self.headers.get("Content-Length", "0"))
-            maximum = ((42 if preset_route else 11) * 1024 * 1024) if upload else MAX_FORM_SIZE
             if not 0 < length <= maximum:
                 self.send_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
                 return
@@ -494,6 +599,7 @@ class StudioHandler(BaseHTTPRequestHandler):
         library = self.server.library
         niche_id = "kids_3d"
         in_settings = path.startswith("/settings/")
+        options = None
         try:
             if path == "/ideas":
                 store.add_idea(field("prompt"), field("title") or None)
@@ -543,17 +649,13 @@ class StudioHandler(BaseHTTPRequestHandler):
             elif path == "/settings/assets":
                 library.assets.create_asset(niche_id, field("asset_id"), field("kind"), field("name"), field("description"))
             elif asset_route:
-                asset_id, action = asset_route.groups()
-                if action == "references":
-                    library.assets.add_reference(niche_id, asset_id, field("angle"), field("variant_id"),
-                                                 field("primary") == "yes", files.get("image"))
-                elif action == "variants":
-                    library.assets.add_variant(niche_id, asset_id, field("variant_id"), field("name"), field("description"))
-                else:
-                    library.assets.save_voice_style(
-                        niche_id, asset_id, field("style_id"), field("name"), field("voice"), field("speed"),
-                        field("is_default") == "yes", field("expressiveness") or None,
-                    )
+                self._save_asset_details(niche_id, *asset_route.groups(), field, files)
+            elif path == "/characters":
+                library.assets.create_asset(
+                    niche_id, field("asset_id"), "character", field("name"), field("description"), field("dress_color"),
+                )
+            elif character_route:
+                reference_id = self._save_character(niche_id, *character_route.groups(), field, files)
             elif preset_route:
                 library.add_preset(niche_id, preset_route[1], field("preset_id"), field("name"),
                                    {name: field(name) for name in form}, files, field("is_default") == "yes")
@@ -569,6 +671,7 @@ class StudioHandler(BaseHTTPRequestHandler):
                     options = {group: {name[len(prefix):]: field(name) for name in form
                                        if name.startswith(prefix) and field(name)}
                                for group, prefix in (("presets", "preset."), ("variants", "variant."), ("voices", "voice."))}
+                    options["characters"] = sorted(set(form.get("characters", [])))
                     self.server.production.configure(job_id, options)
                 elif workspace_route[2] == "publish":
                     mode = field("mode")
@@ -585,9 +688,19 @@ class StudioHandler(BaseHTTPRequestHandler):
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
         except (ValueError, PostizError) as error:
-            if workspace_route:
+            if upload_json:
+                self._reply(HTTPStatus.BAD_REQUEST, json.dumps({"notice": str(error)}), "application/json")
+            elif character_route or path == "/characters":
+                asset_id = character_route[1] if character_route else None
+                values = None
+                if path == "/characters" or character_route[2] == "edit":
+                    values = {name: field(name) for name in ("asset_id", "name", "description", "dress_color")}
+                self._show_character(asset_id, edit=True, status=HTTPStatus.BAD_REQUEST, notice=str(error), values=values)
+            elif key_route or provider_route:
+                self._show_providers(HTTPStatus.BAD_REQUEST, str(error))
+            elif workspace_route:
                 self._show_workspace(store.get_job(job_id), HTTPStatus.BAD_REQUEST, str(error),
-                                     discover=workspace_route[2] == "publish")
+                                     discover=workspace_route[2] == "publish", options_override=options)
             elif create_kind:
                 fields = ("title", "prompt", "trends", "prompts", "start_date", "run_at", "timezone", "daily_limit")
                 self._reply(HTTPStatus.BAD_REQUEST, create_page(
@@ -605,7 +718,25 @@ class StudioHandler(BaseHTTPRequestHandler):
             return
 
         location = f"/workspace?job={job_id}" if workspace_route else ("/settings" if in_settings else "/")
-        if asset_route or path == "/settings/assets":
+        if upload_json:
+            self._reply(HTTPStatus.CREATED, json.dumps({"id": reference_id, "notice": "Image uploaded."}), "application/json")
+            return
+        if key_route or provider_route:
+            location = "/providers"
+        elif path == "/characters":
+            location = f"/characters/{field('asset_id')}/edit"
+        elif character_route:
+            location = f"/characters/{character_route[1]}"
+            action = character_route[2]
+            if action != "edit":
+                location += "/edit"
+                if action.startswith("references"):
+                    location += "#character-images"
+                elif action.startswith("audio") or action == "voices":
+                    location += "#character-voice"
+                else:
+                    location += "#character-overview"
+        elif asset_route or path == "/settings/assets":
             asset_id = asset_route[1] if asset_route else field("asset_id")
             location = f"/settings?asset={asset_id}#asset-{asset_id}"
         elif preset_route or preset_default:

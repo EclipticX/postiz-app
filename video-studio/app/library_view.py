@@ -34,7 +34,7 @@ def _asset_form(csrf_token):
         {_csrf(csrf_token)}
         <div class="fields">
           {_identifier_input('asset_id', 'Stable asset ID')}
-          <label>Kind{_choices('kind', ((kind, kind.capitalize()) for kind in ('character', 'place', 'item')))}</label>
+          <label>Kind{_choices('kind', (('place', 'Place'), ('item', 'Item')))}</label>
         </div>
         <small>Use lowercase letters, numbers and underscores for IDs. Start with a letter.</small>
         <label>Name<input name="name" maxlength="100" required></label>
@@ -159,7 +159,7 @@ def asset_library_section(assets, csrf_token, open_asset=None):
     <details class="panel records library-panel" id="asset-library"{' open' if open_asset else ''}>
       <summary>Asset Library</summary>
       <div class="library-body">
-        <p class="muted">Manage reference images, appearances and character voices.</p>
+        <p class="muted">Manage places, items and their reference images. For cast profiles, open <a href="/characters">Characters</a>.</p>
         {_asset_form(csrf_token)}
         {cards}
       </div>
@@ -253,7 +253,7 @@ def production_presets_section(presets, csrf_token, expanded=False):
     </details>'''
 
 
-def production_options_section(job, assets, presets, options, csrf_token):
+def production_options_section(job, assets, presets, options, csrf_token, *, expanded=False):
     if job['status'] not in ('queued', 'review_keyframes', 'preview_ready', 'needs_review'):
         return ''
     options = options or {}
@@ -267,9 +267,18 @@ def production_options_section(job, assets, presets, options, csrf_token):
             selected=selected_presets.get(kind), default=f'Default ({default})' if default else 'Use built-in settings',
         )
         preset_fields.append(f'<label>{label} preset{select}</label>')
+    selected_characters = set(options.get('characters', []))
+    character_fields = []
     asset_fields = []
     for asset in assets:
         asset_id = asset['id']
+        if asset['kind'] == 'character' and asset['references']:
+            checked = ' checked' if asset_id in selected_characters else ''
+            hint = '' if any(not ref['variant_id'] for ref in asset['references']) else ' · Choose an outfit with images'
+            character_fields.append(
+                f'<label><input type="checkbox" name="characters" value="{_text(asset_id)}"{checked}> '
+                f'{_text(asset["name"])}<small>{hint}</small></label>'
+            )
         if asset['variants']:
             select = _choices(
                 f'variant.{asset_id}', ((variant['id'], variant['name']) for variant in asset['variants']),
@@ -283,6 +292,14 @@ def production_options_section(job, assets, presets, options, csrf_token):
                 selected=options.get('voices', {}).get(asset_id), default=f'Default ({default})' if default else 'Use default voice',
             )
             asset_fields.append(f'<label>{_text(asset["name"])} voice{select}</label>')
+    character_section = ''
+    if character_fields:
+        character_section = f'''
+        <fieldset class="stack">
+          <legend>Characters</legend>
+          <small>Leave all unchecked to let Studio choose the cast.</small>
+          <div class="fields">{''.join(character_fields)}</div>
+        </fieldset>'''
     if job['status'] == 'queued':
         description = 'Options apply when planning starts.'
         button = 'Save options'
@@ -290,12 +307,13 @@ def production_options_section(job, assets, presets, options, csrf_token):
         description = 'Saving changes reruns planning and requires fresh keyframe approval.'
         button = 'Save options and replan'
     return f'''
-    <details class="record production-options">
+    <details class="record production-options"{' open' if expanded else ''}>
       <summary>Production options</summary>
       <form class="stack library-body" method="post" action="/workspace/{int(job['id'])}/options">
         {_csrf(csrf_token)}
         <p class="muted">{description}</p>
         <fieldset class="fields"><legend>Presets</legend>{''.join(preset_fields)}</fieldset>
+        {character_section}
         {'<fieldset class="fields"><legend>Asset overrides</legend>' + ''.join(asset_fields) + '</fieldset>' if asset_fields else ''}
         <button type="submit">{button}</button>
       </form>
