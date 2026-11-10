@@ -28,6 +28,8 @@ from app.published_view import published_post_page, published_posts_page
 from app.publishing import StudioPublishing
 from app.settings import StudioSettings
 from app.settings_view import settings_page
+from app.watchdog import get_issue, list_issues
+from app.watchdog_view import watchdog_issue_page, watchdog_page
 from app.web import workspace_page
 
 
@@ -41,6 +43,7 @@ INBOX_RECORD_TYPES = {"manual", "claude", "schedule"}
 INBOX_STATUSES = {"pending", "approved", "later", "rejected", "deleted"}
 PUBLISHED_POST_PAGE = re.compile(r"/published-posts/([0-9]{1,18})")
 PUBLISHED_ORIGINAL = re.compile(r"/published-posts/([0-9]{1,18})/original/([0-9]{1,18})")
+WATCHDOG_ISSUE = re.compile(r"/watch-dog/([a-z0-9-]{1,80})")
 JOB_MEDIA_PATH = re.compile(r"([0-9]{1,18})/([a-zA-Z0-9_.-]+)")
 ASSET_ID = r"[a-z][a-z0-9_]{0,63}"
 
@@ -397,6 +400,17 @@ class StudioHandler(BaseHTTPRequestHandler):
             params = parse_qs(url.query)
             asset = params.get("asset", [None])[0]
             self._show_settings(open_asset=asset, open_presets=params.get("presets") == ["1"])
+        elif url.path == "/providers":
+            self._redirect("/settings")
+        elif url.path == "/watch-dog":
+            issues = list_issues(self.server.store, self.server.settings)
+            self._reply(HTTPStatus.OK, watchdog_page(issues))
+        elif issue_path := WATCHDOG_ISSUE.fullmatch(url.path):
+            issue = get_issue(self.server.store, self.server.settings, issue_path[1])
+            if issue is None:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            self._reply(HTTPStatus.OK, watchdog_issue_page(issue))
         elif url.path == "/workspace":
             params = parse_qs(url.query)
             job_id = params.get("job", [None])[0]

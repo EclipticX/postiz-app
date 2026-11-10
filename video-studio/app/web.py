@@ -11,10 +11,15 @@ def _label(value):
 
 
 def _page(title, active, content, notice, *, heading_action=''):
-    inbox_current = ' aria-current="page"' if active == '/' else ''
-    workspace_current = ' aria-current="page"' if active == '/workspace' else ''
-    published_current = ' aria-current="page"' if active == '/published-posts' else ''
-    settings_current = ' aria-current="page"' if active == '/settings' else ''
+    links = (
+        ('/', 'Idea Inbox'), ('/workspace', 'Video Workspace'), ('/published-posts', 'Published Posts'),
+        ('/watch-dog', 'Watch Dog'), ('/settings', 'Settings'),
+    )
+    navigation_links = []
+    for path, label in links:
+        current = ' aria-current="page"' if active == path else ''
+        navigation_links.append(f'<a href="{path}"{current}>{label}</a>')
+    navigation = ''.join(navigation_links)
     title = _text(title)
     heading = f'<h1>{title}</h1>'
     if heading_action:
@@ -29,16 +34,13 @@ def _page(title, active, content, notice, *, heading_action=''):
   <link rel="stylesheet" href="/studio.css">
 </head>
 <body>
-  <header class="topbar">
-    <div class="shell topbar-inner">
-      <a class="brand" href="/">Video Studio</a>
-      <nav aria-label="Studio navigation">
-        <a href="/"{inbox_current}>Idea Inbox</a>
-        <a href="/workspace"{workspace_current}>Video Workspace</a>
-        <a href="/published-posts"{published_current}>Published Posts</a>
-        <a href="/settings"{settings_current}>Settings</a>
-      </nav>
-    </div>
+  <header class="studio-sidebar">
+    <a class="brand" href="/">Video Studio</a>
+    <nav class="desktop-navigation" aria-label="Studio navigation">{navigation}</nav>
+    <details class="mobile-navigation">
+      <summary>Menu</summary>
+      <nav aria-label="Studio navigation">{navigation}</nav>
+    </details>
   </header>
   <main class="shell">
     {heading}
