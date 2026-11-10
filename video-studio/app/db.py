@@ -258,6 +258,44 @@ PRAGMA user_version = 5;
 """
 
 
+INBOX_SCHEMA = """
+ALTER TABLE ideas ADD COLUMN deleted_at TEXT
+    CHECK (deleted_at IS NULL OR status <> 'accepted');
+
+ALTER TABLE prompt_schedules ADD COLUMN title TEXT;
+ALTER TABLE prompt_schedules ADD COLUMN created_at TEXT;
+ALTER TABLE prompt_schedules ADD COLUMN rejected_at TEXT
+    CHECK (rejected_at IS NULL OR status = 'draft');
+ALTER TABLE prompt_schedules ADD COLUMN deleted_at TEXT
+    CHECK (deleted_at IS NULL OR status = 'draft');
+
+PRAGMA user_version = 6;
+"""
+
+
+IDEA_RECORDS = """
+SELECT ideas.*, jobs.id AS job_id, (
+    SELECT MIN(scheduled_at) FROM publishing_requests
+    WHERE job_id = jobs.id AND draft = 0 AND status IN ('scheduled', 'published')
+) AS publish_at
+FROM ideas LEFT JOIN jobs ON jobs.idea_id = ideas.id
+"""
+
+
+SCHEDULE_RECORDS = """
+SELECT prompt_schedules.*, (
+    SELECT MIN(publishing_requests.scheduled_at)
+    FROM schedule_entries
+    JOIN jobs ON jobs.schedule_entry_id = schedule_entries.id
+    JOIN publishing_requests ON publishing_requests.job_id = jobs.id
+    WHERE schedule_entries.schedule_id = prompt_schedules.id
+        AND publishing_requests.draft = 0
+        AND publishing_requests.status IN ('scheduled', 'published')
+) AS publish_at
+FROM prompt_schedules
+"""
+
+
 def _apply_schema(db, script):
     # executescript commits any open transaction before running the script.
     statement = ""
@@ -298,7 +336,7 @@ class StudioStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connection(write=True) as db:
             version = db.execute("PRAGMA user_version").fetchone()[0]
-            if not 0 <= version <= 5:
+            if not 0 <= version <= 6:
                 raise RuntimeError(f"Unsupported Studio database version {version}.")
             if version < 1:
                 _apply_schema(db, SCHEMA)
@@ -310,6 +348,8 @@ class StudioStore:
                 _apply_schema(db, PUBLISHING_SCHEMA)
             if version < 5:
                 _apply_schema(db, LIBRARY_SCHEMA)
+            if version < 6:
+                _apply_schema(db, INBOX_SCHEMA)
 
     def seed_niche(self, profile):
         with self._connection(write=True) as db:
@@ -340,18 +380,20 @@ class StudioStore:
                 ],
             )
 
-    def list_ideas(self):
+    def list_ideas(self, *, include_deleted=False):
         with self._connection() as db:
             return [
                 dict(row)
                 for row in db.execute(
-                    """
-                    SELECT ideas.*, jobs.id AS job_id
-                    FROM ideas LEFT JOIN jobs ON jobs.idea_id = ideas.id
-                    ORDER BY ideas.id DESC
-                    """
+                    IDEA_RECORDS + "WHERE (? OR ideas.deleted_at IS NULL) ORDER BY ideas.id DESC",
+                    (include_deleted,),
                 )
             ]
+
+    def get_idea(self, idea_id):
+        with self._connection() as db:
+            row = db.execute(IDEA_RECORDS + "WHERE ideas.id = ?", (idea_id,)).fetchone()
+            return dict(row) if row is not None else None
 
     def add_idea(self, prompt, title=None, source="manual"):
         prompt = _clean_prompt(prompt)
@@ -375,6 +417,8 @@ class StudioStore:
             idea = db.execute("SELECT * FROM ideas WHERE id = ?", (idea_id,)).fetchone()
             if idea is None:
                 raise LookupError("Idea not found.")
+            if idea["deleted_at"]:
+                raise ValueError("Restore this idea before reviewing it.")
             if idea["status"] == status:
                 return
             if idea["status"] in ("accepted", "rejected"):
@@ -399,7 +443,7 @@ class StudioStore:
             row = db.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
             return dict(row) if row is not None else None
 
-    def create_schedule(self, prompts, start_date, run_at, timezone, daily_limit):
+    def create_schedule(self, prompts, start_date, run_at, timezone, daily_limit, *, title=None):
         if not isinstance(prompts, (list, tuple)) or not prompts:
             raise ValueError("Enter at least one prompt.")
         if len(prompts) > 100:
@@ -407,6 +451,10 @@ class StudioStore:
         prompts = [_clean_prompt(prompt) for prompt in prompts]
         if type(daily_limit) is not int or not 1 <= daily_limit <= len(prompts):
             raise ValueError("Videos per day must be between 1 and the number of prompts.")
+        if title is not None:
+            if not isinstance(title, str) or len(title.strip()) > 100:
+                raise ValueError("Enter a schedule title of up to 100 characters.")
+            title = title.strip() or None
 
         try:
             starts = date.fromisoformat(start_date)
@@ -427,10 +475,11 @@ class StudioStore:
         with self._connection(write=True) as db:
             schedule_id = db.execute(
                 """
-                INSERT INTO prompt_schedules (niche_id, start_date, run_at, timezone, daily_limit)
-                VALUES ((SELECT id FROM niches WHERE id = 'kids_3d'), ?, ?, ?, ?)
+                INSERT INTO prompt_schedules (niche_id, start_date, run_at, timezone, daily_limit, title, created_at)
+                VALUES ((SELECT id FROM niches WHERE id = 'kids_3d'), ?, ?, ?, ?, ?,
+                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
                 """,
-                (start_date, run_at, timezone, daily_limit),
+                (start_date, run_at, timezone, daily_limit, title),
             ).lastrowid
             db.executemany(
                 "INSERT INTO schedule_entries (schedule_id, prompt) VALUES (?, ?)",
@@ -438,9 +487,20 @@ class StudioStore:
             )
             return schedule_id
 
-    def list_schedules(self):
+    def list_schedules(self, *, include_deleted=False):
+        return self._read_schedules(
+            SCHEDULE_RECORDS + "WHERE (? OR prompt_schedules.deleted_at IS NULL) ORDER BY prompt_schedules.id DESC",
+            (include_deleted,),
+        )
+
+    def get_schedule(self, schedule_id):
+        schedules = self._read_schedules(SCHEDULE_RECORDS + "WHERE prompt_schedules.id = ?", (schedule_id,))
+        return schedules[0] if schedules else None
+
+    def _read_schedules(self, query, parameters):
         with self._connection() as db:
-            schedules = [dict(row) for row in db.execute("SELECT * FROM prompt_schedules ORDER BY id DESC")]
+            db.execute("BEGIN")
+            schedules = [dict(row) for row in db.execute(query, parameters)]
             for schedule in schedules:
                 schedule["entries"] = [
                     dict(row)
@@ -464,17 +524,53 @@ class StudioStore:
             return schedules
 
     def set_schedule_status(self, schedule_id, status):
-        if status not in ("active", "paused"):
-            raise ValueError("Choose Activate, Pause, or Resume.")
+        if status not in ("active", "paused", "rejected"):
+            raise ValueError("Choose Activate, Pause, Resume, or Reject.")
         with self._connection(write=True) as db:
             schedule = db.execute(
-                "SELECT status FROM prompt_schedules WHERE id = ?", (schedule_id,)
+                "SELECT status, rejected_at, deleted_at FROM prompt_schedules WHERE id = ?", (schedule_id,)
             ).fetchone()
             if schedule is None:
                 raise LookupError("Prompt schedule not found.")
+            if schedule["deleted_at"]:
+                raise ValueError("Restore this schedule before changing its status.")
+            if schedule["rejected_at"]:
+                if status == "rejected":
+                    return
+                raise ValueError("This schedule has already been rejected.")
+            if status == "rejected":
+                if schedule["status"] != "draft":
+                    raise ValueError("Only a draft schedule can be rejected.")
+                db.execute(
+                    "UPDATE prompt_schedules SET rejected_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+                    (schedule_id,),
+                )
+                return
             if schedule["status"] == "draft" and status == "paused":
                 raise ValueError("Activate this schedule before pausing it.")
             db.execute("UPDATE prompt_schedules SET status = ? WHERE id = ?", (status, schedule_id))
+
+    def set_inbox_deleted(self, kind, record_id, deleted):
+        tables = {"idea": ("ideas", ("accepted",)), "schedule": ("prompt_schedules", ("active", "paused"))}
+        if kind not in tables or type(deleted) is not bool:
+            raise ValueError("Choose a valid record and a delete or restore action.")
+        table, approved_states = tables[kind]
+        with self._connection(write=True) as db:
+            record = db.execute(f"SELECT status, deleted_at FROM {table} WHERE id = ?", (record_id,)).fetchone()
+            if record is None:
+                raise LookupError("Inbox record not found.")
+            if (record["deleted_at"] is not None) == deleted:
+                return
+            if deleted and record["status"] in approved_states:
+                raise ValueError("Approved records cannot be deleted.")
+            db.execute(
+                f"""
+                UPDATE {table}
+                SET deleted_at = CASE WHEN ? THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now') END
+                WHERE id = ?
+                """,
+                (deleted, record_id),
+            )
 
     def dispatch_due(self, now):
         """Queue today's due prompts once. A missed day never increases today's quota."""
@@ -482,7 +578,12 @@ class StudioStore:
             raise ValueError("Use a timezone-aware scheduler time.")
         dispatched = 0
         with self._connection(write=True) as db:
-            schedules = db.execute("SELECT * FROM prompt_schedules WHERE status = 'active'").fetchall()
+            schedules = db.execute(
+                """
+                SELECT * FROM prompt_schedules
+                WHERE status = 'active' AND rejected_at IS NULL AND deleted_at IS NULL
+                """
+            ).fetchall()
             for schedule in schedules:
                 local_now = now.astimezone(ZoneInfo(schedule["timezone"]))
                 today = local_now.date().isoformat()

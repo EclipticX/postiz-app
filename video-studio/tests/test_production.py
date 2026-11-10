@@ -79,6 +79,16 @@ class ProductionTests(unittest.TestCase):
         original_file = self.write_fixture(self.production.root / original)
         original_subtitles = self.write_fixture(original_file.with_suffix(".srt"))
         backup = self.write_fixture(original_file.with_name("preview.backup.mp4"))
+        published = self.write_fixture(original_file.with_name(f"preview.{'0' * 32}.mp4"))
+        with self.store._connection(write=True) as db:
+            db.execute(
+                "UPDATE jobs SET status = 'preview_ready', preview_path = ? WHERE id = ?",
+                (published.relative_to(self.production.root).as_posix(), self.job),
+            )
+        posts = self.production.posts
+        request = posts.queue(self.job, {"id": "channel", "identifier": "youtube"}, "Title", "", [], NOW)
+        posts.next_request()
+        posts.finish(request, "published-post")
         with self.store._connection(write=True) as db:
             db.execute(
                 "UPDATE jobs SET status = 'render_ready', preview_path = ? WHERE id = ?",
@@ -98,6 +108,7 @@ class ProductionTests(unittest.TestCase):
         self.assertFalse((self.production.root / first).exists())
         self.assertTrue((self.production.root / second).is_file())
         self.assertTrue(backup.is_file())
+        self.assertTrue(published.is_file())
 
     def test_manual_gate_failover_poll_and_preview(self):
         with patch("app.production.adapter_for", self.adapter), \

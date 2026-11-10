@@ -204,6 +204,41 @@ class PostizClientTests(unittest.TestCase):
         with self.assertRaises(PostizError):
             self.client.analytics('../unsafe-path')
 
+    def test_original_post_lookup_matches_published_id_within_utc_date_window(self):
+        release = 'https://www.youtube.com/watch?v=real-video'
+        self.connection.getresponse.return_value = _response({'posts': [
+            {'id': 'another-post', 'state': 'PUBLISHED', 'releaseURL': 'https://www.youtube.com/watch?v=other'},
+            {'id': 'post-1', 'state': 'QUEUE', 'releaseURL': 'https://www.youtube.com/watch?v=pending'},
+            {'id': 'post-1', 'state': 'PUBLISHED', 'releaseURL': release},
+        ]})
+
+        self.assertEqual(self.client.original_post_url('post-1', '2026-11-10T02:10:00+06:00'), release)
+        self.connection.request.assert_called_once_with(
+            'GET', '/api/public/v1/posts?startDate=2026-11-08&endDate=2026-11-11', body=None,
+            headers={'Accept': 'application/json', 'Authorization': _KEY},
+        )
+
+    def test_original_post_lookup_ignores_unpublished_and_unsafe_links(self):
+        scheduled = '2026-11-09T09:00:00Z'
+        for url in (None, '', '/watch', 'http://example.com/post', 'javascript:alert(1)',
+                    'https://account@example.com/post', 'https://example.com/post\r\nheader: injected',
+                    'https://example.com:broken/post', 'https://example.com\\bad/post'):
+            with self.subTest(url=url):
+                self.connection.getresponse.return_value = _response({'posts': [
+                    {'id': 'post-1', 'state': 'PUBLISHED', 'releaseURL': url},
+                    {'id': 'other-post', 'state': 'PUBLISHED', 'releaseURL': 'https://example.com/other'},
+                ]})
+                self.assertIsNone(self.client.original_post_url('post-1', scheduled))
+        self.connection.getresponse.return_value = _response({'posts': [
+            {'id': 'post-1', 'state': 'DRAFT', 'releaseURL': 'https://example.com/draft'},
+        ]})
+        self.assertIsNone(self.client.original_post_url('post-1', scheduled))
+        self.connection.request.reset_mock()
+        with self.assertRaises(PostizError):
+            self.client.original_post_url('../unsafe-path', scheduled)
+        self.assertIsNone(self.client.original_post_url('post-1', None))
+        self.connection.request.assert_not_called()
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -18,19 +18,30 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from app.db import StudioStore
+from app.inbox_view import create_page, inbox_page, record_page
 from app.niche import load_profile
 from app.planning import StudioPlanner
 from app.postiz_client import PostizError
 from app.production import StudioProduction
+from app.published_posts import METRICS, PLATFORMS, group_published_posts, post_metrics
+from app.published_view import published_post_page, published_posts_page
 from app.publishing import StudioPublishing
 from app.settings import StudioSettings
 from app.settings_view import settings_page
-from app.web import inbox_page, workspace_page
+from app.web import workspace_page
 
 
 STUDIO_ROOT = Path(__file__).resolve().parents[1]
 MAX_FORM_SIZE = 2 * 1024 * 1024
 LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
+INBOX_RECORD = re.compile(r"/(ideas|schedules)/([0-9]{1,18})")
+INBOX_ARCHIVE = re.compile(r"/(ideas|schedules)/([0-9]{1,18})/archive")
+INBOX_CREATE_TYPES = {"/ideas": "manual", "/ideas/generate": "claude", "/schedules": "schedule"}
+INBOX_RECORD_TYPES = {"manual", "claude", "schedule"}
+INBOX_STATUSES = {"pending", "approved", "later", "rejected", "deleted"}
+PUBLISHED_POST_PAGE = re.compile(r"/published-posts/([0-9]{1,18})")
+PUBLISHED_ORIGINAL = re.compile(r"/published-posts/([0-9]{1,18})/original/([0-9]{1,18})")
+JOB_MEDIA_PATH = re.compile(r"([0-9]{1,18})/([a-zA-Z0-9_.-]+)")
 ASSET_ID = r"[a-z][a-z0-9_]{0,63}"
 
 
@@ -64,6 +75,32 @@ def usd_micros(value):
     if not re.fullmatch(r"[0-9]{1,6}(?:\.[0-9]{1,6})?", value):
         raise ValueError("Enter a nonnegative USD amount with up to six decimal places.")
     return int(Decimal(value) * 1_000_000)
+
+
+def inbox_record(kind, row):
+    record_id = row["id"]
+    status = row["status"]
+    if kind == "schedule":
+        title = row["title"] or f"Schedule #{record_id}"
+        details = "\n".join(entry["prompt"] for entry in row["entries"])
+        source = "schedule"
+        status = "rejected" if row["rejected_at"] else ("pending" if status == "draft" else "approved")
+    else:
+        title = row["title"]
+        details = row["prompt"]
+        source = row["source"]
+        if status == "accepted":
+            status = "approved"
+    return dict(
+        row,
+        kind=kind,
+        index=f"{'S' if kind == 'schedule' else 'I'}-{record_id:03d}",
+        title=title,
+        details=details,
+        source=source,
+        status="deleted" if row["deleted_at"] else status,
+        schedule_status=row["status"] if kind == "schedule" else None,
+    )
 
 
 class StudioServer(ThreadingHTTPServer):
@@ -115,12 +152,95 @@ class StudioHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
-    def _show_inbox(self, status=HTTPStatus.OK, notice=""):
+    def _show_inbox(self, status=HTTPStatus.OK, notice="", *, params=None):
+        params = params or {}
+        query = params.get("q", [""])[0].strip()[:100]
+        kind = params.get("type", [""])[0]
+        record_status = params.get("status", [""])[0]
+        kind = kind if kind in INBOX_RECORD_TYPES else ""
+        record_status = record_status if record_status in INBOX_STATUSES else ""
+        include_deleted = record_status == "deleted"
         store = self.server.store
+        records = []
+        if kind != "schedule":
+            records.extend(inbox_record("idea", row) for row in store.list_ideas(include_deleted=include_deleted))
+        if kind in ("", "schedule"):
+            records.extend(inbox_record("schedule", row) for row in store.list_schedules(include_deleted=include_deleted))
+        search = query.casefold()
+        records = [
+            row for row in records
+            if (not kind or row["source"] == kind)
+            and (not record_status or row["status"] == record_status)
+            and (search in row["title"].casefold() or search in row["index"].casefold())
+        ]
+        records.sort(key=lambda row: (row["created_at"] or "", row["id"], row["kind"]), reverse=True)
         self._reply(status, inbox_page(
-            store.list_ideas(), store.list_schedules(), self.server.csrf_token, notice,
-            self.server.planning.idea_requests(),
+            records, query=query, kind=kind, status=record_status,
+            notice=notice, idea_requests=self.server.planning.idea_requests(),
         ))
+
+    def _show_inbox_record(self, collection, record_id, status=HTTPStatus.OK, notice=""):
+        store = self.server.store
+        if collection == "ideas":
+            kind, row = "idea", store.get_idea(record_id)
+        else:
+            kind, row = "schedule", store.get_schedule(record_id)
+        if row is None:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        self._reply(status, record_page(inbox_record(kind, row), self.server.csrf_token, notice=notice))
+
+    def _show_published_posts(self, params):
+        query = params.get("q", [""])[0].strip()[:100]
+        platform = params.get("platform", [""])[0]
+        platform = platform if platform in PLATFORMS else ""
+        search = query.casefold()
+        records = group_published_posts(self.server.publishing.posts.published_posts())
+        records = [
+            record for record in records
+            if (search in record["title"].casefold() or search in record["index"].casefold())
+            and (not platform or any(post["platform"] == platform for post in record["platforms"]))
+        ]
+        self._reply(HTTPStatus.OK, published_posts_page(records, query=query, platform=platform))
+
+    def _show_published_post(self, job_id, params, notice=""):
+        posts = self.server.publishing.posts
+        records = group_published_posts(posts.published_posts(job_id))
+        if not records:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        record = records[0]
+        channel = params.get("channel", [""])[0]
+        metric = params.get("metric", ["engagement"])[0]
+        if metric not in METRICS:
+            metric = "engagement"
+        selected = next((post for post in record["platforms"] if str(post["id"]) == channel), record["platforms"][0])
+        selected["history"] = [
+            {"collected_at": snapshot["collected_at"], "value": post_metrics(snapshot["metrics"])[metric]}
+            for snapshot in posts.published_history(selected)
+        ]
+        preview = selected["preview_path"]
+        match = JOB_MEDIA_PATH.fullmatch(preview or "")
+        if not match or int(match[1]) != job_id or not self._local_media_file(preview):
+            selected["preview_path"] = None
+        self._reply(HTTPStatus.OK, published_post_page(record, selected, metric=metric, notice=notice))
+
+    def _open_published_original(self, job_id, request_id):
+        publishing = self.server.publishing
+        post = next((post for post in publishing.posts.published_posts(job_id) if post["id"] == request_id), None)
+        if post is None:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        try:
+            location = publishing.original_post_url(post)
+        except (PostizError, ValueError) as error:
+            notice = str(error)
+        else:
+            if location:
+                self._redirect(location)
+                return
+            notice = "Postiz has no original link for this post."
+        self._show_published_post(job_id, {"channel": [str(request_id)]}, notice)
 
     def _show_settings(self, status=HTTPStatus.OK, notice="", *, open_asset=None, open_presets=False):
         self._reply(status, settings_page(
@@ -129,6 +249,12 @@ class StudioHandler(BaseHTTPRequestHandler):
             assets=self.server.library.assets.list_assets(), presets=self.server.library.presets(),
             open_asset=open_asset, open_presets=open_presets,
         ))
+
+    def _redirect(self, location):
+        self.send_response(HTTPStatus.SEE_OTHER)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def _show_workspace(self, job=None, status=HTTPStatus.OK, notice="", discover=False):
         tasks = self.server.production.media.job_tasks(job["id"]) if job else ()
@@ -169,8 +295,13 @@ class StudioHandler(BaseHTTPRequestHandler):
             return
         self._reply(HTTPStatus.OK, image, mimetypes.guess_type(path.name)[0] or "application/octet-stream")
 
+    def _local_media_file(self, relative_path):
+        root = self.server.production.root.resolve()
+        path = (root / relative_path).resolve()
+        return path if path.is_relative_to(root) and path.is_file() else None
+
     def _serve_media(self, relative_path):
-        match = re.fullmatch(r"([0-9]{1,18})/([a-zA-Z0-9_.-]+)", relative_path)
+        match = JOB_MEDIA_PATH.fullmatch(relative_path)
         if not match:
             self.send_error(HTTPStatus.NOT_FOUND)
             return
@@ -181,12 +312,16 @@ class StudioHandler(BaseHTTPRequestHandler):
         tasks = self.server.production.media.job_tasks(job["id"])
         paths = {task["local_path"] for task in tasks if task["kind"] == "keyframe"}
         paths.add(job["preview_path"])
-        root = self.server.production.root.resolve()
-        path = (root / relative_path).resolve()
-        if relative_path not in paths or not path.is_relative_to(root) or not path.is_file():
+        path = self._local_media_file(relative_path)
+        if path is None or (
+            relative_path not in paths and relative_path not in self.server.publishing.posts.delivered_preview_paths(job["id"])
+        ):
             self.send_error(HTTPStatus.NOT_FOUND)
             return
 
+        self._stream_media(path)
+
+    def _stream_media(self, path):
         try:
             media_file = path.open("rb")
         except FileNotFoundError:
@@ -243,7 +378,21 @@ class StudioHandler(BaseHTTPRequestHandler):
 
         url = urlsplit(self.path)
         if url.path == "/":
-            self._show_inbox()
+            self._show_inbox(params=parse_qs(url.query))
+        elif url.path == "/inbox/create":
+            kind = parse_qs(url.query).get("type", ["manual"])[0]
+            if kind not in INBOX_RECORD_TYPES:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            self._reply(HTTPStatus.OK, create_page(self.server.csrf_token, kind=kind))
+        elif record := INBOX_RECORD.fullmatch(url.path):
+            self._show_inbox_record(record[1], int(record[2]))
+        elif url.path == "/published-posts":
+            self._show_published_posts(parse_qs(url.query))
+        elif original := PUBLISHED_ORIGINAL.fullmatch(url.path):
+            self._open_published_original(int(original[1]), int(original[2]))
+        elif post := PUBLISHED_POST_PAGE.fullmatch(url.path):
+            self._show_published_post(int(post[1]), parse_qs(url.query))
         elif url.path == "/settings":
             params = parse_qs(url.query)
             asset = params.get("asset", [None])[0]
@@ -312,6 +461,15 @@ class StudioHandler(BaseHTTPRequestHandler):
 
         idea_decision = re.fullmatch(r"/ideas/(\d{1,18})/decision", path)
         schedule_status = re.fullmatch(r"/schedules/(\d{1,18})/status", path)
+        inbox_archive = INBOX_ARCHIVE.fullmatch(path)
+        create_kind = INBOX_CREATE_TYPES.get(path)
+        inbox_detail = None
+        if idea_decision:
+            inbox_detail = ("ideas", int(idea_decision[1]))
+        elif schedule_status:
+            inbox_detail = ("schedules", int(schedule_status[1]))
+        elif inbox_archive:
+            inbox_detail = (inbox_archive[1], int(inbox_archive[2]))
         key_route = re.fullmatch(r"/settings/keys/([A-Z_]+)", path)
         provider_route = re.fullmatch(r"/settings/providers/([a-z0-9-]+)", path)
         preset_default = re.fullmatch(rf"/settings/presets/(visual|script|subtitle|audio)/({ASSET_ID})/default", path)
@@ -333,13 +491,22 @@ class StudioHandler(BaseHTTPRequestHandler):
                 daily_limit = field("daily_limit")
                 if not re.fullmatch(r"[0-9]{1,3}", daily_limit):
                     raise ValueError("Enter the number of videos to start each day.")
+                title = field("title").strip()
+                if "title" in form and not title:
+                    raise ValueError("Enter a schedule title.")
                 prompts = [line for line in field("prompts").splitlines() if line.strip()]
                 store.create_schedule(
                     prompts, field("start_date"), field("run_at"),
-                    field("timezone"), int(daily_limit),
+                    field("timezone"), int(daily_limit), title=title or None,
                 )
             elif schedule_status:
                 store.set_schedule_status(int(schedule_status[1]), field("status"))
+            elif inbox_archive:
+                action = field("action")
+                if action not in ("delete", "restore"):
+                    raise ValueError("Choose Delete or Restore.")
+                kind = "idea" if inbox_archive[1] == "ideas" else "schedule"
+                store.set_inbox_deleted(kind, int(inbox_archive[2]), action == "delete")
             elif key_route:
                 action = field("action")
                 if action == "remove":
@@ -407,6 +574,14 @@ class StudioHandler(BaseHTTPRequestHandler):
             if workspace_route:
                 self._show_workspace(store.get_job(job_id), HTTPStatus.BAD_REQUEST, str(error),
                                      discover=workspace_route[2] == "publish")
+            elif create_kind:
+                fields = ("title", "prompt", "trends", "prompts", "start_date", "run_at", "timezone", "daily_limit")
+                self._reply(HTTPStatus.BAD_REQUEST, create_page(
+                    self.server.csrf_token, kind=create_kind, values={name: field(name) for name in fields},
+                    notice=str(error),
+                ))
+            elif inbox_detail:
+                self._show_inbox_record(*inbox_detail, HTTPStatus.BAD_REQUEST, str(error))
             else:
                 show_error = self._show_settings if in_settings else self._show_inbox
                 show_error(HTTPStatus.BAD_REQUEST, str(error))
@@ -415,16 +590,15 @@ class StudioHandler(BaseHTTPRequestHandler):
             self.send_error(HTTPStatus.NOT_FOUND)
             return
 
-        self.send_response(HTTPStatus.SEE_OTHER)
         location = f"/workspace?job={job_id}" if workspace_route else ("/settings" if in_settings else "/")
         if asset_route or path == "/settings/assets":
             asset_id = asset_route[1] if asset_route else field("asset_id")
             location = f"/settings?asset={asset_id}#asset-{asset_id}"
         elif preset_route or preset_default:
             location = "/settings?presets=1#production-presets"
-        self.send_header("Location", location)
-        self.send_header("Content-Length", "0")
-        self.end_headers()
+        elif inbox_detail and not inbox_archive and field("from_detail") == "1":
+            location = f"/{inbox_detail[0]}/{inbox_detail[1]}"
+        self._redirect(location)
 
 
 def run_schedule_clock(server, stopped):

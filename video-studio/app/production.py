@@ -13,6 +13,7 @@ from app.media_routes import adapter_for, download_artifact, eligible_routes, es
 from app.media_store import MediaStore
 from app.niche import load_profile
 from app.providers import ProviderError, ProviderRequest
+from app.publishing_store import PublishingStore
 from app.render import render_video, sample_frames
 from app.scenes import qa_prompt, spoken_lines
 from app.studio_library import select_references
@@ -39,6 +40,7 @@ class StudioProduction:
     def __init__(self, store, settings, planner):
         self.store = store
         self.media = MediaStore(store)
+        self.posts = PublishingStore(store)
         self.settings = settings
         self.planner = planner
         self.library = planner.library
@@ -304,7 +306,10 @@ class StudioProduction:
                 "UPDATE jobs SET status = 'qa_pending', preview_path = ?, stage_error = NULL WHERE id = ?",
                 (preview.as_posix(), job["id"]),
             )
+        delivered = self.posts.delivered_preview_paths(job["id"])
         for previous in (self.root / preview.parent).glob("preview.*"):
+            if previous.relative_to(self.root).as_posix() in delivered:
+                continue
             if previous.stem != preview.stem and re.fullmatch(r"preview(?:\.[0-9a-f]{32})?\.(?:mp4|srt)", previous.name):
                 try:
                     previous.unlink(missing_ok=True)

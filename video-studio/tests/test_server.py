@@ -10,6 +10,7 @@ from urllib.parse import urlencode
 
 from app.db import StudioStore
 from app.niche import load_profile
+from app.publishing_store import PublishingStore
 from app.server import StudioServer, run_schedule_clock
 from test_asset_library import REQUIRES_FFMPEG, png, wav
 
@@ -68,6 +69,9 @@ class StudioHTTPTest(unittest.TestCase):
 
         status, html = self.request("GET", "/")
         self.assertEqual(status, 200)
+        self.assertIn('href="/inbox/create"', html)
+        status, html = self.request("GET", "/inbox/create")
+        self.assertEqual(status, 200)
         self.csrf = re.search(r'name="csrf_token" value="([^"]+)"', html).group(1)
 
     def request(self, method, path, fields=None, headers=None, *, payload=None, binary=False):
@@ -101,9 +105,20 @@ class StudioHTTPTest(unittest.TestCase):
 
     def test_inbox_approval_and_job_workspace(self):
         self.assertEqual(self.post("/ideas", title="A forest visit", prompt="<script>"), 303)
+        status, html = self.request("GET", "/?q=I-001&type=manual&status=pending")
+        self.assertEqual(status, 200)
+        self.assertIn('href="/ideas/1"', html)
+        self.assertIn("A forest visit", html)
+        self.assertIn("Publish date", html)
+        self.assertNotIn('action="/ideas"', html)
+        status, html = self.request("GET", "/ideas/1")
+        self.assertEqual(status, 200)
+        self.assertIn("&lt;script&gt;", html)
+        self.assertNotIn("<script>", html)
         self.assertEqual(self.post("/ideas/1/decision", decision="later"), 303)
         self.assertEqual(self.store.list_jobs(), [])
         self.assertEqual(self.post("/ideas/1/decision", decision="accept"), 303)
+        self.assertIn("A forest visit", self.request("GET", "/?status=approved")[1])
         status, html = self.request("GET", "/workspace?job=1")
         self.assertEqual(status, 200)
         self.assertIn("A forest visit", html)
@@ -112,16 +127,84 @@ class StudioHTTPTest(unittest.TestCase):
         self.assertEqual(self.request("GET", "/studio.css")[0], 200)
 
     def test_prompt_schedule_requires_activation(self):
+        status, html = self.request("GET", "/inbox/create?type=schedule")
+        self.assertEqual(status, 200)
+        self.assertIn('action="/schedules"', html)
         self.assertEqual(self.post(
-            "/schedules", prompts="Forest scene\nLibrary scene", start_date="2026-11-09",
+            "/schedules", title="Forest and library", prompts="Forest scene\nLibrary scene", start_date="2026-11-09",
             run_at="09:00", timezone="Asia/Dhaka", daily_limit="1",
         ), 303)
         due = datetime(2026, 11, 9, 3, 15, tzinfo=timezone.utc)
         self.assertEqual(self.store.dispatch_due(due), 0)
-        self.assertIn("Activate Schedule", self.request("GET", "/")[1])
+        self.assertIn('href="/schedules/1"', self.request("GET", "/?type=schedule")[1])
+        status, html = self.request("GET", "/schedules/1")
+        self.assertEqual(status, 200)
+        self.assertIn("Forest and library", html)
+        self.assertIn("Library scene", html)
+        self.assertIn("Approve and activate", html)
         self.assertEqual(self.post("/schedules/1/status", status="active"), 303)
         self.assertEqual(self.store.dispatch_due(due), 1)
         self.assertIn("Forest scene", self.request("GET", "/workspace?job=1")[1])
+
+    def test_deleted_inbox_record_can_be_restored_from_its_details(self):
+        self.assertEqual(self.post("/ideas", title="A reversible draft", prompt="Demo prompt"), 303)
+        self.assertEqual(self.post("/ideas/1/archive", action="delete"), 303)
+        self.assertNotIn("A reversible draft", self.request("GET", "/")[1])
+        self.assertIn("A reversible draft", self.request("GET", "/?status=deleted")[1])
+        self.assertIn("Restore", self.request("GET", "/ideas/1")[1])
+        self.assertEqual(self.post("/ideas/1/archive", action="restore"), 303)
+        self.assertIn("A reversible draft", self.request("GET", "/")[1])
+        self.assertNotIn("A reversible draft", self.request("GET", "/?status=deleted")[1])
+        self.assertEqual(self.request("GET", "/ideas/999")[0], 404)
+
+    def test_published_list_links_to_platform_history_and_the_delivered_video(self):
+        idea = self.store.add_idea("A garden video")
+        self.store.decide_idea(idea, "accept")
+        job_id = self.store.list_jobs()[0]["id"]
+        detail = f"/published-posts/{job_id}"
+        delivered = f"{job_id}/preview.mp4"
+        media = self.store.path.parent / "media" / delivered
+        media.parent.mkdir(parents=True)
+        media.write_bytes(b"0123456789")
+        with self.store._connection(write=True) as db:
+            db.execute(
+                "UPDATE jobs SET status = 'preview_ready', preview_path = ? WHERE id = ?", (delivered, job_id),
+            )
+        posts = PublishingStore(self.store)
+        release = datetime(2026, 11, 9, 3, tzinfo=timezone.utc)
+        youtube = posts.queue(job_id, {"id": "yt", "identifier": "youtube"}, "Title", "YouTube caption", [], release)
+        posts.next_request()
+        posts.finish(youtube, "youtube-post")
+        self.assertEqual(self.request("GET", detail)[0], 404)
+        self.assertNotIn("A garden video", self.request("GET", "/published-posts")[1])
+        posts.record_analytics(youtube, {"views": 20, "likes": 3, "comments": 0}, release)
+
+        instagram = posts.queue(
+            job_id, {"id": "ig", "identifier": "instagram"}, "Title", "Instagram caption", ["garden"], release,
+        )
+        posts.next_request()
+        posts.finish(instagram, "instagram-post")
+        posts.record_analytics(instagram, {"views": 10, "likes": 2, "comments": None}, release)
+        with self.store._connection(write=True) as db:
+            db.execute("UPDATE jobs SET preview_path = ? WHERE id = ?", (f"{job_id}/new-preview.mp4", job_id))
+
+        status, html = self.request("GET", "/published-posts?platform=instagram&q=P-001")
+        self.assertEqual(status, 200)
+        self.assertEqual(html.count(f'href="{detail}"'), 1)
+        self.assertIn("A garden video", html)
+        self.assertIn("Partial total", html)
+        status, html = self.request("GET", f"{detail}?channel={instagram}&metric=views")
+        self.assertEqual(status, 200)
+        self.assertIn("Instagram caption", html)
+        self.assertIn("Views totals by snapshot date", html)
+        self.assertIn(f'src="/media/{delivered}"', html)
+        self.assertEqual(self.request("GET", f"/media/{delivered}", headers={"Range": "bytes=1-3"}, binary=True), (206, b"123"))
+
+        with patch("app.publishing.StudioPublishing.original_post_url", return_value="https://www.youtube.com/shorts/example") as original:
+            self.assertEqual(self.request("GET", f"{detail}/original/{youtube}")[0], 303)
+            self.assertEqual(original.call_args.args[0]["post_id"], "youtube-post")
+            self.assertEqual(self.request("GET", f"{detail}/original/999")[0], 404)
+            self.assertEqual(original.call_count, 1)
 
     def test_rejects_cross_site_posts_and_nonlocal_host(self):
         self.assertEqual(self.request("POST", "/ideas", {"prompt": "Unapproved"})[0], 403)

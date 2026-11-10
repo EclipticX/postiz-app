@@ -8,6 +8,14 @@ PUBLISHABLE = ("preview_ready", "needs_review")
 CHANNEL_IDENTIFIERS = {
     "youtube", "facebook", "instagram", "instagram-standalone", "tiktok", "tiktok-business",
 }
+_LATEST_ANALYTICS_JOIN = """
+LEFT JOIN analytics ON analytics.id = (
+    SELECT id FROM analytics
+    WHERE job_id = publishing_requests.job_id
+        AND platform = publishing_requests.identifier AND post_id = publishing_requests.post_id
+    ORDER BY collected_at DESC, id DESC LIMIT 1
+)
+"""
 
 
 def _utc_time(value):
@@ -172,18 +180,64 @@ class PublishingStore:
                     """
                     SELECT publishing_requests.*, analytics.metrics_json, analytics.collected_at
                     FROM publishing_requests
-                    LEFT JOIN analytics ON analytics.id = (
-                        SELECT id FROM analytics
-                        WHERE job_id = publishing_requests.job_id
-                            AND platform = publishing_requests.identifier AND post_id = publishing_requests.post_id
-                        ORDER BY collected_at DESC, id DESC LIMIT 1
-                    )
+                    """ + _LATEST_ANALYTICS_JOIN + """
                     WHERE publishing_requests.job_id = ?
                     ORDER BY publishing_requests.id
                     """,
                     (job_id,),
                 )
             ]
+
+    def published_posts(self, job_id=None):
+        """Return confirmed non-draft releases and their latest snapshots."""
+        with self.store._connection() as db:
+            return [
+                _post_record(row)
+                for row in db.execute(
+                    """
+                    SELECT publishing_requests.*, jobs.title AS job_title,
+                        analytics.metrics_json, analytics.collected_at
+                    FROM publishing_requests JOIN jobs ON jobs.id = publishing_requests.job_id
+                    """ + _LATEST_ANALYTICS_JOIN + """
+                    WHERE publishing_requests.status = 'published' AND publishing_requests.draft = 0
+                        AND publishing_requests.post_id IS NOT NULL AND publishing_requests.scheduled_at IS NOT NULL
+                        AND (? IS NULL OR publishing_requests.job_id = ?)
+                    ORDER BY publishing_requests.scheduled_at DESC, publishing_requests.id DESC
+                    """,
+                    (job_id, job_id),
+                )
+            ]
+
+    def published_history(self, post):
+        """Return recent snapshots for a published_posts record in display order."""
+        with self.store._connection() as db:
+            recent = db.execute(
+                """
+                SELECT collected_at, metrics_json FROM analytics
+                WHERE job_id = ? AND platform = ? AND post_id = ?
+                ORDER BY collected_at DESC, id DESC LIMIT 14
+                """,
+                (post["job_id"], post["identifier"], post["post_id"]),
+            ).fetchall()
+            return [
+                {"collected_at": row["collected_at"], "metrics": json.loads(row["metrics_json"])}
+                for row in reversed(recent)
+            ]
+
+    def delivered_preview_paths(self, job_id) -> set[str]:
+        """Return the exact local previews handed off for public release."""
+        with self.store._connection() as db:
+            return {
+                row["preview_path"]
+                for row in db.execute(
+                    """
+                    SELECT preview_path FROM publishing_requests
+                    WHERE job_id = ? AND status IN ('scheduled', 'published')
+                        AND draft = 0 AND post_id IS NOT NULL
+                    """,
+                    (job_id,),
+                )
+            }
 
     def due_analytics(self, now, limit=10):
         if type(limit) is not int or not 1 <= limit <= 100:

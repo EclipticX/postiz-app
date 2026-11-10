@@ -155,6 +155,92 @@ class PublishingStoreTests(unittest.TestCase):
         self.assertEqual(self.posts.due_analytics(observed), [])
         self.assertEqual(self.posts.due_analytics(observed + timedelta(days=1))[0]["id"], scheduled)
 
+    def test_published_posts_only_include_confirmed_releases(self):
+        self.preview()
+        later = self.when + timedelta(days=1)
+        second = self.posts.queue(
+            self.job, {**self.channel, "id": "youtube-2"}, "Second release", "Another caption", [],
+            later,
+        )
+        first = self.approve()
+        draft = self.approve({"id": "facebook-1", "identifier": "facebook", "name": "Garden Page"}, draft=True)
+        scheduled = self.approve({**self.channel, "id": "youtube-3"})
+        for request_id in (second, first, draft, scheduled):
+            self.assertEqual(self.posts.next_request()["id"], request_id)
+            self.posts.finish(request_id, f"post-{request_id}")
+
+        self.assertEqual(self.posts.published_posts(), [])
+        self.posts.record_analytics(first, {"views": 0, "likes": None}, self.when)
+        self.posts.record_analytics(second, {"views": 4}, later)
+        releases = self.posts.published_posts()
+        self.assertEqual([post["id"] for post in releases], [second, first])
+        self.assertEqual(self.posts.published_posts(self.job), releases)
+        self.assertEqual(self.posts.published_posts(self.job + 1), [])
+        self.assertEqual(releases[1]["title"], "A story")
+        self.assertEqual(releases[1]["job_title"], self.store.get_job(self.job)["title"])
+        self.assertEqual(releases[1]["preview_path"], "1/preview.mp4")
+        self.assertEqual(releases[1]["metrics"], {"views": 0, "likes": None})
+
+        with self.store._connection(write=True) as db:
+            db.execute("DELETE FROM analytics WHERE post_id = ?", (f"post-{second}",))
+        release = self.posts.published_posts()[0]
+        self.assertIsNone(release["metrics"])
+        self.assertIsNone(release["collected_at"])
+        self.assertEqual(self.posts.published_history(release), [])
+
+    def test_published_history_limits_and_scopes_snapshots(self):
+        self.preview()
+        request_id = self.approve()
+        self.posts.next_request()
+        self.posts.finish(request_id, "shared-post")
+        for day in range(15):
+            self.posts.record_analytics(
+                request_id, {"views": 0 if day == 1 else day, "comments": None},
+                self.when + timedelta(days=min(day, 13)),
+            )
+
+        idea = self.store.add_idea("Another video")
+        self.store.decide_idea(idea, "accept")
+        another_job = self.store.list_ideas()[0]["job_id"]
+        with self.store._connection(write=True) as db:
+            db.executemany(
+                "INSERT INTO analytics (job_id, platform, post_id, metrics_json, collected_at) VALUES (?, ?, ?, ?, ?)",
+                [
+                    (job_id, platform, post_id, '{"views": 999}', "2027-01-01T00:00:00.000000+00:00")
+                    for job_id, platform, post_id in (
+                        (another_job, "youtube", "shared-post"),
+                        (self.job, "instagram", "shared-post"),
+                        (self.job, "youtube", "another-post"),
+                    )
+                ],
+            )
+
+        post, = self.posts.published_posts(self.job)
+        self.assertEqual(post["metrics"], {"views": 14, "comments": None})
+        history = self.posts.published_history(post)
+        self.assertEqual([snapshot["metrics"]["views"] for snapshot in history], [0, *range(2, 15)])
+        self.assertIsNone(history[0]["metrics"]["comments"])
+        self.assertEqual(history[-1]["collected_at"], post["collected_at"])
+
+    def test_delivered_preview_paths_exclude_drafts_and_unsent_requests(self):
+        self.preview(path="1/scheduled.mp4")
+        scheduled = self.approve()
+        self.posts.next_request()
+        self.assertEqual(self.posts.delivered_preview_paths(self.job), set())
+        self.posts.finish(scheduled, "scheduled-post")
+
+        self.preview(path="1/draft.mp4")
+        draft = self.approve({"id": "facebook-1", "identifier": "facebook", "name": "Garden Page"}, draft=True)
+        self.posts.next_request()
+        self.posts.finish(draft, "draft-post")
+        self.preview(path="1/queued.mp4")
+        self.approve({**self.channel, "id": "youtube-2"})
+
+        self.assertEqual(self.posts.delivered_preview_paths(self.job), {"1/scheduled.mp4"})
+        self.assertEqual(self.posts.delivered_preview_paths(self.job + 1), set())
+        self.posts.record_analytics(scheduled, {"views": 0}, self.when)
+        self.assertEqual(self.posts.delivered_preview_paths(self.job), {"1/scheduled.mp4"})
+
     def test_validates_channel_and_schedule_timezone(self):
         self.preview()
         with self.assertRaisesRegex(ValueError, "channel type"):

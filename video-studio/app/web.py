@@ -10,10 +10,15 @@ def _label(value):
     return _text(value.replace('_', ' ').capitalize())
 
 
-def _page(title, active, content, notice):
+def _page(title, active, content, notice, *, heading_action=''):
     inbox_current = ' aria-current="page"' if active == '/' else ''
     workspace_current = ' aria-current="page"' if active == '/workspace' else ''
+    published_current = ' aria-current="page"' if active == '/published-posts' else ''
     settings_current = ' aria-current="page"' if active == '/settings' else ''
+    title = _text(title)
+    heading = f'<h1>{title}</h1>'
+    if heading_action:
+        heading = f'<div class="inbox-heading">{heading}{heading_action}</div>'
     notice_html = f'<p class="notice" role="status">{_text(notice)}</p>' if notice else ''
     return f'''<!doctype html>
 <html lang="en">
@@ -30,12 +35,13 @@ def _page(title, active, content, notice):
       <nav aria-label="Studio navigation">
         <a href="/"{inbox_current}>Idea Inbox</a>
         <a href="/workspace"{workspace_current}>Video Workspace</a>
+        <a href="/published-posts"{published_current}>Published Posts</a>
         <a href="/settings"{settings_current}>Settings</a>
       </nav>
     </div>
   </header>
   <main class="shell">
-    <h1>{title}</h1>
+    {heading}
     {notice_html}
     {content}
   </main>
@@ -45,145 +51,6 @@ def _page(title, active, content, notice):
 
 def _csrf(csrf_token):
     return f'<input type="hidden" name="csrf_token" value="{_text(csrf_token)}">'
-
-
-def _idea_card(idea, csrf_token):
-    action_html = ''
-    if idea['status'] in ('pending', 'later'):
-        later_button = ''
-        if idea['status'] == 'pending':
-            later_button = '<button type="submit" name="decision" value="later">Later</button>'
-        action_html = f'''
-        <form class="actions" method="post" action="/ideas/{int(idea['id'])}/decision">
-          {_csrf(csrf_token)}
-          <button class="primary" type="submit" name="decision" value="accept">Accept</button>
-          {later_button}
-          <button type="submit" name="decision" value="reject">Reject</button>
-        </form>'''
-    if idea['job_id'] is not None:
-        action_html = f'<a href="/workspace?job={int(idea["job_id"])}">Open video job</a>'
-    return f'''
-    <article class="record">
-      <div class="record-title">
-        <h3>{_text(idea['title'])}</h3>
-        <span class="status">{_label(idea['status'])}</span>
-      </div>
-      <p class="prompt">{_text(idea['prompt'])}</p>
-      {action_html}
-    </article>'''
-
-
-def _schedule_entry(entry):
-    job_html = ''
-    if entry['job_id'] is not None:
-        job_html = f' · <a href="/workspace?job={int(entry["job_id"])}">Open job</a>'
-    return f'''
-    <li><span class="prompt">{_text(entry['prompt'])}</span>
-      <small>{_label(entry['status'])}{job_html}</small>
-    </li>'''
-
-
-def _schedule_card(schedule, csrf_token):
-    status = schedule['status']
-    next_status, action = {
-        'draft': ('active', 'Activate Schedule'),
-        'active': ('paused', 'Pause'),
-        'paused': ('active', 'Resume'),
-    }[status]
-    progress = schedule['progress']
-    counts = ''.join(
-        f'<div><dt>{label}</dt><dd>{int(progress[key])}</dd></div>'
-        for key, label in (
-            ('pending', 'Pending'), ('queued', 'Queued'), ('waiting', 'Waiting for review'),
-            ('completed', 'Completed'), ('failed', 'Failed'),
-        )
-    )
-    prompts = ''.join(_schedule_entry(entry) for entry in schedule['entries'])
-    open_attribute = ' open' if status == 'draft' else ''
-    primary = ' class="primary"' if status == 'draft' else ''
-    return f'''
-    <article class="record">
-      <div class="record-title">
-        <h3>Schedule #{int(schedule['id'])}</h3>
-        <span class="status">{_label(status)}</span>
-      </div>
-      <p class="muted">{_text(schedule['start_date'])} onwards · {_text(schedule['run_at'])}
-        {_text(schedule['timezone'])} · {int(schedule['daily_limit'])} per day</p>
-      <dl class="counts">{counts}</dl>
-      <details{open_attribute}>
-        <summary>Review {len(schedule['entries'])} prompts</summary>
-        <ol class="scheduled-prompts">{prompts}</ol>
-      </details>
-      <form class="actions" method="post" action="/schedules/{int(schedule['id'])}/status">
-        {_csrf(csrf_token)}
-        <button{primary} type="submit" name="status" value="{next_status}">{action}</button>
-      </form>
-    </article>'''
-
-
-def inbox_page(ideas, schedules, csrf_token, notice='', idea_requests=None) -> str:
-    ideas_html = ''.join(_idea_card(idea, csrf_token) for idea in ideas)
-    if not ideas_html:
-        ideas_html = '<p class="muted">Ideas you add will appear here for approval.</p>'
-    schedules_html = ''.join(_schedule_card(schedule, csrf_token) for schedule in schedules)
-    if not schedules_html:
-        schedules_html = '<p class="muted">Save a draft to review the batch before activating it.</p>'
-    trend_html = ''
-    if idea_requests is not None:
-        runs = ''.join(
-            f'<li>{_label(run["status"])} {_text(run["error"] or "")}</li>' for run in idea_requests
-        )
-        trend_html = f'''
-        <form method="post" action="/ideas/generate" class="stack">
-          {_csrf(csrf_token)}
-          <label for="trend-input">Trend or theme</label>
-          <textarea id="trend-input" name="trends" rows="3" maxlength="4000" required></textarea>
-          <button type="submit">Generate ideas with Claude</button>
-        </form>
-        {'<ul>' + runs + '</ul>' if runs else ''}'''
-    content = f'''
-    <p class="intro">Review individual ideas or set a daily queue from your own prompts.</p>
-    <div class="columns">
-      <section class="panel" aria-labelledby="ideas-heading">
-        <h2 id="ideas-heading">Ideas</h2>
-        {trend_html}
-        <form method="post" action="/ideas" class="stack">
-          {_csrf(csrf_token)}
-          <label for="idea-title">Title <span class="muted">(optional)</span></label>
-          <input id="idea-title" name="title" type="text">
-          <label for="idea-prompt">Prompt</label>
-          <textarea id="idea-prompt" name="prompt" rows="4" required></textarea>
-          <button class="primary" type="submit">Add idea</button>
-        </form>
-        <div class="records">{ideas_html}</div>
-      </section>
-      <section class="panel" aria-labelledby="schedules-heading">
-        <h2 id="schedules-heading">Prompt Schedule</h2>
-        <form method="post" action="/schedules" class="stack">
-          {_csrf(csrf_token)}
-          <label for="prompts">Batch prompts</label>
-          <textarea id="prompts" name="prompts" rows="4" aria-describedby="prompts-help" required></textarea>
-          <small id="prompts-help" class="muted">Paste up to 100 prompts, one per line.</small>
-          <div class="fields">
-            <label for="start-date">Start date
-              <input id="start-date" name="start_date" type="date" required>
-            </label>
-            <label for="run-at">Daily time
-              <input id="run-at" name="run_at" type="time" value="09:00" required>
-            </label>
-            <label for="timezone">Time zone
-              <input id="timezone" name="timezone" type="text" value="Asia/Dhaka" required>
-            </label>
-            <label for="daily-limit">Videos per day
-              <input id="daily-limit" name="daily_limit" type="number" min="1" max="100" value="1" required>
-            </label>
-          </div>
-          <button class="primary" type="submit">Save schedule draft</button>
-        </form>
-        <div class="records">{schedules_html}</div>
-      </section>
-    </div>'''
-    return _page('Idea Inbox', '/', content, notice)
 
 
 def _publishing_section(job, posts, channels, metrics, csrf_token):

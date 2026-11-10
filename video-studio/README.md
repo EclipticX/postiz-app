@@ -1,6 +1,6 @@
 # Local AI Video Studio
 
-Studio runs alongside Postiz. The three screens are Idea Inbox, Video Workspace, and Settings. Studio plans 30-second vertical shorts at 720 × 1280 using 4- and 5-second scenes. SQLite stores approval decisions, prompt schedules, jobs, and their progress. Media files stay in the local Studio data directory.
+Studio runs alongside Postiz. Use the navigation to open Idea Inbox, Video Workspace, Published Posts, or Settings. Studio plans 30-second vertical shorts at 720 × 1280 using 4- and 5-second scenes. SQLite stores approval decisions, prompt schedules, jobs, and their progress. Media files stay in the local Studio data directory.
 
 ## Start locally
 
@@ -29,12 +29,14 @@ Uploaded assets and audio stay in the persistent Studio data directory. SQLite s
 
 ## Try the inbox and scheduler
 
-1. Add an idea with a ready prompt. **Accept** creates a job in Video Workspace. **Later** keeps the idea available for a future decision.
-2. Under **Prompt Schedule**, paste one prompt per line and choose a start date, daily time, timezone, and number of videos to start each day.
-3. Review the draft batch and select **Activate Schedule** to approve it. Studio queues the next prompts when the local clock reaches the schedule. Keep Studio running at the scheduled time. After a restart, Studio resumes on the next eligible run and preserves the daily limit.
+1. Open **Idea Inbox → Create** to add an idea, request ideas from Claude, or create a prompt schedule. Use the inbox filters to find a record and select its index to open the full details. **Approve** creates a job in Video Workspace. **Later** keeps an idea available for a future decision.
+2. To create a prompt schedule, enter a title, paste one prompt per line, and choose a start date, daily time, timezone, and number of videos to start each day.
+3. Open the draft batch by its index and select **Approve and activate**. Studio queues the next prompts when the local clock reaches the production start time. Keep Studio running at the scheduled time. After a restart, Studio resumes on the next eligible run and preserves the daily limit. The inbox **Publish date** shows the earliest confirmed Postiz schedule linked to the record. Delete moves an unapproved record to the **Deleted** status filter, where it can be restored.
 
 4. In **Video Workspace**, review and approve the generated keyframes before the video worker starts. A scheduled prompt batch also waits at this step. Review the finished preview and visual QA, or use **Revise** to send feedback through the planner. Revised plans require fresh keyframe approval.
 5. Load connected Postiz channels in Video Workspace. Review the caption, title, and hashtags and choose **Approve draft** for any supported channel or **Approve public YouTube schedule** for YouTube. Facebook and Instagram local-file publishing paths and TikTok direct-post settings are tracked in the project plan.
+
+Open **Published Posts** after Studio confirms a publication from Postiz analytics. Select a video index to see the delivered video if it is saved locally, the selected channel's caption, and up to 14 saved analytics snapshots. **Open post** looks up the platform's original link in Postiz. Dates use the stored scheduled release time. Engagement counts likes plus comments on channels that report both. Missing metrics, including post-level follows, appear as `—`.
 
 Follow the [project plan](../project%20plan.md) for checklist and live verification status.
 

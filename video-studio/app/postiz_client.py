@@ -4,10 +4,10 @@ import json
 import os
 import re
 import stat
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from http.client import HTTPConnection, HTTPException, HTTPSConnection
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 from uuid import uuid4
 
 
@@ -131,6 +131,27 @@ class PostizClient:
             return []
         raise PostizError('Postiz did not return post analytics.')
 
+    def original_post_url(self, post_id, scheduled_at):
+        if not _valid_id(post_id):
+            raise PostizError('A valid Postiz post ID is required.')
+        if scheduled_at is None:
+            return None
+        day = date.fromisoformat(_post_date(scheduled_at)[:10])
+        try:
+            query = urlencode({
+                'startDate': (day - timedelta(days=1)).isoformat(),
+                'endDate': (day + timedelta(days=2)).isoformat(),
+            })
+        except OverflowError:
+            raise PostizError('The scheduled date is outside the Postiz lookup range.') from None
+        result = self._request('GET', f'/posts?{query}')
+        if not isinstance(result, dict) or not isinstance(result.get('posts'), list):
+            raise PostizError('Postiz did not return a post list.')
+        for post in result['posts']:
+            if isinstance(post, dict) and post.get('id') == post_id and post.get('state') == 'PUBLISHED':
+                return _safe_release_url(post.get('releaseURL'))
+        return None
+
     def _request(self, method, path, *, body=None, headers=None, creating=False):
         scheme, host, port = self._origin
         connection_type = HTTPSConnection if scheme == 'https' else HTTPConnection
@@ -192,6 +213,21 @@ def _response_error(creating):
 
 def _valid_id(value):
     return isinstance(value, str) and bool(re.fullmatch(r'[a-zA-Z0-9_-]{1,200}', value))
+
+
+def _safe_release_url(value):
+    if not isinstance(value, str) or '\\' in value or not all(33 <= ord(char) <= 126 for char in value):
+        return None
+    try:
+        url = urlsplit(value)
+        if (
+            url.scheme == 'https' and url.hostname and url.username is None
+            and url.port in (None, 443)
+        ):
+            return value
+    except ValueError:
+        pass
+    return None
 
 
 def _media(value):

@@ -31,6 +31,11 @@ class StudioPublishing:
     def channels(self):
         return self._client().channels()
 
+    def original_post_url(self, post):
+        if post["status"] != "published" or post["draft"]:
+            return None
+        return self._client().original_post_url(post["post_id"], post["scheduled_at"])
+
     def metrics(self, job_id):
         with self.store._connection() as db:
             rows = db.execute(
