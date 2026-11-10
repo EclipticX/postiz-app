@@ -1,3 +1,4 @@
+import json
 import re
 import tempfile
 import threading
@@ -245,6 +246,47 @@ class StudioHTTPTest(unittest.TestCase):
         )
         self.assertIn("Load connected Postiz channels", self.request("GET", f"/workspace?job={job_id}")[1])
         self.assertEqual(self.request("GET", f"/media/{job_id}/.env")[0], 404)
+
+    def test_scene_editor_loads_the_clip_and_saves_a_legacy_scene(self):
+        idea = self.store.add_idea("A scene editor test")
+        self.store.decide_idea(idea, "accept")
+        job_id = self.store.list_jobs()[0]["id"]
+        scene = load_profile()["few_shot"][0]["scenes"][0]
+        scene_id = scene["scene_id"]
+        clip = f"{job_id}/{scene_id}-video.mp4"
+        path = self.store.path.parent / "media" / clip
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"example")
+        with self.store._connection(write=True) as db:
+            db.execute(
+                "UPDATE jobs SET status = 'preview_ready', plan_json = ?, preview_path = ? WHERE id = ?",
+                (json.dumps([scene]), f"{job_id}/preview.mp4", job_id),
+            )
+            db.executemany(
+                "INSERT INTO media_tasks (job_id, scene_id, kind, status, local_path) VALUES (?, ?, ?, 'completed', ?)",
+                [(job_id, scene_id, kind, f"{job_id}/{scene_id}-{kind}.{extension}")
+                 for kind, extension in (("keyframe", "png"), ("video", "mp4"), ("voice", "mp3"))],
+            )
+
+        editor = f"/workspace/{job_id}/scenes/{scene_id}"
+        self.assertIn(f'href="{editor}"', self.request("GET", f"/workspace?job={job_id}")[1])
+        status, html = self.request("GET", editor)
+        self.assertEqual(status, 200)
+        self.assertIn(scene["action"], html)
+        self.assertIn(f'src="/media/{clip}"', html)
+        self.assertEqual(self.request("GET", f"/media/{clip}", headers={"Range": "bytes=1-3"}), (206, "xam"))
+        self.assertEqual(self.request("GET", f"/workspace/{job_id}/scenes/missing")[0], 404)
+
+        revision = re.search(r'name="revision" value="([^"]+)"', html).group(1)
+        fields = {"action": "Tavi waves.", "camera": scene["camera"], "dialogue": scene["dialogue"], "revision": revision}
+        self.assertEqual(self.request("POST", editor, fields)[0], 403)
+        self.assertEqual(self.post(editor, **dict(fields, action="")), 400)
+        self.assertEqual(self.post(editor, **dict(fields, revision="stale")), 400)
+        self.assertEqual(self.post(editor, **fields), 303)
+        self.assertEqual(self.request("GET", editor)[0], 200)
+        updated = self.store.get_job(job_id)
+        self.assertEqual(updated["status"], "making_keyframes")
+        self.assertEqual(json.loads(updated["plan_json"]), [dict(scene, action="Tavi waves.")])
 
     def test_publishing_approval_rejects_a_stale_preview_form(self):
         idea = self.store.add_idea("A garden tale")

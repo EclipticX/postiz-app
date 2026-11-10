@@ -6,10 +6,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app.db import StudioStore
+from app.media_store import scene_revision
 from app.niche import load_profile
 from app.planning import StudioPlanner
 from app.production import StudioProduction
 from app.providers import ProviderError, ProviderResult
+from app.scenes import spoken_lines
 from app.settings import StudioSettings
 
 
@@ -73,6 +75,131 @@ class ProductionTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"media fixture")
         return path
+
+    def prepare_scene_edit(self, *, structured_dialogue=False):
+        scenes = load_profile()["few_shot"][0]["scenes"]
+        if structured_dialogue:
+            scenes[0]["dialogue"] = ""
+            scenes[0]["dialogue_lines"] = [
+                {"speaker_id": "tavi_seed_sprite", "text": "Hello!"},
+                {"speaker_id": "tavi_seed_sprite", "text": "You look thirsty!"},
+            ]
+        preview = f"{self.job}/preview.mp4"
+        self.write_fixture(self.production.root / preview)
+        with self.store._connection(write=True) as db:
+            db.execute(
+                "UPDATE jobs SET status = 'preview_ready', plan_json = ?, preview_path = ?, qa_json = ? WHERE id = ?",
+                (json.dumps(scenes), preview, json.dumps({"decision": "pass", "score": 95, "issues": []}), self.job),
+            )
+            for scene in scenes:
+                media = [("keyframe", 0, "png"), ("video", 0, "mp4")]
+                media.extend(("voice", index, "mp3") for index, _ in enumerate(spoken_lines(scene)))
+                for kind, index, extension in media:
+                    path = f"{self.job}/{scene['scene_id']}-{kind}-{index}.{extension}"
+                    self.write_fixture(self.production.root / path)
+                    db.execute(
+                        """INSERT INTO media_tasks (job_id, scene_id, kind, line_index, status, attempts, local_path)
+                           VALUES (?, ?, ?, ?, 'completed', 1, ?)""",
+                        (self.job, scene["scene_id"], kind, index, path),
+                    )
+        return scenes
+
+    def scene_revision(self):
+        return scene_revision(self.store.get_job(self.job), self.production.media.job_tasks(self.job))
+
+    def complete_scene_keyframe(self, scene_id):
+        media = self.production.media
+        frame, = media.tasks()
+        self.assertEqual((frame["scene_id"], frame["kind"]), (scene_id, "keyframe"))
+        reservation = self.settings.reserve(self.job, "fal-nano-banana-pro", 100, NOW)
+        self.assertTrue(media.begin(frame["id"], "fal-nano-banana-pro", reservation))
+        self.settings.settle(reservation)
+        path = f"{self.job}/{scene_id}-keyframe-0.png"
+        self.write_fixture(self.production.root / path)
+        media.complete(frame["id"], path)
+        self.assertEqual(self.store.get_job(self.job)["status"], "review_keyframes")
+        self.assertEqual(media.tasks(), [])
+
+    def test_scene_visual_edit_preserves_other_media_and_requires_fresh_keyframe_approval(self):
+        scene, second_scene = self.prepare_scene_edit()
+        scene_id = scene["scene_id"]
+        media = self.production.media
+        initial = media.job_tasks(self.job)
+        untouched = {task["id"]: task for task in initial if task["scene_id"] != scene_id or task["kind"] == "voice"}
+        original_revision = self.scene_revision()
+        original_preview = self.store.get_job(self.job)["preview_path"]
+        posts = self.production.posts
+        request = posts.queue(self.job, {"id": "channel", "identifier": "youtube"}, "Title", "", [], NOW)
+        posts.next_request()
+        posts.finish(request, "published-post")
+
+        self.production.edit_scene(
+            self.job, scene_id, "Tavi waves.", scene["camera"], [scene["dialogue"]],
+            regenerate_keyframe=False, expected_revision=original_revision,
+        )
+        job = self.store.get_job(self.job)
+        self.assertEqual(job["status"], "making_keyframes")
+        self.assertIsNone(job["preview_path"])
+        self.assertNotIn("score", json.loads(job["qa_json"]))
+        self.assertEqual(json.loads(job["plan_json"]), [dict(scene, action="Tavi waves."), second_scene])
+        self.assertEqual({task["id"]: task for task in media.job_tasks(self.job) if task["id"] in untouched}, untouched)
+
+        self.complete_scene_keyframe(scene_id)
+        reviewed_revision = self.scene_revision()
+        self.production.edit_scene(
+            self.job, scene_id, "Tavi waves.", scene["camera"], [scene["dialogue"]],
+            regenerate_keyframe=True, expected_revision=reviewed_revision,
+        )
+        self.complete_scene_keyframe(scene_id)
+        with self.assertRaises(ValueError):
+            media.approve_keyframes(self.job, expected_revision=reviewed_revision)
+        media.approve_keyframes(self.job, expected_revision=self.scene_revision())
+        clip, = media.tasks()
+        self.assertEqual((clip["scene_id"], clip["kind"]), (scene_id, "video"))
+        self.assertEqual({task["id"]: task for task in media.job_tasks(self.job) if task["id"] in untouched}, untouched)
+        self.assertEqual(posts.job_posts(self.job)[0]["preview_path"], original_preview)
+        self.assertTrue((self.production.root / original_preview).is_file())
+
+    def test_scene_dialogue_edit_requeues_only_the_changed_structured_line(self):
+        scene, other_scene = self.prepare_scene_edit(structured_dialogue=True)
+        initial = self.production.media.job_tasks(self.job)
+        original_revision = self.scene_revision()
+        self.production.edit_scene(
+            self.job, scene["scene_id"], scene["action"], scene["camera"], ["Hello!", "Let me help."],
+            regenerate_keyframe=False, expected_revision=original_revision,
+        )
+        job = self.store.get_job(self.job)
+        self.assertEqual(job["status"], "making_media")
+        self.assertEqual(json.loads(job["plan_json"])[0]["dialogue_lines"], [
+            scene["dialogue_lines"][0], dict(scene["dialogue_lines"][1], text="Let me help."),
+        ])
+        voice, = self.production.media.tasks()
+        self.assertEqual((voice["scene_id"], voice["kind"], voice["line_index"]), (scene["scene_id"], "voice", 1))
+        untouched = {
+            task["id"]: task for task in initial
+            if (task["scene_id"], task["kind"], task["line_index"]) != (scene["scene_id"], "voice", 1)
+        }
+        self.assertEqual(
+            {task["id"]: task for task in self.production.media.job_tasks(self.job) if task["id"] in untouched},
+            untouched,
+        )
+
+        qa = {"decision": "retry", "score": 60, "issues": ["Review the second scene."],
+              "failed_scene_ids": [other_scene["scene_id"]]}
+        with patch("app.production.adapter_for", self.adapter), \
+                patch("app.production.local_image", return_value=FRAME), \
+                patch("app.production.download_artifact", side_effect=lambda url, path, kind: self.write_fixture(path)), \
+                patch("app.production.render_video", side_effect=lambda scenes, clips, voices, path, **kw: self.write_fixture(path)), \
+                patch("app.production.sample_frames", return_value=[Path("fixture.jpg")]), \
+                patch.object(self, "submit", return_value=ProviderResult("completed", data=qa)):
+            self.production.advance(NOW)
+
+        self.assertEqual(self.store.get_job(self.job)["status"], "needs_review")
+        self.assertEqual(self.production.media.tasks(), [])
+        self.assertEqual(
+            {task["id"]: task for task in self.production.media.job_tasks(self.job) if task["id"] in untouched},
+            untouched,
+        )
 
     def test_new_render_replaces_the_preview_version(self):
         original = Path(str(self.job)) / "preview.mp4"

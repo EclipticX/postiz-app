@@ -6,11 +6,12 @@ import re
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from itertools import zip_longest
 from pathlib import Path
 from uuid import uuid4
 
 from app.media_routes import adapter_for, download_artifact, eligible_routes, estimated_micros, local_image
-from app.media_store import MediaStore
+from app.media_store import MediaStore, can_edit_scene, queue_scene_media, scene_revision
 from app.niche import load_profile
 from app.providers import ProviderError, ProviderRequest
 from app.publishing_store import PublishingStore
@@ -70,6 +71,77 @@ class StudioProduction:
         if not feedback or len(feedback) > 4000:
             raise ValueError("Enter revision feedback in 1–4,000 characters.")
         self._reset_plan(job_id, feedback=feedback)
+
+    def edit_scene(self, job_id, scene_id, action, camera, dialogue, *, regenerate_keyframe, expected_revision):
+        action, camera = action.strip(), camera.strip()
+        dialogue = [line.strip() for line in dialogue]
+        if not 1 <= len(action) <= 4000 or not 1 <= len(camera) <= 4000:
+            raise ValueError("Enter 1–4,000 characters for both the action and camera directions.")
+        if any(len(line) > 4000 for line in dialogue):
+            raise ValueError("Use at most 4,000 characters per dialogue line.")
+
+        with self.store._connection(write=True) as db:
+            job = db.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            if job is None:
+                raise LookupError("Video job not found.")
+            scenes = json.loads(job["plan_json"] or "[]")
+            index = next((i for i, scene in enumerate(scenes) if scene["scene_id"] == scene_id), None)
+            if index is None:
+                raise LookupError("Scene not found.")
+            tasks = db.execute("SELECT * FROM media_tasks WHERE job_id = ? ORDER BY id", (job_id,)).fetchall()
+            if expected_revision != scene_revision(job, tasks):
+                raise ValueError("The scene plan or media changed. Reload the editor before saving.")
+            if not can_edit_scene(job, tasks):
+                raise ValueError("Wait for the current production step to finish before editing this scene.")
+            if db.execute(
+                "SELECT 1 FROM publishing_requests WHERE job_id = ? AND status IN ('queued', 'sending')", (job_id,),
+            ).fetchone():
+                raise ValueError("Wait for the approved Postiz handoff to finish before editing this scene.")
+
+            scene = scenes[index]
+            edited = dict(scene, action=action, camera=camera)
+            if scene.get("dialogue_lines"):
+                if len(dialogue) != len(scene["dialogue_lines"]) or not all(dialogue):
+                    raise ValueError("Enter text for every existing dialogue line.")
+                edited["dialogue_lines"] = [
+                    dict(line, text=text) for line, text in zip(scene["dialogue_lines"], dialogue)
+                ]
+            else:
+                if len(dialogue) != 1:
+                    raise ValueError("Enter a single narration field.")
+                edited["dialogue"] = dialogue[0]
+
+            redraw = regenerate_keyframe or action != scene["action"] or camera != scene["camera"]
+            changed_lines = [
+                (job_id, scene_id, line_index)
+                for line_index, (before, after) in enumerate(zip_longest(spoken_lines(scene), spoken_lines(edited)))
+                if before != after
+            ]
+            if not redraw and not changed_lines:
+                raise ValueError("Edit a field or select Regenerate keyframe.")
+
+            db.executemany(
+                "DELETE FROM media_tasks WHERE job_id = ? AND scene_id = ? AND kind = 'voice' AND line_index = ?",
+                changed_lines,
+            )
+            status = job["status"]
+            if redraw:
+                db.execute(
+                    "DELETE FROM media_tasks WHERE job_id = ? AND scene_id = ? AND kind IN ('keyframe', 'video')",
+                    (job_id, scene_id),
+                )
+                db.execute("INSERT INTO media_tasks (job_id, scene_id, kind) VALUES (?, ?, 'keyframe')", (job_id, scene_id))
+                status = "making_keyframes"
+            elif status != "review_keyframes":
+                queue_scene_media(db, job_id, [edited])
+                pending = db.execute("SELECT 1 FROM media_tasks WHERE job_id = ? AND status = 'queued'", (job_id,))
+                status = "making_media" if pending.fetchone() else "render_ready"
+
+            scenes[index] = edited
+            db.execute(
+                "UPDATE jobs SET plan_json = ?, status = ?, preview_path = NULL, qa_json = ?, stage_error = NULL WHERE id = ?",
+                (json.dumps(scenes), status, json.dumps({"auto_retry": False}), job_id),
+            )
 
     def configure(self, job_id, options):
         job = self.store.get_job(job_id)
@@ -372,7 +444,9 @@ class StudioProduction:
             tasks = db.execute("SELECT * FROM media_tasks WHERE job_id = ? AND kind = 'video'", (job["id"],)).fetchall()
             failed_ids = {value for value in qa["failed_scene_ids"] if isinstance(value, str)}
             retries = [task for task in tasks if task["scene_id"] in failed_ids and task["attempts"] < MAX_ATTEMPTS]
-            if qa["decision"] == "retry" and retries and len(retries) == len(failed_ids):
+            # A scene edit authorizes only the requested regeneration. Let the user review further QA findings.
+            auto_retry = json.loads(job["qa_json"] or "{}").get("auto_retry", True)
+            if auto_retry and qa["decision"] == "retry" and retries and len(retries) == len(failed_ids):
                 db.executemany(
                     """UPDATE media_tasks SET status = 'queued', provider_task_id = NULL,
                         reservation_id = NULL, local_path = NULL WHERE id = ?""",

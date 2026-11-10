@@ -1,6 +1,8 @@
 import json
 from html import escape
 
+from app.media_store import can_edit_scene, scene_revision
+
 
 def _text(value):
     return escape(str(value), quote=True)
@@ -127,11 +129,14 @@ def workspace_page(
         error_html = f'<p class="notice">{_text(error)}</p>' if error else ''
         scenes = json.loads(job.get('plan_json') or '[]')
         asset_names = {asset['id']: asset['name'] for asset in assets}
+        scene_link = 'Edit scene' if can_edit_scene(job, tasks) else 'View scene'
         scenes_html = ''.join(
             f'''<li><h4>{_text(scene['scene_id'])} · {int(scene['duration'])} seconds</h4>
               <p>{_text(scene['action'])}</p>
               <p class="muted">Camera: {_text(scene['camera'])}</p>
-              {_scene_dialogue(scene, asset_names)}</li>'''
+              {_scene_dialogue(scene, asset_names)}
+              <p><a href="/workspace/{int(job['id'])}/scenes/{_text(scene['scene_id'])}"
+                    aria-label="{scene_link} {_text(scene['scene_id'])}">{scene_link}</a></p></li>'''
             for scene in scenes
         )
         frames = ''.join(
@@ -147,7 +152,9 @@ def workspace_page(
         if job['status'] == 'review_keyframes':
             actions = f'''
             <form method="post" action="/workspace/{int(job['id'])}/approve-keyframes" class="actions">
-              {_csrf(csrf_token)}<button class="primary" type="submit">Approve keyframes</button>
+              {_csrf(csrf_token)}
+              <input type="hidden" name="revision" value="{_text(scene_revision(job, tasks))}">
+              <button class="primary" type="submit">Approve keyframes</button>
             </form>'''
         if job['status'] in ('review_keyframes', 'preview_ready', 'needs_review'):
             actions += f'''
@@ -170,7 +177,7 @@ def workspace_page(
         )
         qa = json.loads(job.get('qa_json') or '{}')
         issues = ''.join(f'<li>{_text(issue)}</li>' for issue in qa.get('issues', []))
-        qa_html = f'<h3>Visual QA · {int(qa["score"])}/100</h3><ul>{issues}</ul>' if qa else ''
+        qa_html = f'<h3>Visual QA · {int(qa["score"])}/100</h3><ul>{issues}</ul>' if 'score' in qa else ''
         content = f'''
         <p class="intro"><a href="/workspace">All video jobs</a></p>
         <section class="panel" aria-labelledby="job-heading">

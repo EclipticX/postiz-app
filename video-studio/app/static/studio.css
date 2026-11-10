@@ -262,6 +262,8 @@ summary { cursor: pointer; }
 .keyframes { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(8rem, 1fr)); }
 .keyframes figure { margin: 0; }
 .keyframes img, video { display: block; width: 100%; border-radius: .5rem; background: var(--background); }
+.scene-previews { max-width: 30rem; }
+.scene-previews figure { max-width: 15rem; }
 video { max-width: 22rem; }
 .library-panel > summary { font-size: 1.25rem; font-weight: 700; }
 .library-body { margin-top: .75rem; }

@@ -1,5 +1,6 @@
 """Durable scene tasks and the keyframe approval gate."""
 
+import hashlib
 import json
 
 from app.scenes import spoken_lines
@@ -7,6 +8,35 @@ from app.scenes import spoken_lines
 
 MAX_MEDIA_ATTEMPTS = 3
 ACTIVE_JOB_STATUSES = ("making_keyframes", "making_media")
+SCENE_EDIT_STATUSES = ("review_keyframes", "preview_ready", "needs_review")
+
+
+def can_edit_scene(job, tasks):
+    return (job["status"] in SCENE_EDIT_STATUSES and bool(job["plan_json"]) and bool(tasks)
+            and all(task["status"] == "completed" and task["local_path"] for task in tasks))
+
+
+def scene_revision(job, tasks):
+    # A new provider reservation distinguishes regenerated frames even when paths are reused.
+    snapshot = [job["id"], job["status"], job["plan_json"], [
+        (task["id"], task["status"], task["local_path"], task["reservation_id"]) for task in tasks
+    ]]
+    return hashlib.sha256(json.dumps(snapshot).encode("utf-8")).hexdigest()
+
+
+def queue_scene_media(db, job_id, scenes):
+    tasks = []
+    for scene in scenes:
+        tasks.append((job_id, scene["scene_id"], "video", 0))
+        tasks.extend(
+            (job_id, scene["scene_id"], "voice", index)
+            for index, _ in enumerate(spoken_lines(scene))
+        )
+    db.executemany(
+        """INSERT INTO media_tasks (job_id, scene_id, kind, line_index) VALUES (?, ?, ?, ?)
+        ON CONFLICT (job_id, scene_id, kind, line_index) DO NOTHING""",
+        tasks,
+    )
 
 
 def _load_scenes(plan_json):
@@ -58,39 +88,26 @@ class MediaStore:
                 queued += 1
         return queued
 
-    def approve_keyframes(self, job_id):
+    def approve_keyframes(self, job_id, *, expected_revision=None):
         with self.store._connection(write=True) as db:
-            job = db.execute("SELECT status, plan_json FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            job = db.execute("SELECT id, status, plan_json FROM jobs WHERE id = ?", (job_id,)).fetchone()
             if job is None:
                 raise LookupError("Video job not found.")
             if job["status"] != "review_keyframes":
                 raise ValueError("This job is not waiting for keyframe approval.")
+            tasks = db.execute("SELECT * FROM media_tasks WHERE job_id = ? ORDER BY id", (job_id,)).fetchall()
+            if expected_revision is not None and expected_revision != scene_revision(job, tasks):
+                raise ValueError("The scene plan or keyframes changed. Review them before approving.")
 
             scenes = _load_scenes(job["plan_json"])
             ready = {
-                row["scene_id"] for row in db.execute(
-                    """
-                    SELECT scene_id FROM media_tasks
-                    WHERE job_id = ? AND kind = 'keyframe' AND status = 'completed'
-                        AND local_path IS NOT NULL
-                    """,
-                    (job_id,),
-                )
+                task["scene_id"] for task in tasks
+                if task["kind"] == "keyframe" and task["status"] == "completed" and task["local_path"]
             }
             if ready != {scene["scene_id"] for scene in scenes}:
                 raise ValueError("Wait for every keyframe before approving.")
 
-            tasks = []
-            for scene in scenes:
-                tasks.append((job_id, scene["scene_id"], "video", 0))
-                tasks.extend(
-                    (job_id, scene["scene_id"], "voice", index)
-                    for index, _ in enumerate(spoken_lines(scene))
-                )
-            db.executemany(
-                "INSERT INTO media_tasks (job_id, scene_id, kind, line_index) VALUES (?, ?, ?, ?)",
-                tasks,
-            )
+            queue_scene_media(db, job_id, scenes)
             db.execute("UPDATE jobs SET status = 'making_media', stage_error = NULL WHERE id = ?", (job_id,))
 
     def tasks(self):

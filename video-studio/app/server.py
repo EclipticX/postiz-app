@@ -20,6 +20,7 @@ from urllib.parse import parse_qs, urlsplit
 from app.character_view import character_page, characters_page
 from app.db import StudioStore
 from app.inbox_view import create_page, inbox_page, record_page
+from app.media_store import can_edit_scene, scene_revision
 from app.niche import load_profile
 from app.planning import StudioPlanner
 from app.postiz_client import PostizError
@@ -27,6 +28,7 @@ from app.production import StudioProduction
 from app.published_posts import METRICS, PLATFORMS, group_published_posts, post_metrics
 from app.published_view import published_post_page, published_posts_page
 from app.publishing import StudioPublishing
+from app.scene_editor_view import scene_editor_page
 from app.settings import StudioSettings
 from app.settings_view import providers_page, settings_page
 from app.watchdog import get_issue, list_issues
@@ -45,6 +47,7 @@ INBOX_STATUSES = {"pending", "approved", "later", "rejected", "deleted"}
 PUBLISHED_POST_PAGE = re.compile(r"/published-posts/([0-9]{1,18})")
 PUBLISHED_ORIGINAL = re.compile(r"/published-posts/([0-9]{1,18})/original/([0-9]{1,18})")
 WATCHDOG_ISSUE = re.compile(r"/watch-dog/([a-z0-9-]{1,80})")
+WORKSPACE_SCENE = re.compile(r"/workspace/([0-9]{1,18})/scenes/([A-Za-z0-9][A-Za-z0-9_-]{0,63})")
 JOB_MEDIA_PATH = re.compile(r"([0-9]{1,18})/([a-zA-Z0-9_.-]+)")
 ASSET_ID = r"[a-z][a-z0-9_]{0,63}"
 REFERENCE_ID = r"[a-zA-Z0-9_-]{1,80}"
@@ -304,6 +307,26 @@ class StudioHandler(BaseHTTPRequestHandler):
             production_options_open=options_override is not None,
         ))
 
+    def _show_scene_editor(self, job_id, scene_id, status=HTTPStatus.OK, notice="", *, values=None):
+        job = self.server.store.get_job(job_id)
+        if job is None:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        scenes = json.loads(job["plan_json"] or "[]")
+        scene = next((item for item in scenes if item["scene_id"] == scene_id), None)
+        if scene is None:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        tasks = self.server.production.media.job_tasks(job_id)
+        scene_tasks = [task for task in tasks if task["scene_id"] == scene_id]
+        assets = self.server.library.assets.list_assets(job["niche_id"] or "kids_3d")
+        asset_names = {asset["id"]: asset["name"] for asset in assets}
+        revision = scene_revision(job, tasks) if values is None else values["expected_revision"]
+        self._reply(status, scene_editor_page(
+            job, scene, scene_tasks, self.server.csrf_token, revision, asset_names,
+            editable=can_edit_scene(job, tasks), notice=notice, values=values,
+        ))
+
     def _serve_reference(self, relative_path):
         match = re.fullmatch(rf"({ASSET_ID})/({REFERENCE_ID})", relative_path)
         if not match:
@@ -346,7 +369,10 @@ class StudioHandler(BaseHTTPRequestHandler):
             self.send_error(HTTPStatus.NOT_FOUND)
             return
         tasks = self.server.production.media.job_tasks(job["id"])
-        paths = {task["local_path"] for task in tasks if task["kind"] == "keyframe"}
+        paths = {
+            task["local_path"] for task in tasks
+            if task["kind"] == "keyframe" or (task["kind"] == "video" and task["status"] == "completed")
+        }
         paths.add(job["preview_path"])
         path = self._local_media_file(relative_path)
         if path is None or (
@@ -472,6 +498,8 @@ class StudioHandler(BaseHTTPRequestHandler):
                     self.send_error(HTTPStatus.NOT_FOUND)
                     return
             self._show_workspace(job, discover=params.get("channels") == ["1"])
+        elif scene := WORKSPACE_SCENE.fullmatch(url.path):
+            self._show_scene_editor(int(scene[1]), scene[2])
         elif url.path.startswith("/media/"):
             self._serve_media(url.path.removeprefix("/media/"))
         elif url.path.startswith("/asset-reference/"):
@@ -593,6 +621,7 @@ class StudioHandler(BaseHTTPRequestHandler):
         provider_route = re.fullmatch(r"/settings/providers/([a-z0-9-]+)", path)
         preset_default = re.fullmatch(rf"/settings/presets/(visual|script|subtitle|audio)/({ASSET_ID})/default", path)
         workspace_route = re.fullmatch(r"/workspace/(\d{1,18})/(approve-keyframes|retry-render|revise|publish|options)", path)
+        scene_route = WORKSPACE_SCENE.fullmatch(path)
         store = self.server.store
         settings = self.server.settings
         planning = self.server.planning
@@ -661,10 +690,19 @@ class StudioHandler(BaseHTTPRequestHandler):
                                    {name: field(name) for name in form}, files, field("is_default") == "yes")
             elif preset_default:
                 library.set_default(niche_id, preset_default[1], preset_default[2])
+            elif scene_route:
+                scene_values = {
+                    "action": field("action"),
+                    "camera": field("camera"),
+                    "dialogue": form.get("dialogue", []),
+                    "regenerate_keyframe": field("regenerate_keyframe") == "1",
+                    "expected_revision": field("revision"),
+                }
+                self.server.production.edit_scene(int(scene_route[1]), scene_route[2], **scene_values)
             elif workspace_route:
                 job_id = int(workspace_route[1])
                 if workspace_route[2] == "approve-keyframes":
-                    self.server.production.media.approve_keyframes(job_id)
+                    self.server.production.media.approve_keyframes(job_id, expected_revision=field("revision"))
                 elif workspace_route[2] == "retry-render":
                     self.server.production.retry_render(job_id)
                 elif workspace_route[2] == "options":
@@ -698,6 +736,9 @@ class StudioHandler(BaseHTTPRequestHandler):
                 self._show_character(asset_id, edit=True, status=HTTPStatus.BAD_REQUEST, notice=str(error), values=values)
             elif key_route or provider_route:
                 self._show_providers(HTTPStatus.BAD_REQUEST, str(error))
+            elif scene_route:
+                self._show_scene_editor(int(scene_route[1]), scene_route[2], HTTPStatus.BAD_REQUEST, str(error),
+                                        values=scene_values)
             elif workspace_route:
                 self._show_workspace(store.get_job(job_id), HTTPStatus.BAD_REQUEST, str(error),
                                      discover=workspace_route[2] == "publish", options_override=options)
@@ -721,7 +762,9 @@ class StudioHandler(BaseHTTPRequestHandler):
         if upload_json:
             self._reply(HTTPStatus.CREATED, json.dumps({"id": reference_id, "notice": "Image uploaded."}), "application/json")
             return
-        if key_route or provider_route:
+        if scene_route:
+            location = path
+        elif key_route or provider_route:
             location = "/providers"
         elif path == "/characters":
             location = f"/characters/{field('asset_id')}/edit"
