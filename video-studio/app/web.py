@@ -15,7 +15,7 @@ def _label(value):
 def _page(title, active, content, notice, *, script=None, heading_action=''):
     links = (
         ('/', 'Idea Inbox'), ('/workspace', 'Video Workspace'), ('/published-posts', 'Published Posts'),
-        ('/characters', 'Characters'),
+        ('/characters', 'Characters'), ('/assets', 'Asset Library'), ('/presets', 'Production Presets'),
         ('/providers', 'Providers'), ('/watch-dog', 'Watch Dog'), ('/settings', 'Settings'),
     )
     navigation_links = []
@@ -38,7 +38,7 @@ def _page(title, active, content, notice, *, script=None, heading_action=''):
   <link rel="stylesheet" href="/studio.css">
   {script_html}
 </head>
-<body>
+<body{' class="providers-page-body"' if active == '/providers' else ''}>
   <header class="studio-sidebar">
     <a class="brand" href="/">Video Studio</a>
     <nav class="desktop-navigation" aria-label="Studio navigation">{navigation}</nav>

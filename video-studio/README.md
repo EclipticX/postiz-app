@@ -19,10 +19,10 @@ For a native development run, use Python 3.9 or later and run `python3 -m app.se
 
 ## Set up assets and presets
 
-1. Open **Characters** and create a profile with a stable ID, name, and description. Create separate profiles for characters that look alike. Use **Settings → Asset Library** for places and items.
+1. Open **Characters** and create a profile with a stable ID, name, and description. Create separate profiles for characters that look alike. Use **Asset Library** for places and items.
 2. Edit the character profile to upload PNG or JPEG references in one selection. The profile displays them in a grid. Label the angles, pick a primary image for each appearance, and set a dress color for the base appearance or an outfit.
 3. Add an uploaded MP3 or WAV or a direct HTTPS voice reference link. For generated dialogue, add an ElevenLabs voice style with a voice name or ID, speed, and optional expressiveness. Mark one style as the character's default.
-4. In **Settings → Production Presets**, save a visual style and palette, script tone, subtitle style, and audio presets. Audio accepts local MP3 or WAV files for looping background music and one opening sound effect. Mark the presets to use by default for new videos.
+4. In **Production Presets**, save a visual style and palette, script tone, subtitle style, and audio presets. Audio accepts local MP3 or WAV files for looping background music and one opening sound effect. Mark the presets to use by default for new videos.
 5. Use **Video Workspace → Production Options** to select the cast and choose a preset, appearance, or character voice for one video. Saving a change after planning starts a new plan and requires fresh keyframe approval. The planner saves the selected assets and defaults with each plan.
 
 Uploaded assets and audio stay in the persistent Studio data directory. SQLite stores references, labels, variants, and presets. Studio upgrades older databases automatically. Before switching back to an older Studio version, restore the data-directory backup from before the upgrade.

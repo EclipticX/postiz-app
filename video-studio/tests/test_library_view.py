@@ -2,6 +2,7 @@ import json
 import unittest
 from html.parser import HTMLParser
 
+from app.library_view import asset_library_section, production_presets_section
 from app.settings_view import settings_page
 from app.web import workspace_page
 
@@ -59,7 +60,8 @@ _JOB = {'id': 12, 'title': 'First video', 'status': 'review_keyframes', 'source'
 
 class LibraryViewTests(unittest.TestCase):
     def test_asset_forms_use_expected_fields_and_same_origin_thumbnails(self):
-        html = settings_page(_BUDGET, _SCHEDULE, 'token', assets=_ASSETS, presets=_PRESETS)
+        place_and_item_assets = [asset for asset in _ASSETS if asset['kind'] in ('place', 'item')]
+        html = asset_library_section(place_and_item_assets, 'token')
         forms = Forms(html).forms
         expected_fields = {
             '/settings/assets': {'asset_id', 'kind', 'name', 'description'},
@@ -81,7 +83,7 @@ class LibraryViewTests(unittest.TestCase):
         self.assertIn('Forest &lt;b&gt;Path&lt;/b&gt;', html)
 
     def test_preset_forms_include_correct_settings_upload_and_default_actions(self):
-        forms = Forms(settings_page(_BUDGET, _SCHEDULE, 'token', presets=_PRESETS)).forms
+        forms = Forms(production_presets_section(_PRESETS, 'token')).forms
         per_kind = {
             'visual': {'style', 'palette'}, 'script': {'tone'},
             'subtitle': {'font_name', 'font_size', 'text_color', 'outline_color', 'position'},
@@ -95,6 +97,18 @@ class LibraryViewTests(unittest.TestCase):
                 self.assertEqual(form['attrs'].get('enctype'), 'multipart/form-data' if kind == 'audio' else None)
         self.assertIn('/settings/presets/visual/watercolor/default', forms)
         self.assertNotIn('/settings/presets/subtitle/large/default', forms)
+
+    def test_settings_page_does_not_contain_asset_library_or_presets(self):
+        html = settings_page(_BUDGET, _SCHEDULE, 'token', assets=_ASSETS, presets=_PRESETS)
+        self.assertNotIn("settings-nav-cards", html)
+        self.assertNotIn("<summary>Asset Library</summary>", html)
+        self.assertNotIn("<summary>Production Presets</summary>", html)
+        self.assertNotIn('/settings/assets', html)
+        self.assertNotIn('/settings/presets', html)
+        self.assertNotIn("Manage places, environments, and prop references", html)
+        self.assertNotIn("Manage visual styles, script tone, subtitles, and audio", html)
+        self.assertIn("Daily limit (USD)", html)
+        self.assertIn("Idea generation schedule", html)
 
     def test_workspace_applies_selected_overrides_and_escapes_structured_dialogue(self):
         scene = {

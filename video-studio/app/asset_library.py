@@ -253,6 +253,24 @@ class AssetLibrary:
         with self.store._connection() as db:
             return self._asset_record(self._character_row(db, niche_id, asset_id))
 
+    def get_asset(self, niche_id, asset_id):
+        _valid_id(niche_id, "Niche ID")
+        _valid_id(asset_id, "Asset ID")
+        with self.store._connection() as db:
+            return self._asset_record(self._asset_row(db, niche_id, asset_id))
+
+    def update_asset(self, niche_id, asset_id, name, description):
+        _valid_id(niche_id, "Niche ID")
+        _valid_id(asset_id, "Asset ID")
+        name = _text(name, "Asset name", 100)
+        description = _text(description, "Asset description", 2000)
+        with self.store._connection(write=True) as db:
+            self._asset_row(db, niche_id, asset_id)
+            db.execute(
+                "UPDATE assets SET name = ?, description = ? WHERE niche_id = ? AND id = ?",
+                (name, description, niche_id, asset_id),
+            )
+
     def update_character(self, niche_id, asset_id, name, description, dress_color, variant_id=""):
         _valid_id(niche_id, "Niche ID")
         _valid_id(asset_id, "Character ID")

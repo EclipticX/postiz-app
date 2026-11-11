@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from zoneinfo import ZoneInfo
@@ -53,7 +54,140 @@ DEFAULT_PROVIDERS = (
     ("fal-elevenlabs", "tts", "FAL_KEY", 10, "1000_characters", {"audio": True}),
     ("postiz", "publishing", "POSTIZ_API_KEY", 10, "request", {}),
 )
-KEY_NAMES = {provider[2] for provider in DEFAULT_PROVIDERS}
+
+DEFAULT_ACTIVE_PLATFORMS = ("FAL_KEY", "ANTHROPIC_API_KEY", "EVOLINK_API_KEY", "POSTIZ_API_KEY")
+
+KNOWN_PLATFORMS = {
+    "FAL_KEY": {
+        "name": "Fal.ai (FAL_KEY)",
+        "slug": "fal",
+        "active": ["character", "animation"],
+        "models": [
+            ("Character model", [
+                ("", "Select model...", ""),
+                ("fal-ai/nano-banana-pro", "fal-ai/nano-banana-pro", "Ultra-fast character & asset generation"),
+                ("fal-ai/flux-pro/v1.1-ultra", "fal-ai/flux-pro/v1.1-ultra", "High fidelity photorealistic scenes"),
+                ("fal-ai/recraft-v3", "fal-ai/recraft-v3", "Vector art & graphic asset design"),
+            ]),
+            ("Animation model", [
+                ("", "Select model...", ""),
+                ("fal-ai/veo3.1/image-to-video", "fal-ai/veo3.1/image-to-video", "Deep cinematic video generation"),
+                ("fal-ai/kling-video/v1.5/pro", "fal-ai/kling-video/v1.5/pro", "Smooth motion video generation"),
+                ("fal-ai/luma-dream-machine", "fal-ai/luma-dream-machine", "Fast realistic dynamic video"),
+            ]),
+        ],
+    },
+    "ANTHROPIC_API_KEY": {
+        "name": "Anthropic (Claude) (ANTHROPIC_API_KEY)",
+        "slug": "anthropic",
+        "active": ["scripting"],
+        "models": [
+            ("Scripting model", [
+                ("", "Select model...", ""),
+                ("claude-fable-5-2", "claude-fable-5-2", "Next generation of intelligence for the hardest tasks"),
+                ("claude-haiku-5-5", "claude-haiku-5-5", "Fastest model for daily tasks"),
+                ("claude-sonnet-5-5", "claude-sonnet-5-5", "Smart, efficient model for everyday use"),
+                ("claude-opus-5-5", "claude-opus-5-5", "Powerful, large model for complex challenges"),
+                ("claude-fable-5-1", "claude-fable-5-1", "Claude Fable 5.1"),
+                ("claude-opus-5", "claude-opus-5", "Claude Opus 5"),
+                ("claude-3-7-sonnet-20250219", "Claude 3.7 Sonnet", "Hybrid reasoning flagship model"),
+                ("claude-3-5-sonnet-20241022", "Claude 3.5 Sonnet", "Coding and analysis flagship"),
+                ("claude-3-5-haiku-20241022", "Claude 3.5 Haiku", "Fast, lightweight daily tasks"),
+            ]),
+        ],
+    },
+    "EVOLINK_API_KEY": {
+        "name": "EvoLink (Seedance) (EVOLINK_API_KEY)",
+        "slug": "evolink",
+        "active": ["animation"],
+        "models": [
+            ("Animation model", [
+                ("", "Select model...", ""),
+                ("seedance-2.0-image-to-video", "seedance-2.0-image-to-video", "Seedance 2.0 image to video animation"),
+                ("seedance-1.5-pro", "seedance-1.5-pro", "Seedance 1.5 Pro animation"),
+            ]),
+        ],
+    },
+    "POSTIZ_API_KEY": {
+        "name": "Postiz (POSTIZ_API_KEY)",
+        "slug": "postiz",
+        "active": ["publishing"],
+        "models": [],
+    },
+    "GEMINI_API_KEY": {
+        "name": "Google (Gemini, Veo) (GEMINI_API_KEY)",
+        "slug": "google",
+        "active": ["scripting", "animation"],
+        "models": [
+            ("Scripting model", [
+                ("", "Select model...", ""),
+                ("gemini-2.0-flash", "gemini-2.0-flash", "Next-gen multimodal speed & reasoning"),
+                ("gemini-1.5-pro", "gemini-1.5-pro", "Long-context reasoning & analysis"),
+            ]),
+            ("Animation model", [
+                ("", "Select model...", ""),
+                ("veo-2.0-generate-video", "veo-2.0-generate-video", "Google Veo 2.0 video generation"),
+            ]),
+        ],
+    },
+    "OPENAI_API_KEY": {
+        "name": "OpenAI (GPT-4o, Sora) (OPENAI_API_KEY)",
+        "slug": "openai",
+        "active": ["scripting", "animation"],
+        "models": [
+            ("Scripting model", [
+                ("", "Select model...", ""),
+                ("gpt-4o", "gpt-4o", "Flagship omni model for text & vision"),
+                ("gpt-4o-mini", "gpt-4o-mini", "Fast & lightweight everyday model"),
+                ("o3-mini", "o3-mini", "High intelligence reasoning model"),
+            ]),
+            ("Animation model", [
+                ("", "Select model...", ""),
+                ("sora-1.0", "sora-1.0", "OpenAI Sora video generation"),
+            ]),
+        ],
+    },
+    "REPLICATE_API_KEY": {
+        "name": "Replicate (REPLICATE_API_KEY)",
+        "slug": "replicate",
+        "active": ["character", "animation"],
+        "models": [
+            ("Character model", [
+                ("", "Select model...", ""),
+                ("black-forest-labs/flux-1.1-pro", "Flux 1.1 Pro", "High-res prompt following"),
+            ]),
+            ("Animation model", [
+                ("", "Select model...", ""),
+                ("kling-ai/kling-v1", "Kling v1", "Kling AI video generation"),
+            ]),
+        ],
+    },
+    "RUNWAY_API_KEY": {
+        "name": "Runway (RUNWAY_API_KEY)",
+        "slug": "runway",
+        "active": ["animation"],
+        "models": [
+            ("Animation model", [
+                ("", "Select model...", ""),
+                ("gen-3-alpha-turbo", "gen-3-alpha-turbo", "Runway Gen-3 Alpha Turbo"),
+            ]),
+        ],
+    },
+    "ELEVENLABS_API_KEY": {
+        "name": "ElevenLabs (ELEVENLABS_API_KEY)",
+        "slug": "elevenlabs",
+        "active": ["animation"],
+        "models": [
+            ("Audio model", [
+                ("", "Select model...", ""),
+                ("eleven_multilingual_v2", "eleven_multilingual_v2", "Eleven Multilingual v2"),
+                ("eleven_turbo_v2_5", "eleven_turbo_v2_5", "Eleven Turbo v2.5 low-latency"),
+            ]),
+        ],
+    },
+}
+
+KEY_NAMES = {provider[2] for provider in DEFAULT_PROVIDERS} | set(KNOWN_PLATFORMS.keys())
 
 
 def _check_whole_number(value, label, minimum=0):
@@ -99,6 +233,7 @@ class StudioSettings:
     def __init__(self, store, env_path):
         self.store = store
         self.env_path = Path(env_path)
+        self.list_platforms()
 
     def _read_lines(self):
         try:
@@ -170,6 +305,85 @@ class StudioSettings:
             provider["capabilities"] = json.loads(provider.pop("capabilities_json"))
             provider["configured"] = provider["key_env"] in keys
         return providers
+
+    @property
+    def platforms_path(self):
+        return self.env_path.with_name("platforms.json")
+
+    def list_platforms(self):
+        saved = None
+        custom = {}
+        categories = {}
+        if self.platforms_path.exists():
+            try:
+                data = json.loads(self.platforms_path.read_text(encoding="utf-8"))
+                saved = data.get("active")
+                custom = data.get("custom", {})
+                categories = data.get("categories", {})
+            except Exception:
+                saved = None
+        if saved is None:
+            saved = list(DEFAULT_ACTIVE_PLATFORMS)
+
+        configured_keys = _key_values(self._read_lines())
+        for k in configured_keys:
+            if k not in saved:
+                saved.append(k)
+
+        for k in custom:
+            KEY_NAMES.add(k)
+
+        return saved, custom, categories
+
+    def add_platform(self, key_name, name=None, slug=None):
+        key_name = key_name.strip().upper()
+        if not re.fullmatch(r"[A-Z0-9_]{3,64}", key_name):
+            raise ValueError("Platform key must be 3-64 uppercase letters, numbers, or underscores.")
+        active, custom, categories = self.list_platforms()
+        if key_name not in active:
+            active.append(key_name)
+        if key_name not in KNOWN_PLATFORMS and key_name not in custom:
+            custom[key_name] = {
+                "name": name or key_name,
+                "slug": slug or key_name.lower().replace("_api_key", "").replace("_key", ""),
+                "active": ["scripting"],
+            }
+        KEY_NAMES.add(key_name)
+        self.platforms_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.platforms_path.write_text(json.dumps({"active": active, "custom": custom, "categories": categories}, indent=2), encoding="utf-8")
+        return key_name
+
+    def remove_platform(self, key_name):
+        key_name = key_name.strip().upper()
+        active, custom, categories = self.list_platforms()
+        if key_name in active:
+            active.remove(key_name)
+        if key_name in categories:
+            del categories[key_name]
+        self.platforms_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.platforms_path.write_text(json.dumps({"active": active, "custom": custom, "categories": categories}, indent=2), encoding="utf-8")
+        if key_name in KEY_NAMES:
+            self.set_key(key_name, None)
+
+    def update_platform_categories(self, key_name, categories):
+        key_name = key_name.strip().upper()
+        active, custom, current_categories = self.list_platforms()
+        valid_cats = {"scripting", "character", "animation", "publishing"}
+        if isinstance(categories, str):
+            cleaned = [c.strip().lower() for c in categories.split(",") if c.strip().lower() in valid_cats]
+        else:
+            cleaned = [c.strip().lower() for c in categories if c.strip().lower() in valid_cats]
+        current_categories[key_name] = cleaned
+        self.platforms_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.platforms_path.write_text(json.dumps({
+            "active": active,
+            "custom": custom,
+            "categories": current_categories
+        }, indent=2), encoding="utf-8")
+        return cleaned
+
+    def configured_keys(self):
+        return set(_key_values(self._read_lines()).keys())
 
     def key(self, key_env):
         _check_key_name(key_env)

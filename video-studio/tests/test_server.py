@@ -228,6 +228,98 @@ class StudioHTTPTest(unittest.TestCase):
         self.assertNotIn("fixture-replacement", self.request("GET", "/providers")[1])
         self.assertNotIn("Configured · ••••••••", self.request("GET", "/providers")[1])
 
+    def test_providers_category_tabs_and_run_order(self):
+        status, js = self.request("GET", "/providers.js")
+        self.assertEqual(status, 200)
+        self.assertIn("switchTab", js)
+        self.assertIn("data-remove-key", js)
+        self.assertIn("data-remove-platform", js)
+
+        status, html = self.request("GET", "/providers?tab=publishing")
+        self.assertEqual(status, 200)
+        self.assertIn('data-tab="publishing" role="tab" aria-selected="true"', html)
+        self.assertIn("Run order", html)
+        self.assertIn('data-tab="api-keys"', html)
+        self.assertIn("Add platform", html)
+        self.assertIn("data-disable-provider", html)
+        # Verify no inline event handlers violating CSP
+        self.assertNotIn("onclick=", html)
+        self.assertNotIn("onchange=", html)
+
+    def test_providers_add_and_remove_platform(self):
+        # 1. Initially GEMINI_API_KEY is in Add platform dropdown
+        status, html = self.request("GET", "/providers?tab=api-keys")
+        self.assertEqual(status, 200)
+        self.assertIn('value="GEMINI_API_KEY"', html)
+        self.assertNotIn('id="key-card-gemini_api_key"', html)
+        # Verify no inline event handlers violating CSP on api-keys tab
+        self.assertNotIn("onclick=", html)
+        self.assertNotIn("onchange=", html)
+
+        # 2. Add GEMINI_API_KEY platform
+        self.assertEqual(self.post("/settings/platforms/add", platform_key="GEMINI_API_KEY"), 303)
+
+        # 3. Check GEMINI_API_KEY is now an active card
+        status, html = self.request("GET", "/providers?tab=api-keys")
+        self.assertEqual(status, 200)
+        self.assertIn('id="key-card-gemini_api_key"', html)
+        self.assertNotIn('value="GEMINI_API_KEY"', html)
+        self.assertIn('data-remove-platform="GEMINI_API_KEY"', html)
+        self.assertIn("confirm-remove-dialog", html)
+
+        # 4. Save a key for GEMINI_API_KEY and check it becomes configured
+        self.assertEqual(self.post("/settings/keys/GEMINI_API_KEY", action="save", value="gem-key-123"), 303)
+        status, html = self.request("GET", "/providers?tab=api-keys")
+        self.assertEqual(status, 200)
+        self.assertIn('data-remove-key="GEMINI_API_KEY"', html)
+
+        # 5. Remove key for GEMINI_API_KEY
+        self.assertEqual(self.post("/settings/keys/GEMINI_API_KEY", action="remove"), 303)
+        status, html = self.request("GET", "/providers?tab=api-keys")
+        self.assertEqual(status, 200)
+        self.assertNotIn('data-remove-key="GEMINI_API_KEY"', html)
+
+        # 6. Remove GEMINI_API_KEY platform
+        self.assertEqual(self.post("/settings/platforms/remove", key_name="GEMINI_API_KEY"), 303)
+
+        # 7. Check GEMINI_API_KEY is back in the Add dropdown
+        status, html = self.request("GET", "/providers?tab=api-keys")
+        self.assertEqual(status, 200)
+        self.assertNotIn('id="key-card-gemini_api_key"', html)
+        self.assertIn('value="GEMINI_API_KEY"', html)
+
+    def test_providers_platform_category_toggle_and_persistence(self):
+        # 1. Check initial Anthropic categories: scripting is active, character is inactive
+        status, html = self.request("GET", "/providers?tab=api-keys")
+        self.assertEqual(status, 200)
+        self.assertIn('data-platform="ANTHROPIC_API_KEY"', html)
+
+        # 2. Toggle character to active for Anthropic
+        status, body = self.request(
+            "POST", "/settings/platforms/categories",
+            fields={"csrf_token": self.csrf, "platform_key": "ANTHROPIC_API_KEY", "categories": "scripting,character"},
+            headers={"Accept": "application/json"}
+        )
+        self.assertEqual(status, 200)
+        self.assertIn('"status": "ok"', body)
+
+        # 3. Verify HTML reflects the updated categories
+        status, html = self.request("GET", "/providers?tab=api-keys")
+        self.assertEqual(status, 200)
+        # Check that both Scripting and Character are active for Anthropic
+        self.assertIn('data-toggle-cat="character" data-cat-title="Character" data-platform="ANTHROPIC_API_KEY" aria-pressed="true"', html)
+        self.assertIn('✓ Character</button>', html)
+
+        # 4. Remove scripting, keep only character
+        status = self.post("/settings/platforms/categories", platform_key="ANTHROPIC_API_KEY", categories="character", tab="api-keys")
+        self.assertEqual(status, 303)
+
+        # 5. Verify Scripting is now inactive (aria-pressed="false") and Character remains active
+        status, html = self.request("GET", "/providers?tab=api-keys")
+        self.assertEqual(status, 200)
+        self.assertIn('data-toggle-cat="scripting" data-cat-title="Scripting" data-platform="ANTHROPIC_API_KEY" aria-pressed="false"', html)
+        self.assertIn('data-toggle-cat="character" data-cat-title="Character" data-platform="ANTHROPIC_API_KEY" aria-pressed="true"', html)
+
     def test_workspace_preview_supports_byte_ranges_and_only_serves_registered_media(self):
         idea = self.store.add_idea("A preview test")
         self.store.decide_idea(idea, "accept")
@@ -389,3 +481,110 @@ class StudioHTTPTest(unittest.TestCase):
         self.assertNotIn(
             'name="characters" value="mother" checked', self.request("GET", f"/workspace?job={job}")[1],
         )
+
+    def test_assets_library_screens_crud_and_navigation(self):
+        status, html = self.request("GET", "/assets")
+        self.assertEqual(status, 200)
+        self.assertIn("Asset Library", html)
+        self.assertIn("+ Add Asset", html)
+        self.assertIn('href="/assets?kind=place"', html)
+        self.assertIn('href="/assets?kind=item"', html)
+        self.assertIn('href="/assets" aria-current="page"', html)
+        self.assertIn('href="/presets"', html)
+
+        self.assertEqual(self.request("GET", "/assets/new/profile")[0], 200)
+        self.assertEqual(self.post("/assets", asset_id="crystal_cave", kind="place",
+                                   name="Crystal Cave", description="A glittering subterranean cave"), 303)
+        base = "/assets/crystal_cave"
+        status, html = self.request("GET", base)
+        self.assertEqual(status, 200)
+        self.assertIn("Crystal Cave", html)
+        self.assertIn("Place", html)
+        self.assertIn("Needs a reference image", html)
+        self.assertIn('href="/assets/crystal_cave/edit"', html)
+
+        # Search filter
+        self.assertIn('href="/assets/crystal_cave"', self.request("GET", "/assets?q=CRYSTAL")[1])
+        self.assertNotIn('href="/assets/crystal_cave"', self.request("GET", "/assets?q=DESERT")[1])
+
+        # Add variant
+        self.assertEqual(self.post(f"{base}/variants", variant_id="glowing", name="Glowing Crystals",
+                                   description="Crystals glowing blue and violet"), 303)
+        self.assertIn("Glowing Crystals", self.request("GET", base)[1])
+
+        # Edit asset
+        self.assertEqual(self.request("GET", f"{base}/edit")[0], 200)
+        self.assertEqual(self.post(f"{base}/edit", name="Enchanted Crystal Cave",
+                                   description="Glittering and humming with magic"), 303)
+        self.assertIn("Enchanted Crystal Cave", self.request("GET", base)[1])
+
+        # Test backward-compatible redirect from /settings?asset=crystal_cave to /assets/crystal_cave
+        status, _ = self.request("GET", "/settings?asset=crystal_cave")
+        self.assertEqual(status, 303)
+
+        # Static script
+        status, js = self.request("GET", "/assets.js")
+        self.assertEqual(status, 200)
+        self.assertIn("data-preview-dialog", js)
+
+    def test_presets_screens_crud_and_audio(self):
+        status, html = self.request("GET", "/presets")
+        self.assertEqual(status, 200)
+        self.assertIn("Production Presets", html)
+        self.assertIn('data-tab-btn="visual"', html)
+        self.assertIn('data-tab-btn="script"', html)
+        self.assertIn('data-tab-btn="subtitle"', html)
+        self.assertIn('data-tab-btn="audio"', html)
+        self.assertIn('href="/presets" aria-current="page"', html)
+
+        # Create visual preset
+        self.assertEqual(self.post("/presets/visual", preset_id="neon_noir", name="Neon Noir",
+                                   style="High contrast dark city with neon glows",
+                                   palette="Electric cyan, magenta, jet black", is_default="yes"), 303)
+        status, html = self.request("GET", "/presets?tab=visual")
+        self.assertEqual(status, 200)
+        self.assertIn("Neon Noir", html)
+        self.assertIn("Default", html)
+        self.assertIn("High contrast dark city with neon glows", html)
+
+        # Create script preset
+        self.assertEqual(self.post("/presets/script", preset_id="noir_tone", name="Noir Tone",
+                                   tone="Hardboiled cynical voiceover", is_default="no"), 303)
+        status, html = self.request("GET", "/presets?tab=script")
+        self.assertEqual(status, 200)
+        self.assertIn("Noir Tone", html)
+        self.assertIn("Hardboiled cynical voiceover", html)
+
+        # Set default for script preset
+        self.assertEqual(self.post("/presets/script/noir_tone/default"), 303)
+        self.assertIn("Default", self.request("GET", "/presets?tab=script")[1])
+
+        # Create subtitle preset
+        self.assertEqual(self.post("/presets/subtitle", preset_id="neon_subs", name="Neon Captions",
+                                   font_name="DejaVu Sans", font_size="16", text_color="#00FFFF",
+                                   outline_color="#000000", position="bottom", is_default="no"), 303)
+        status, html = self.request("GET", "/presets?tab=subtitle")
+        self.assertEqual(status, 200)
+        self.assertIn("Neon Captions", html)
+        self.assertIn("#00FFFF", html)
+
+        # Static script and audio endpoint
+        status, js = self.request("GET", "/presets.js")
+        self.assertEqual(status, 200)
+        self.assertIn("data-tab-btn", js)
+        self.assertEqual(self.request("GET", "/preset-audio/nonexistent.mp3")[0], 404)
+
+        # Test backward-compatible redirect from /settings?presets=1 to /presets
+        status, _ = self.request("GET", "/settings?presets=1")
+        self.assertEqual(status, 303)
+
+    def test_settings_page_does_not_contain_asset_library_or_presets(self):
+        status, html = self.request("GET", "/settings")
+        self.assertEqual(status, 200)
+        self.assertIn("Budget", html)
+        self.assertIn("Idea generation schedule", html)
+        self.assertNotIn("settings-nav-cards", html)
+        self.assertNotIn("<summary>Asset Library</summary>", html)
+        self.assertNotIn("<summary>Production Presets</summary>", html)
+        self.assertNotIn("Manage places, environments, and prop references", html)
+        self.assertNotIn("Manage visual styles, script tone, subtitles, and audio", html)
