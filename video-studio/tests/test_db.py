@@ -102,9 +102,10 @@ class StudioStoreTests(unittest.TestCase):
         self.store.set_inbox_deleted("idea", idea_id, False)
         self.assertEqual(self.store.get_idea(idea_id)["status"], "later")
         self.store.decide_idea(idea_id, "accept")
-        with self.assertRaises(ValueError):
-            self.store.set_inbox_deleted("idea", idea_id, True)
         self.assertEqual(len(self.store.list_jobs()), 1)
+        self.store.set_inbox_deleted("idea", idea_id, True)
+        self.assertTrue(self.store.get_idea(idea_id)["deleted_at"])
+        self.assertEqual(self.store.list_jobs(), [])
 
     def test_schedule_reject_delete_and_restore_never_activate_a_rejected_draft(self):
         schedule_id = self.store.create_schedule(
@@ -227,8 +228,10 @@ class StudioStoreTests(unittest.TestCase):
         self.store.set_schedule_status(schedule, "active")
         self.assertEqual(self.store.dispatch_due(due), 2)
         self.store.set_schedule_status(schedule, "paused")
-        with self.assertRaises(ValueError):
-            self.store.set_inbox_deleted("schedule", schedule, True)
+        self.store.set_inbox_deleted("schedule", schedule, True)
+        self.assertTrue(self.store.get_schedule(schedule)["deleted_at"])
+        self.store.set_inbox_deleted("schedule", schedule, False)
+        self.assertIsNone(self.store.get_schedule(schedule)["deleted_at"])
         self.assertEqual(self.store.dispatch_due(due + timedelta(days=1)), 0)
         self.store.set_schedule_status(schedule, "active")
         self.assertEqual(self.store.dispatch_due(due + timedelta(days=3)), 2)
@@ -250,6 +253,152 @@ class StudioStoreTests(unittest.TestCase):
             self.store.create_schedule(["Prompt"], "2026-11-09", "09:00", "Asia/Dhaka", 1, title="x" * 101)
         with self.assertRaises(ValueError):
             self.store.dispatch_due(datetime(2026, 11, 9, 3))
+
+
+    def test_brand_profiles_crud_and_defaults(self):
+        # Initial auto-seed creates default brand profile
+        profiles = self.store.list_brand_profiles("kids_3d")
+        self.assertEqual(len(profiles), 1)
+        self.assertTrue(profiles[0]["is_default"])
+        self.assertEqual(profiles[0]["id"], "kids_3d_default")
+
+        # Create a second brand profile
+        self.store.create_brand_profile(
+            "kids_3d",
+            "bedtime_rhymes",
+            "Bedtime Rhymes",
+            "Soft pastel 3D claymation with dreamy slow movements.",
+            brand_rules="- Calming gentle colors only\n- No loud sounds",
+            story_rules="- Scene 1 introduces peaceful setting\n- Scene 3 ends with sleep",
+            is_default=False,
+        )
+        profiles = self.store.list_brand_profiles("kids_3d")
+        self.assertEqual(len(profiles), 2)
+
+        # Switch default
+        self.store.set_default_brand_profile("kids_3d", "bedtime_rhymes")
+        default_p = self.store.default_brand_profile("kids_3d")
+        self.assertEqual(default_p["id"], "bedtime_rhymes")
+        self.assertTrue(default_p["is_default"])
+
+        # Cannot delete default
+        with self.assertRaises(ValueError):
+            self.store.delete_brand_profile("kids_3d", "bedtime_rhymes")
+
+        # Switch default back and delete
+        self.store.set_default_brand_profile("kids_3d", "kids_3d_default")
+        self.store.delete_brand_profile("kids_3d", "bedtime_rhymes")
+        profiles = self.store.list_brand_profiles("kids_3d")
+        self.assertEqual(len(profiles), 1)
+
+    def test_idea_and_schedule_brand_propagation(self):
+        self.store.create_brand_profile(
+            "kids_3d",
+            "action_brand",
+            "Action Brand",
+            "High energy 3D animation",
+            brand_rules="Fast cuts",
+            story_rules="Hero arrives",
+            is_default=False,
+        )
+        idea_id = self.store.add_idea("Dynamic racing", title="Racing", brand_id="action_brand")
+        idea = self.store.get_idea(idea_id)
+        self.assertEqual(idea["brand_id"], "action_brand")
+
+        self.store.decide_idea(idea_id, "accept")
+        job = self.store.list_jobs()[-1]
+        options = json.loads(job["production_options_json"])
+        self.assertEqual(options.get("presets", {}).get("brand"), "action_brand")
+
+        # Prompt schedule with brand_id
+        schedule_id = self.store.create_schedule(
+            ["Space race"],
+            "2026-11-09",
+            "09:00",
+            "Asia/Dhaka",
+            1,
+            brand_id="action_brand",
+        )
+        self.store.set_schedule_status(schedule_id, "active")
+        due = datetime(2026, 11, 9, 3, tzinfo=timezone.utc)
+        self.assertEqual(self.store.dispatch_due(due), 1)
+        sched_job = self.store.list_jobs()[-1]
+        sched_options = json.loads(sched_job["production_options_json"])
+        self.assertEqual(sched_options.get("presets", {}).get("brand"), "action_brand")
+
+    def test_idea_update_and_job_sync(self):
+        idea_id = self.store.add_idea("Original prompt", title="Original Title")
+        self.store.update_idea(idea_id, "Updated prompt", title="Updated Title")
+        idea = self.store.get_idea(idea_id)
+        self.assertEqual(idea["title"], "Updated Title")
+        self.assertEqual(idea["prompt"], "Updated prompt")
+
+        # Accept idea -> creates job
+        self.store.decide_idea(idea_id, "accept")
+        job = self.store.get_job(self.store.get_idea(idea_id)["job_id"])
+        self.assertEqual(job["title"], "Updated Title")
+        self.assertEqual(job["prompt"], "Updated prompt")
+
+        # Updating accepted idea keeps queued job in sync
+        self.store.update_idea(idea_id, "Even newer prompt", title="Newer Title")
+        job = self.store.get_job(job["id"])
+        self.assertEqual(job["title"], "Newer Title")
+        self.assertEqual(job["prompt"], "Even newer prompt")
+
+    def test_idea_pause_and_resume_job(self):
+        idea_id = self.store.add_idea("Job pause prompt", title="Pause Test")
+        self.store.decide_idea(idea_id, "accept")
+        job_id = self.store.get_idea(idea_id)["job_id"]
+        self.assertEqual(self.store.get_job(job_id)["status"], "queued")
+
+        self.store.pause_idea_job(idea_id)
+        self.assertEqual(self.store.get_job(job_id)["status"], "paused")
+        self.assertEqual(self.store.get_idea(idea_id)["job_status"], "paused")
+
+        self.store.resume_idea_job(idea_id)
+        self.assertEqual(self.store.get_job(job_id)["status"], "queued")
+        self.assertEqual(self.store.get_idea(idea_id)["job_status"], "queued")
+
+    def test_job_pause_resume_update_and_delete(self):
+        idea_id = self.store.add_idea("Workspace job prompt", title="Workspace Job")
+        self.store.decide_idea(idea_id, "accept")
+        job_id = self.store.get_idea(idea_id)["job_id"]
+
+        # Pause and resume
+        self.store.pause_job(job_id)
+        self.assertEqual(self.store.get_job(job_id)["status"], "paused")
+        self.store.resume_job(job_id)
+        self.assertEqual(self.store.get_job(job_id)["status"], "queued")
+
+        # Update content
+        self.store.update_job_content(job_id, "Refined prompt", title="Refined Title")
+        job = self.store.get_job(job_id)
+        self.assertEqual(job["title"], "Refined Title")
+        self.assertEqual(job["prompt"], "Refined prompt")
+        # Linked idea also updated
+        idea = self.store.get_idea(idea_id)
+        self.assertEqual(idea["title"], "Refined Title")
+        self.assertEqual(idea["prompt"], "Refined prompt")
+
+        # Delete job
+        self.store.delete_job(job_id)
+        self.assertIsNone(self.store.get_job(job_id))
+        # Linked idea is reset to later
+        self.assertEqual(self.store.get_idea(idea_id)["status"], "later")
+
+    def test_schedule_update(self):
+        schedule_id = self.store.create_schedule(
+            ["Prompt 1", "Prompt 2"], "2026-11-10", "10:00", "Asia/Dhaka", 1, title="Initial Schedule"
+        )
+        self.store.update_schedule(
+            schedule_id, "Renamed Schedule", "2026-11-12", "11:00", "Asia/Dhaka", 2
+        )
+        sched = self.store.get_schedule(schedule_id)
+        self.assertEqual(sched["title"], "Renamed Schedule")
+        self.assertEqual(sched["start_date"], "2026-11-12")
+        self.assertEqual(sched["run_at"], "11:00")
+        self.assertEqual(sched["daily_limit"], 2)
+
 
 
 if __name__ == "__main__":

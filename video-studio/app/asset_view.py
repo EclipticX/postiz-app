@@ -77,8 +77,10 @@ def assets_page(assets, query='', active_kind='all'):
               <strong>{_text(asset['name'])}</strong>{variant_hint}<br>
               <small class="muted">{_text(asset['id'])}</small>
             </span>
-            <span class="badge-kind badge-{_text(kind)}">{kind_label}</span>
-            <span class="status {status_class}">{readiness}</span>
+            <div class="asset-badges">
+              <span class="status {status_class}">{readiness}</span>
+              <span class="badge-kind badge-{_text(kind)}">{kind_label}</span>
+            </div>
           </a>
         </li>''')
 

@@ -1,6 +1,7 @@
 """SQLite storage for the Studio inbox and prompt schedule."""
 
 import json
+import re
 import sqlite3
 from contextlib import closing, contextmanager
 from datetime import date, time
@@ -259,22 +260,62 @@ PRAGMA user_version = 5;
 
 
 INBOX_SCHEMA = """
-ALTER TABLE ideas ADD COLUMN deleted_at TEXT
-    CHECK (deleted_at IS NULL OR status <> 'accepted');
+ALTER TABLE ideas ADD COLUMN deleted_at TEXT;
 
 ALTER TABLE prompt_schedules ADD COLUMN title TEXT;
 ALTER TABLE prompt_schedules ADD COLUMN created_at TEXT;
 ALTER TABLE prompt_schedules ADD COLUMN rejected_at TEXT
     CHECK (rejected_at IS NULL OR status = 'draft');
-ALTER TABLE prompt_schedules ADD COLUMN deleted_at TEXT
-    CHECK (deleted_at IS NULL OR status = 'draft');
+ALTER TABLE prompt_schedules ADD COLUMN deleted_at TEXT;
 
 PRAGMA user_version = 6;
 """
 
 
+BRAND_SCHEMA = """
+CREATE TABLE IF NOT EXISTS brand_profiles (
+    niche_id TEXT NOT NULL REFERENCES niches(id),
+    id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    mother_prompt TEXT NOT NULL,
+    brand_rules TEXT NOT NULL,
+    story_rules TEXT NOT NULL,
+    is_default INTEGER NOT NULL DEFAULT 0 CHECK (is_default IN (0, 1)),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    PRIMARY KEY (niche_id, id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS brand_profiles_default
+    ON brand_profiles (niche_id) WHERE is_default = 1;
+
+ALTER TABLE ideas ADD COLUMN brand_id TEXT;
+ALTER TABLE prompt_schedules ADD COLUMN brand_id TEXT;
+ALTER TABLE idea_generation_requests ADD COLUMN brand_id TEXT;
+
+PRAGMA user_version = 7;
+"""
+
+
+LIFECYCLE_SCHEMA = """
+ALTER TABLE ideas ADD COLUMN deleted_at_backup TEXT;
+UPDATE ideas SET deleted_at_backup = deleted_at;
+ALTER TABLE ideas DROP COLUMN deleted_at;
+ALTER TABLE ideas ADD COLUMN deleted_at TEXT;
+UPDATE ideas SET deleted_at = deleted_at_backup;
+ALTER TABLE ideas DROP COLUMN deleted_at_backup;
+
+ALTER TABLE prompt_schedules ADD COLUMN deleted_at_backup TEXT;
+UPDATE prompt_schedules SET deleted_at_backup = deleted_at;
+ALTER TABLE prompt_schedules DROP COLUMN deleted_at;
+ALTER TABLE prompt_schedules ADD COLUMN deleted_at TEXT;
+UPDATE prompt_schedules SET deleted_at = deleted_at_backup;
+ALTER TABLE prompt_schedules DROP COLUMN deleted_at_backup;
+
+PRAGMA user_version = 8;
+"""
+
+
 IDEA_RECORDS = """
-SELECT ideas.*, jobs.id AS job_id, (
+SELECT ideas.*, jobs.id AS job_id, jobs.status AS job_status, (
     SELECT MIN(scheduled_at) FROM publishing_requests
     WHERE job_id = jobs.id AND draft = 0 AND status IN ('scheduled', 'published')
 ) AS publish_at
@@ -336,7 +377,7 @@ class StudioStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connection(write=True) as db:
             version = db.execute("PRAGMA user_version").fetchone()[0]
-            if not 0 <= version <= 6:
+            if not 0 <= version <= 8:
                 raise RuntimeError(f"Unsupported Studio database version {version}.")
             if version < 1:
                 _apply_schema(db, SCHEMA)
@@ -350,6 +391,10 @@ class StudioStore:
                 _apply_schema(db, LIBRARY_SCHEMA)
             if version < 6:
                 _apply_schema(db, INBOX_SCHEMA)
+            if version < 7:
+                _apply_schema(db, BRAND_SCHEMA)
+            if version < 8:
+                _apply_schema(db, LIFECYCLE_SCHEMA)
 
     def seed_niche(self, profile):
         with self._connection(write=True) as db:
@@ -395,16 +440,18 @@ class StudioStore:
             row = db.execute(IDEA_RECORDS + "WHERE ideas.id = ?", (idea_id,)).fetchone()
             return dict(row) if row is not None else None
 
-    def add_idea(self, prompt, title=None, source="manual"):
+    def add_idea(self, prompt, title=None, source="manual", brand_id=None):
         prompt = _clean_prompt(prompt)
         title = (title or "").strip() or _prompt_title(prompt)
+        if brand_id is not None:
+            brand_id = brand_id.strip() or None
         with self._connection(write=True) as db:
             return db.execute(
                 """
-                INSERT INTO ideas (niche_id, title, prompt, source)
-                VALUES ((SELECT id FROM niches WHERE id = 'kids_3d'), ?, ?, ?)
+                INSERT INTO ideas (niche_id, title, prompt, source, brand_id)
+                VALUES ((SELECT id FROM niches WHERE id = 'kids_3d'), ?, ?, ?, ?)
                 """,
-                (title, prompt, source),
+                (title, prompt, source, brand_id),
             ).lastrowid
 
     def decide_idea(self, idea_id, decision):
@@ -426,13 +473,77 @@ class StudioStore:
 
             db.execute("UPDATE ideas SET status = ? WHERE id = ?", (status, idea_id))
             if status == "accepted":
+                production_options = {}
+                if idea["brand_id"]:
+                    production_options = {"presets": {"brand": idea["brand_id"]}}
                 db.execute(
                     """
-                    INSERT INTO jobs (niche_id, title, prompt, source, idea_id)
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT INTO jobs (niche_id, title, prompt, source, idea_id, production_options_json)
+                    VALUES (?, ?, ?, ?, ?, ?)
                     """,
-                    (idea["niche_id"], idea["title"], idea["prompt"], idea["source"], idea_id),
+                    (idea["niche_id"], idea["title"], idea["prompt"], idea["source"], idea_id, json.dumps(production_options)),
                 )
+
+    def update_idea(self, idea_id, prompt, title=None, brand_id=None):
+        prompt = _clean_prompt(prompt)
+        title = (title or "").strip() or _prompt_title(prompt)
+        if brand_id is not None:
+            brand_id = brand_id.strip() or None
+        with self._connection(write=True) as db:
+            idea = db.execute("SELECT * FROM ideas WHERE id = ?", (idea_id,)).fetchone()
+            if idea is None:
+                raise LookupError("Idea not found.")
+            if idea["deleted_at"]:
+                raise ValueError("Restore this idea before editing it.")
+            db.execute(
+                "UPDATE ideas SET title = ?, prompt = ?, brand_id = ? WHERE id = ?",
+                (title, prompt, brand_id, idea_id),
+            )
+            job = db.execute("SELECT * FROM jobs WHERE idea_id = ?", (idea_id,)).fetchone()
+            if job:
+                opts = json.loads(job["production_options_json"] or "{}")
+                if brand_id:
+                    opts.setdefault("presets", {})["brand"] = brand_id
+                elif "presets" in opts and "brand" in opts["presets"]:
+                    del opts["presets"]["brand"]
+
+                if job["status"] in ("queued", "paused"):
+                    db.execute(
+                        "UPDATE jobs SET title = ?, prompt = ?, production_options_json = ? WHERE id = ?",
+                        (title, prompt, json.dumps(opts), job["id"]),
+                    )
+                else:
+                    db.execute(
+                        "UPDATE spend_reservations SET status = 'released' WHERE job_id = ? AND status = 'reserved'",
+                        (job["id"],),
+                    )
+                    db.execute("DELETE FROM media_tasks WHERE job_id = ?", (job["id"],))
+                    db.execute(
+                        """UPDATE jobs SET title = ?, prompt = ?, status = 'queued', plan_json = NULL,
+                           plan_attempts = 0, plan_feedback = NULL, stage_error = NULL,
+                           preview_path = NULL, qa_json = NULL, revision_feedback = 'Prompt updated',
+                           production_context_json = NULL, production_options_json = ?
+                           WHERE id = ?""",
+                        (title, prompt, json.dumps(opts), job["id"]),
+                    )
+
+    def pause_idea_job(self, idea_id):
+        with self._connection(write=True) as db:
+            job = db.execute("SELECT id, status FROM jobs WHERE idea_id = ?", (idea_id,)).fetchone()
+            if not job:
+                raise LookupError("No video job found for this idea.")
+            if job["status"] != "queued":
+                raise ValueError("Only queued jobs can be paused.")
+            db.execute("UPDATE jobs SET status = 'paused' WHERE id = ?", (job["id"],))
+
+    def resume_idea_job(self, idea_id):
+        with self._connection(write=True) as db:
+            job = db.execute("SELECT id, status FROM jobs WHERE idea_id = ?", (idea_id,)).fetchone()
+            if not job:
+                raise LookupError("No video job found for this idea.")
+            if job["status"] != "paused":
+                raise ValueError("Only paused jobs can be resumed.")
+            db.execute("UPDATE jobs SET status = 'queued' WHERE id = ?", (job["id"],))
 
     def list_jobs(self):
         with self._connection() as db:
@@ -443,7 +554,210 @@ class StudioStore:
             row = db.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
             return dict(row) if row is not None else None
 
-    def create_schedule(self, prompts, start_date, run_at, timezone, daily_limit, *, title=None):
+    def pause_job(self, job_id):
+        with self._connection(write=True) as db:
+            job = db.execute("SELECT id, status FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            if not job:
+                raise LookupError("Video job not found.")
+            if job["status"] != "queued":
+                raise ValueError("Only queued jobs can be paused.")
+            db.execute("UPDATE jobs SET status = 'paused' WHERE id = ?", (job_id,))
+
+    def resume_job(self, job_id):
+        with self._connection(write=True) as db:
+            job = db.execute("SELECT id, status FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            if not job:
+                raise LookupError("Video job not found.")
+            if job["status"] != "paused":
+                raise ValueError("Only paused jobs can be resumed.")
+            db.execute("UPDATE jobs SET status = 'queued' WHERE id = ?", (job_id,))
+
+    def update_job_content(self, job_id, prompt, title=None):
+        prompt = _clean_prompt(prompt)
+        title = (title or "").strip() or _prompt_title(prompt)
+        with self._connection(write=True) as db:
+            job = db.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            if not job:
+                raise LookupError("Video job not found.")
+            if db.execute(
+                "SELECT 1 FROM media_tasks WHERE job_id = ? AND status IN ('submitting', 'pending')", (job_id,),
+            ).fetchone():
+                raise ValueError("Wait for the submitted provider tasks to finish before updating.")
+            if db.execute(
+                "SELECT 1 FROM publishing_requests WHERE job_id = ? AND status IN ('queued', 'sending')", (job_id,),
+            ).fetchone():
+                raise ValueError("Wait for the approved Postiz handoff to finish before updating.")
+
+            if job["status"] in ("queued", "paused"):
+                db.execute("UPDATE jobs SET title = ?, prompt = ? WHERE id = ?", (title, prompt, job_id))
+            else:
+                db.execute(
+                    "UPDATE spend_reservations SET status = 'released' WHERE job_id = ? AND status = 'reserved'",
+                    (job_id,),
+                )
+                db.execute("DELETE FROM media_tasks WHERE job_id = ?", (job_id,))
+                db.execute(
+                    """UPDATE jobs SET title = ?, prompt = ?, status = 'queued', plan_json = NULL,
+                        plan_attempts = 0, plan_feedback = NULL, stage_error = NULL,
+                        preview_path = NULL, qa_json = NULL, revision_feedback = 'Prompt updated',
+                        production_context_json = NULL WHERE id = ?""",
+                    (title, prompt, job_id),
+                )
+            if job["idea_id"]:
+                db.execute("UPDATE ideas SET title = ?, prompt = ? WHERE id = ?", (title, prompt, job["idea_id"]))
+
+    def delete_job(self, job_id):
+        with self._connection(write=True) as db:
+            job = db.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            if not job:
+                raise LookupError("Video job not found.")
+            if db.execute(
+                "SELECT 1 FROM media_tasks WHERE job_id = ? AND status IN ('submitting', 'pending')", (job_id,),
+            ).fetchone():
+                raise ValueError("Wait for the submitted provider tasks to finish before deleting.")
+            if db.execute(
+                "SELECT 1 FROM publishing_requests WHERE job_id = ? AND status IN ('queued', 'sending')", (job_id,),
+            ).fetchone():
+                raise ValueError("Wait for the approved Postiz handoff to finish before deleting.")
+
+            db.execute(
+                "UPDATE spend_reservations SET status = 'released' WHERE job_id = ? AND status = 'reserved'",
+                (job_id,),
+            )
+            db.execute("DELETE FROM media_tasks WHERE job_id = ?", (job_id,))
+            db.execute("DELETE FROM publishing_requests WHERE job_id = ?", (job_id,))
+            db.execute("DELETE FROM analytics WHERE job_id = ?", (job_id,))
+            idea_id = job["idea_id"]
+            db.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
+            if idea_id:
+                db.execute("UPDATE ideas SET status = 'later' WHERE id = ?", (idea_id,))
+
+    def _seed_brand_profile_if_empty(self, db, niche_id="kids_3d"):
+        count = db.execute("SELECT COUNT(*) FROM brand_profiles WHERE niche_id = ?", (niche_id,)).fetchone()[0]
+        if count == 0:
+            from app.niche import load_profile
+            prof = {}
+            try:
+                prof = load_profile(niche_id)
+            except Exception:
+                pass
+            niche_row = db.execute("SELECT id FROM niches WHERE id = ?", (niche_id,)).fetchone()
+            if not niche_row:
+                db.execute(
+                    "INSERT INTO niches (id, name, config_json) VALUES (?, ?, ?) ON CONFLICT (id) DO NOTHING",
+                    (niche_id, prof.get("name", niche_id.replace("_", " ").title()), json.dumps(prof)),
+                )
+            db.execute(
+                """
+                INSERT INTO brand_profiles (niche_id, id, name, mother_prompt, brand_rules, story_rules, is_default)
+                VALUES (?, ?, ?, ?, ?, ?, 1)
+                ON CONFLICT (niche_id, id) DO NOTHING
+                """,
+                (
+                    niche_id,
+                    f"{niche_id}_default",
+                    f"{prof.get('name', 'Default')} (Default)",
+                    prof.get("style_guide", "Whimsical, colorful 3D animation, warm studio lighting, expressive cute characters."),
+                    "\n".join(prof.get("brand_rules", [])),
+                    "\n".join(prof.get("audience_rules", [])),
+                ),
+            )
+
+    def list_brand_profiles(self, niche_id="kids_3d"):
+        with self._connection(write=True) as db:
+            self._seed_brand_profile_if_empty(db, niche_id)
+            rows = db.execute(
+                "SELECT * FROM brand_profiles WHERE niche_id = ? ORDER BY is_default DESC, id ASC",
+                (niche_id,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_brand_profile(self, niche_id, brand_id):
+        with self._connection(write=True) as db:
+            self._seed_brand_profile_if_empty(db, niche_id)
+            row = db.execute(
+                "SELECT * FROM brand_profiles WHERE niche_id = ? AND id = ?",
+                (niche_id, brand_id),
+            ).fetchone()
+            return dict(row) if row is not None else None
+
+    def default_brand_profile(self, niche_id="kids_3d"):
+        with self._connection(write=True) as db:
+            self._seed_brand_profile_if_empty(db, niche_id)
+            row = db.execute(
+                "SELECT * FROM brand_profiles WHERE niche_id = ? AND is_default = 1",
+                (niche_id,),
+            ).fetchone()
+            if row is not None:
+                return dict(row)
+            row = db.execute(
+                "SELECT * FROM brand_profiles WHERE niche_id = ? ORDER BY id ASC LIMIT 1",
+                (niche_id,),
+            ).fetchone()
+            return dict(row) if row is not None else None
+
+    def create_brand_profile(self, niche_id, brand_id, name, mother_prompt, brand_rules, story_rules, is_default=False):
+        brand_id = (brand_id or "").strip().lower()
+        if not re.fullmatch(r"[a-z0-9_]{1,64}", brand_id):
+            raise ValueError("Brand ID must be 1–64 lowercase letters, numbers, or underscores.")
+        name = (name or "").strip()
+        if not name or len(name) > 100:
+            raise ValueError("Enter a brand name of up to 100 characters.")
+        mother_prompt = (mother_prompt or "").strip()
+        if not mother_prompt or len(mother_prompt) > 4000:
+            raise ValueError("Enter a mother prompt / style guide of up to 4,000 characters.")
+        brand_rules = (brand_rules or "").strip()
+        story_rules = (story_rules or "").strip()
+
+        with self._connection(write=True) as db:
+            self._seed_brand_profile_if_empty(db, niche_id)
+            existing = db.execute(
+                "SELECT id FROM brand_profiles WHERE niche_id = ? AND id = ?",
+                (niche_id, brand_id),
+            ).fetchone()
+            if existing:
+                raise ValueError(f"Brand profile '{brand_id}' already exists.")
+
+            if is_default:
+                db.execute("UPDATE brand_profiles SET is_default = 0 WHERE niche_id = ?", (niche_id,))
+
+            db.execute(
+                """
+                INSERT INTO brand_profiles (niche_id, id, name, mother_prompt, brand_rules, story_rules, is_default)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (niche_id, brand_id, name, mother_prompt, brand_rules, story_rules, 1 if is_default else 0),
+            )
+
+    def set_default_brand_profile(self, niche_id, brand_id):
+        with self._connection(write=True) as db:
+            self._seed_brand_profile_if_empty(db, niche_id)
+            target = db.execute(
+                "SELECT id FROM brand_profiles WHERE niche_id = ? AND id = ?",
+                (niche_id, brand_id),
+            ).fetchone()
+            if not target:
+                raise ValueError("Brand profile not found.")
+            db.execute("UPDATE brand_profiles SET is_default = 0 WHERE niche_id = ?", (niche_id,))
+            db.execute("UPDATE brand_profiles SET is_default = 1 WHERE niche_id = ? AND id = ?", (niche_id, brand_id))
+
+    def delete_brand_profile(self, niche_id, brand_id):
+        with self._connection(write=True) as db:
+            self._seed_brand_profile_if_empty(db, niche_id)
+            target = db.execute(
+                "SELECT is_default FROM brand_profiles WHERE niche_id = ? AND id = ?",
+                (niche_id, brand_id),
+            ).fetchone()
+            if not target:
+                raise ValueError("Brand profile not found.")
+            count = db.execute("SELECT COUNT(*) FROM brand_profiles WHERE niche_id = ?", (niche_id,)).fetchone()[0]
+            if count <= 1:
+                raise ValueError("Cannot delete the only brand profile.")
+            if target["is_default"]:
+                raise ValueError("Cannot delete the default brand profile. Set another as default first.")
+            db.execute("DELETE FROM brand_profiles WHERE niche_id = ? AND id = ?", (niche_id, brand_id))
+
+    def create_schedule(self, prompts, start_date, run_at, timezone, daily_limit, *, title=None, brand_id=None):
         if not isinstance(prompts, (list, tuple)) or not prompts:
             raise ValueError("Enter at least one prompt.")
         if len(prompts) > 100:
@@ -455,6 +769,8 @@ class StudioStore:
             if not isinstance(title, str) or len(title.strip()) > 100:
                 raise ValueError("Enter a schedule title of up to 100 characters.")
             title = title.strip() or None
+        if brand_id is not None:
+            brand_id = brand_id.strip() or None
 
         try:
             starts = date.fromisoformat(start_date)
@@ -475,11 +791,11 @@ class StudioStore:
         with self._connection(write=True) as db:
             schedule_id = db.execute(
                 """
-                INSERT INTO prompt_schedules (niche_id, start_date, run_at, timezone, daily_limit, title, created_at)
-                VALUES ((SELECT id FROM niches WHERE id = 'kids_3d'), ?, ?, ?, ?, ?,
+                INSERT INTO prompt_schedules (niche_id, start_date, run_at, timezone, daily_limit, title, brand_id, created_at)
+                VALUES ((SELECT id FROM niches WHERE id = 'kids_3d'), ?, ?, ?, ?, ?, ?,
                     strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
                 """,
-                (start_date, run_at, timezone, daily_limit, title),
+                (start_date, run_at, timezone, daily_limit, title, brand_id),
             ).lastrowid
             db.executemany(
                 "INSERT INTO schedule_entries (schedule_id, prompt) VALUES (?, ?)",
@@ -550,19 +866,57 @@ class StudioStore:
                 raise ValueError("Activate this schedule before pausing it.")
             db.execute("UPDATE prompt_schedules SET status = ? WHERE id = ?", (status, schedule_id))
 
+    def update_schedule(self, schedule_id, title, start_date, run_at, timezone, daily_limit, brand_id=None):
+        if type(daily_limit) is not int or daily_limit < 1:
+            raise ValueError("Videos per day must be at least 1.")
+        if not isinstance(title, str) or not title.strip() or len(title.strip()) > 100:
+            raise ValueError("Enter a schedule title of up to 100 characters.")
+        title = title.strip()
+        if brand_id is not None:
+            brand_id = brand_id.strip() or None
+
+        try:
+            starts = date.fromisoformat(start_date)
+            start_time = time.fromisoformat(run_at)
+        except (TypeError, ValueError) as error:
+            raise ValueError("Enter a valid start date and time.") from error
+        if (
+            starts.isoformat() != start_date
+            or start_time.tzinfo is not None
+            or start_time.isoformat(timespec="minutes") != run_at
+        ):
+            raise ValueError("Use YYYY-MM-DD for the date and HH:MM for the time.")
+        try:
+            ZoneInfo(timezone)
+        except (TypeError, ValueError, ZoneInfoNotFoundError) as error:
+            raise ValueError("Enter a valid time zone, such as Asia/Dhaka.") from error
+
+        with self._connection(write=True) as db:
+            schedule = db.execute("SELECT * FROM prompt_schedules WHERE id = ?", (schedule_id,)).fetchone()
+            if schedule is None:
+                raise LookupError("Prompt schedule not found.")
+            if schedule["deleted_at"]:
+                raise ValueError("Restore this schedule before editing it.")
+            db.execute(
+                """
+                UPDATE prompt_schedules
+                SET title = ?, start_date = ?, run_at = ?, timezone = ?, daily_limit = ?, brand_id = ?
+                WHERE id = ?
+                """,
+                (title, start_date, run_at, timezone, daily_limit, brand_id, schedule_id),
+            )
+
     def set_inbox_deleted(self, kind, record_id, deleted):
-        tables = {"idea": ("ideas", ("accepted",)), "schedule": ("prompt_schedules", ("active", "paused"))}
+        tables = {"idea": "ideas", "schedule": "prompt_schedules"}
         if kind not in tables or type(deleted) is not bool:
             raise ValueError("Choose a valid record and a delete or restore action.")
-        table, approved_states = tables[kind]
+        table = tables[kind]
         with self._connection(write=True) as db:
             record = db.execute(f"SELECT status, deleted_at FROM {table} WHERE id = ?", (record_id,)).fetchone()
             if record is None:
                 raise LookupError("Inbox record not found.")
             if (record["deleted_at"] is not None) == deleted:
                 return
-            if deleted and record["status"] in approved_states:
-                raise ValueError("Approved records cannot be deleted.")
             db.execute(
                 f"""
                 UPDATE {table}
@@ -571,6 +925,22 @@ class StudioStore:
                 """,
                 (deleted, record_id),
             )
+            if kind == "idea":
+                if deleted:
+                    job = db.execute("SELECT id FROM jobs WHERE idea_id = ?", (record_id,)).fetchone()
+                    if job:
+                        db.execute(
+                            "UPDATE spend_reservations SET status = 'released' WHERE job_id = ? AND status = 'reserved'",
+                            (job["id"],),
+                        )
+                        db.execute("DELETE FROM media_tasks WHERE job_id = ?", (job["id"],))
+                        db.execute("DELETE FROM publishing_requests WHERE job_id = ?", (job["id"],))
+                        db.execute("DELETE FROM analytics WHERE job_id = ?", (job["id"],))
+                        db.execute("DELETE FROM jobs WHERE id = ?", (job["id"],))
+                        db.execute("UPDATE ideas SET status = 'later' WHERE id = ?", (record_id,))
+            elif kind == "schedule":
+                if deleted and record["status"] == "active":
+                    db.execute("UPDATE prompt_schedules SET status = 'paused' WHERE id = ?", (record_id,))
 
     def dispatch_due(self, now):
         """Queue today's due prompts once. A missed day never increases today's quota."""
@@ -615,13 +985,14 @@ class StudioStore:
                 db.executemany(
                     """
                     INSERT INTO jobs
-                        (niche_id, title, prompt, source, schedule_entry_id, scheduled_for)
-                    VALUES (?, ?, ?, 'schedule', ?, ?)
+                        (niche_id, title, prompt, source, schedule_entry_id, scheduled_for, production_options_json)
+                    VALUES (?, ?, ?, 'schedule', ?, ?, ?)
                     """,
                     [
                         (
                             schedule["niche_id"], _prompt_title(entry["prompt"]),
                             entry["prompt"], entry["id"], today,
+                            json.dumps({"presets": {"brand": schedule["brand_id"]}}) if schedule["brand_id"] else "{}",
                         )
                         for entry in entries
                     ],

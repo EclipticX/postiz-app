@@ -253,12 +253,19 @@ def production_presets_section(presets, csrf_token, expanded=False):
     </details>'''
 
 
-def production_options_section(job, assets, presets, options, csrf_token, *, expanded=False):
+def production_options_section(job, assets, presets, options, csrf_token, *, expanded=False, brand_profiles=None):
     if job['status'] not in ('queued', 'review_keyframes', 'preview_ready', 'needs_review'):
         return ''
     options = options or {}
     selected_presets = options.get('presets', {})
     preset_fields = []
+    if brand_profiles:
+        default_brand = next((bp['name'] for bp in brand_profiles if bp.get('is_default')), None)
+        select = _choices(
+            'preset.brand', ((bp['id'], bp['name']) for bp in brand_profiles),
+            selected=selected_presets.get('brand'), default=f'Default ({default_brand})' if default_brand else 'Use default brand',
+        )
+        preset_fields.append(f'<label>Brand rules{select}</label>')
     for kind, label in _PRESET_LABELS.items():
         choices = [preset for preset in presets if preset['kind'] == kind]
         default = next((preset['name'] for preset in choices if preset['is_default']), None)

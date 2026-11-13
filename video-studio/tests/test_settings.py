@@ -134,7 +134,7 @@ class StudioSettingsTests(unittest.TestCase):
             list(executor.map(lambda _: old_store.initialize(), range(2)))
         self.assertEqual(old_store.list_ideas()[0]["prompt"], "Old prompt")
         with sqlite3.connect(old_path) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 6)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 8)
             self.assertIsNotNone(db.execute("SELECT COUNT(*) FROM idea_generation_requests").fetchone())
         old_settings = StudioSettings(old_store, self.env_path)
         self.assertEqual(old_settings.get_budgets(), {"daily_micros": 0, "video_micros": 0})

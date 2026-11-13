@@ -386,8 +386,19 @@ document.addEventListener('DOMContentLoaded', () => {
   blurActiveElement();
   setTimeout(blurActiveElement, 50);
 
+  // Open Add Platform Dialog
+  const openAddPlatformBtn = document.getElementById('open-add-platform-dialog');
+  const addPlatformDialog = document.getElementById('add-platform-dialog');
+  if (openAddPlatformBtn && addPlatformDialog) {
+    openAddPlatformBtn.addEventListener('click', () => {
+      if (typeof addPlatformDialog.showModal === 'function') {
+        addPlatformDialog.showModal();
+      }
+    });
+  }
+
   // Close dialogs when clicking on the backdrop
-  const dialogs = document.querySelectorAll('dialog.confirm-dialog');
+  const dialogs = document.querySelectorAll('dialog.confirm-dialog, dialog.brand-dialog');
   dialogs.forEach(dialog => {
     dialog.addEventListener('click', (e) => {
       const rect = dialog.getBoundingClientRect();

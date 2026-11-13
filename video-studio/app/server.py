@@ -18,9 +18,10 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from app.asset_view import asset_page, assets_page
+from app.brand_view import brand_rules_page
 from app.character_view import character_page, characters_page
 from app.db import StudioStore
-from app.inbox_view import create_page, inbox_page, record_page
+from app.inbox_view import create_page, edit_idea_page, edit_schedule_page, inbox_page, record_page
 from app.media_store import can_edit_scene, scene_revision
 from app.niche import load_profile
 from app.planning import StudioPlanner
@@ -42,6 +43,7 @@ STUDIO_ROOT = Path(__file__).resolve().parents[1]
 MAX_FORM_SIZE = 2 * 1024 * 1024
 LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 INBOX_RECORD = re.compile(r"/(ideas|schedules)/([0-9]{1,18})")
+INBOX_RECORD_EDIT = re.compile(r"/(ideas|schedules)/([0-9]{1,18})/edit")
 INBOX_ARCHIVE = re.compile(r"/(ideas|schedules)/([0-9]{1,18})/archive")
 INBOX_CREATE_TYPES = {"/ideas": "manual", "/ideas/generate": "claude", "/schedules": "schedule"}
 INBOX_RECORD_TYPES = {"manual", "claude", "schedule"}
@@ -61,6 +63,8 @@ ASSET_LIBRARY_PAGE = re.compile(rf"/assets/({ASSET_ID})(/edit)?")
 ASSET_LIBRARY_ACTION = re.compile(rf"/assets/({ASSET_ID})/(edit|references(?:/{REFERENCE_ID})?|variants)")
 PRESET_ACTION = re.compile(r"/presets/(visual|script|subtitle|audio)")
 PRESET_DEFAULT = re.compile(rf"/presets/(visual|script|subtitle|audio)/({ASSET_ID})/default")
+BRAND_DEFAULT = re.compile(rf"/brand-rules/({ASSET_ID})/default")
+BRAND_DELETE = re.compile(rf"/brand-rules/({ASSET_ID})/delete")
 
 
 def parse_upload(content_type, body):
@@ -118,6 +122,7 @@ def inbox_record(kind, row):
         source=source,
         status="deleted" if row["deleted_at"] else status,
         schedule_status=row["status"] if kind == "schedule" else None,
+        job_status=row.get("job_status"),
     )
 
 
@@ -207,6 +212,28 @@ class StudioHandler(BaseHTTPRequestHandler):
             self.send_error(HTTPStatus.NOT_FOUND)
             return
         self._reply(status, record_page(inbox_record(kind, row), self.server.csrf_token, notice=notice))
+
+    def _show_inbox_edit(self, collection, record_id, status=HTTPStatus.OK, notice="", values=None):
+        store = self.server.store
+        if collection == "ideas":
+            row = store.get_idea(record_id)
+            if row is None:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            html = edit_idea_page(
+                inbox_record("idea", row), self.server.csrf_token, notice=notice,
+                brand_profiles=store.list_brand_profiles(), values=values,
+            )
+        else:
+            row = store.get_schedule(record_id)
+            if row is None:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            html = edit_schedule_page(
+                inbox_record("schedule", row), self.server.csrf_token, notice=notice,
+                brand_profiles=store.list_brand_profiles(), values=values,
+            )
+        self._reply(status, html)
 
     def _show_published_posts(self, params):
         query = params.get("q", [""])[0].strip()[:100]
@@ -328,6 +355,7 @@ class StudioHandler(BaseHTTPRequestHandler):
             self.server.store.list_jobs(), job, notice, tasks, self.server.csrf_token,
             posts=posts, channels=channels, metrics=metrics, assets=assets, presets=presets, production_options=options,
             production_options_open=options_override is not None,
+            brand_profiles=self.server.store.list_brand_profiles(),
         ))
 
     def _show_scene_editor(self, job_id, scene_id, status=HTTPStatus.OK, notice="", *, values=None):
@@ -481,7 +509,12 @@ class StudioHandler(BaseHTTPRequestHandler):
             if kind not in INBOX_RECORD_TYPES:
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
-            self._reply(HTTPStatus.OK, create_page(self.server.csrf_token, kind=kind))
+            self._reply(HTTPStatus.OK, create_page(
+                self.server.csrf_token, kind=kind,
+                brand_profiles=self.server.store.list_brand_profiles(),
+            ))
+        elif edit_record := INBOX_RECORD_EDIT.fullmatch(url.path):
+            self._show_inbox_edit(edit_record[1], int(edit_record[2]))
         elif record := INBOX_RECORD.fullmatch(url.path):
             self._show_inbox_record(record[1], int(record[2]))
         elif url.path == "/published-posts":
@@ -542,6 +575,11 @@ class StudioHandler(BaseHTTPRequestHandler):
         elif url.path == "/presets":
             tab = parse_qs(url.query).get("tab", ["visual"])[0]
             self._reply(HTTPStatus.OK, presets_page(self.server.library.presets(), self.server.csrf_token, active_tab=tab))
+        elif url.path == "/brand-rules":
+            notice = parse_qs(url.query).get("notice", [""])[0]
+            self._reply(HTTPStatus.OK, brand_rules_page(
+                self.server.store.list_brand_profiles(), self.server.csrf_token, notice=notice,
+            ))
         elif url.path == "/workspace":
             params = parse_qs(url.query)
             job_id = params.get("job", [None])[0]
@@ -566,6 +604,9 @@ class StudioHandler(BaseHTTPRequestHandler):
         elif url.path == "/studio.css":
             css = (STUDIO_ROOT / "app/static/studio.css").read_text(encoding="utf-8")
             self._reply(HTTPStatus.OK, css, "text/css; charset=utf-8")
+        elif url.path == "/studio.js":
+            script = (STUDIO_ROOT / "app/static/studio.js").read_text(encoding="utf-8")
+            self._reply(HTTPStatus.OK, script, "text/javascript; charset=utf-8")
         elif url.path == "/characters.js":
             script = (STUDIO_ROOT / "app/static/characters.js").read_text(encoding="utf-8")
             self._reply(HTTPStatus.OK, script, "text/javascript; charset=utf-8")
@@ -577,6 +618,9 @@ class StudioHandler(BaseHTTPRequestHandler):
             self._reply(HTTPStatus.OK, script, "text/javascript; charset=utf-8")
         elif url.path == "/presets.js":
             script = (STUDIO_ROOT / "app/static/presets.js").read_text(encoding="utf-8")
+            self._reply(HTTPStatus.OK, script, "text/javascript; charset=utf-8")
+        elif url.path in ("/brand_rules.js", "/brand-rules.js"):
+            script = (STUDIO_ROOT / "app/static/brand_rules.js").read_text(encoding="utf-8")
             self._reply(HTTPStatus.OK, script, "text/javascript; charset=utf-8")
         elif url.path.startswith("/preset-audio/"):
             self._serve_preset_audio(url.path.removeprefix("/preset-audio/"))
@@ -698,20 +742,31 @@ class StudioHandler(BaseHTTPRequestHandler):
             return
 
         idea_decision = re.fullmatch(r"/ideas/(\d{1,18})/decision", path)
+        idea_control = re.fullmatch(r"/ideas/(\d{1,18})/job-control", path)
+        idea_edit = re.fullmatch(r"/ideas/(\d{1,18})/edit", path)
         schedule_status = re.fullmatch(r"/schedules/(\d{1,18})/status", path)
+        schedule_edit = re.fullmatch(r"/schedules/(\d{1,18})/edit", path)
         inbox_archive = INBOX_ARCHIVE.fullmatch(path)
         create_kind = INBOX_CREATE_TYPES.get(path)
         inbox_detail = None
         if idea_decision:
             inbox_detail = ("ideas", int(idea_decision[1]))
+        elif idea_control:
+            inbox_detail = ("ideas", int(idea_control[1]))
+        elif idea_edit:
+            inbox_detail = ("ideas", int(idea_edit[1]))
         elif schedule_status:
             inbox_detail = ("schedules", int(schedule_status[1]))
+        elif schedule_edit:
+            inbox_detail = ("schedules", int(schedule_edit[1]))
         elif inbox_archive:
             inbox_detail = (inbox_archive[1], int(inbox_archive[2]))
         key_route = re.fullmatch(r"/settings/keys/([A-Z_]+)", path)
         provider_route = re.fullmatch(r"/settings/providers/([a-z0-9-]+)", path)
         preset_default = re.fullmatch(rf"/settings/presets/(visual|script|subtitle|audio)/({ASSET_ID})/default", path)
-        workspace_route = re.fullmatch(r"/workspace/(\d{1,18})/(approve-keyframes|retry-render|revise|publish|options)", path)
+        brand_default = BRAND_DEFAULT.fullmatch(path)
+        brand_delete = BRAND_DELETE.fullmatch(path)
+        workspace_route = re.fullmatch(r"/workspace/(\d{1,18})/(approve-keyframes|retry-render|revise|publish|options|pause|resume|edit|delete)", path)
         scene_route = WORKSPACE_SCENE.fullmatch(path)
         store = self.server.store
         settings = self.server.settings
@@ -722,11 +777,23 @@ class StudioHandler(BaseHTTPRequestHandler):
         options = None
         try:
             if path == "/ideas":
-                store.add_idea(field("prompt"), field("title") or None)
+                store.add_idea(field("prompt"), field("title") or None, brand_id=field("brand_id") or None)
             elif path == "/ideas/generate":
-                planning.request_ideas(field("trends"))
+                planning.request_ideas(field("trends"), brand_id=field("brand_id") or None)
             elif idea_decision:
                 store.decide_idea(int(idea_decision[1]), field("decision"))
+            elif idea_control:
+                action = field("action")
+                if action == "pause":
+                    store.pause_idea_job(int(idea_control[1]))
+                elif action == "resume":
+                    store.resume_idea_job(int(idea_control[1]))
+                else:
+                    raise ValueError("Choose Pause or Resume.")
+            elif idea_edit:
+                store.update_idea(
+                    int(idea_edit[1]), field("prompt"), field("title") or None, brand_id=field("brand_id") or None,
+                )
             elif path == "/schedules":
                 daily_limit = field("daily_limit")
                 if not re.fullmatch(r"[0-9]{1,3}", daily_limit):
@@ -738,9 +805,18 @@ class StudioHandler(BaseHTTPRequestHandler):
                 store.create_schedule(
                     prompts, field("start_date"), field("run_at"),
                     field("timezone"), int(daily_limit), title=title or None,
+                    brand_id=field("brand_id") or None,
                 )
             elif schedule_status:
                 store.set_schedule_status(int(schedule_status[1]), field("status"))
+            elif schedule_edit:
+                daily_limit = field("daily_limit")
+                if not re.fullmatch(r"[0-9]{1,3}", daily_limit):
+                    raise ValueError("Enter the number of videos to start each day.")
+                store.update_schedule(
+                    int(schedule_edit[1]), field("title"), field("start_date"), field("run_at"),
+                    field("timezone"), int(daily_limit), brand_id=field("brand_id") or None,
+                )
             elif inbox_archive:
                 action = field("action")
                 if action not in ("delete", "restore"):
@@ -823,6 +899,21 @@ class StudioHandler(BaseHTTPRequestHandler):
                 library.set_default(niche_id, preset_default[1], preset_default[2])
             elif preset_action_default:
                 library.set_default(niche_id, preset_action_default[1], preset_action_default[2])
+            elif path == "/brand-rules":
+                is_def = field("is_default") in ("1", "yes", "true", "on")
+                store.create_brand_profile(
+                    niche_id,
+                    field("brand_id").strip(),
+                    field("name").strip(),
+                    field("mother_prompt").strip(),
+                    brand_rules=field("brand_rules").strip(),
+                    story_rules=field("story_rules").strip(),
+                    is_default=is_def,
+                )
+            elif brand_default:
+                store.set_default_brand_profile(niche_id, brand_default[1])
+            elif brand_delete:
+                store.delete_brand_profile(niche_id, brand_delete[1])
             elif scene_route:
                 scene_values = {
                     "action": field("action"),
@@ -834,17 +925,28 @@ class StudioHandler(BaseHTTPRequestHandler):
                 self.server.production.edit_scene(int(scene_route[1]), scene_route[2], **scene_values)
             elif workspace_route:
                 job_id = int(workspace_route[1])
-                if workspace_route[2] == "approve-keyframes":
+                action = workspace_route[2]
+                if action == "approve-keyframes":
                     self.server.production.media.approve_keyframes(job_id, expected_revision=field("revision"))
-                elif workspace_route[2] == "retry-render":
+                elif action == "retry-render":
                     self.server.production.retry_render(job_id)
-                elif workspace_route[2] == "options":
+                elif action == "pause":
+                    store.pause_job(job_id)
+                elif action == "resume":
+                    store.resume_job(job_id)
+                elif action == "edit":
+                    store.update_job_content(job_id, field("prompt"), field("title") or None)
+                elif action == "delete":
+                    store.delete_job(job_id)
+                    self._redirect("/workspace")
+                    return
+                elif action == "options":
                     options = {group: {name[len(prefix):]: field(name) for name in form
                                        if name.startswith(prefix) and field(name)}
                                for group, prefix in (("presets", "preset."), ("variants", "variant."), ("voices", "voice."))}
                     options["characters"] = sorted(set(form.get("characters", [])))
                     self.server.production.configure(job_id, options)
-                elif workspace_route[2] == "publish":
+                elif action == "publish":
                     mode = field("mode")
                     if mode not in ("draft", "schedule"):
                         raise ValueError("Choose to create a draft or schedule a post.")
@@ -882,11 +984,18 @@ class StudioHandler(BaseHTTPRequestHandler):
                 self._show_workspace(store.get_job(job_id), HTTPStatus.BAD_REQUEST, str(error),
                                      discover=workspace_route[2] == "publish", options_override=options)
             elif create_kind:
-                fields = ("title", "prompt", "trends", "prompts", "start_date", "run_at", "timezone", "daily_limit")
+                fields = ("title", "prompt", "trends", "prompts", "start_date", "run_at", "timezone", "daily_limit", "brand_id")
                 self._reply(HTTPStatus.BAD_REQUEST, create_page(
                     self.server.csrf_token, kind=create_kind, values={name: field(name) for name in fields},
-                    notice=str(error),
+                    notice=str(error), brand_profiles=self.server.store.list_brand_profiles(),
                 ))
+            elif path == "/brand-rules" or brand_default or brand_delete:
+                self._reply(HTTPStatus.BAD_REQUEST, brand_rules_page(
+                    self.server.store.list_brand_profiles(), self.server.csrf_token, notice=str(error),
+                    values={name: field(name) for name in ("brand_id", "name", "mother_prompt", "brand_rules", "story_rules")},
+                ))
+            elif idea_edit or schedule_edit:
+                self._show_inbox_edit(*inbox_detail, HTTPStatus.BAD_REQUEST, str(error), values={name: field(name) for name in form})
             elif inbox_detail:
                 self._show_inbox_record(*inbox_detail, HTTPStatus.BAD_REQUEST, str(error))
             else:
@@ -934,12 +1043,14 @@ class StudioHandler(BaseHTTPRequestHandler):
             location = f"/presets?tab={preset_action[1]}"
         elif preset_action_default:
             location = f"/presets?tab={preset_action_default[1]}"
+        elif path == "/brand-rules" or brand_default or brand_delete:
+            location = "/brand-rules"
         elif asset_route or path == "/settings/assets":
             asset_id = asset_route[1] if asset_route else field("asset_id")
             location = f"/settings?asset={asset_id}#asset-{asset_id}"
         elif preset_route or preset_default:
             location = "/settings?presets=1#production-presets"
-        elif inbox_detail and not inbox_archive and field("from_detail") == "1":
+        elif inbox_detail and not inbox_archive and (field("from_detail") == "1" or idea_edit or schedule_edit or idea_control):
             location = f"/{inbox_detail[0]}/{inbox_detail[1]}"
         self._redirect(location)
 

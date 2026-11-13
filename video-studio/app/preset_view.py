@@ -136,6 +136,7 @@ def presets_page(presets, csrf_token, active_tab='visual', notice=''):
 
     tab_links = []
     panes = []
+    dialogs = []
 
     for kind in _PRESET_KINDS:
         count = len(groups[kind])
@@ -150,12 +151,16 @@ def presets_page(presets, csrf_token, active_tab='visual', notice=''):
 
         cards = ''.join(_preset_card(preset, csrf_token) for preset in groups[kind])
         if not cards:
-            cards = f'<p class="empty-state">No {label.lower()} presets created yet. Add one below.</p>'
+            cards = f'<p class="empty-state">No {label.lower()} presets created yet. Click "+ Add Preset" above to create one.</p>'
 
         multipart = ' enctype="multipart/form-data"' if kind == 'audio' else ''
-        add_form = f'''
-        <details class="record preset-add-accordion">
-          <summary>+ Add {label} Preset</summary>
+        dialog_id = f'add-preset-dialog-{kind}'
+        dialogs.append(f'''
+        <dialog class="brand-dialog" id="{dialog_id}">
+          <div class="brand-dialog-header">
+            <h3>Add {label} Preset</h3>
+            <button type="button" class="brand-dialog-close" data-close-dialog="{dialog_id}" aria-label="Close dialog">&times;</button>
+          </div>
           <form class="stack library-body" method="post"{multipart} action="/presets/{kind}">
             {_csrf(csrf_token)}
             <div class="fields">
@@ -164,9 +169,12 @@ def presets_page(presets, csrf_token, active_tab='visual', notice=''):
             </div>
             {_preset_fields(kind)}
             <label><input type="checkbox" name="is_default" value="yes"> Set as default for new videos</label>
-            <button type="submit" class="primary">Save {label.lower()} preset</button>
+            <div class="confirm-dialog-actions" style="margin-top:1.25rem;">
+              <button type="button" class="btn-cancel" data-close-dialog="{dialog_id}">Cancel</button>
+              <button type="submit" class="primary">Save {label.lower()} preset</button>
+            </div>
           </form>
-        </details>'''
+        </dialog>''')
 
         pane_display = ' active' if is_active else ''
         panes.append(f'''
@@ -177,7 +185,6 @@ def presets_page(presets, csrf_token, active_tab='visual', notice=''):
           <div class="presets-list stack">
             {cards}
           </div>
-          {add_form}
         </div>''')
 
     content = f'''
@@ -185,6 +192,8 @@ def presets_page(presets, csrf_token, active_tab='visual', notice=''):
     <nav class="providers-nav-tabs presets-nav-tabs" role="tablist">
       {''.join(tab_links)}
     </nav>
-    {''.join(panes)}'''
+    {''.join(panes)}
+    {''.join(dialogs)}'''
 
-    return _page('Production Presets', '/presets', content, notice, script='/presets.js')
+    heading_action = '<button type="button" class="primary" id="open-add-preset-dialog">+ Add Preset</button>'
+    return _page('Production Presets', '/presets', content, notice, script='/presets.js', heading_action=heading_action)

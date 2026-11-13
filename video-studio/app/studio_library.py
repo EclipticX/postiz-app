@@ -174,6 +174,25 @@ class StudioLibrary:
             if not characters or asset["kind"] != "character" or asset["id"] in characters
         ]
 
+        # Apply brand profile (mother prompt, brand rules, story rhythm)
+        brand_id = options.get("presets", {}).get("brand")
+        brand = None
+        if brand_id:
+            brand = self.store.get_brand_profile(niche_id, brand_id)
+        if not brand:
+            brand = self.store.default_brand_profile(niche_id)
+
+        if brand:
+            profile["style_guide"] = brand["mother_prompt"]
+            if brand.get("brand_rules"):
+                rules = [r.strip("-*• \t") for r in brand["brand_rules"].splitlines() if r.strip()]
+                if rules:
+                    profile["brand_rules"] = rules
+            if brand.get("story_rules"):
+                rules = [r.strip("-*• \t") for r in brand["story_rules"].splitlines() if r.strip()]
+                if rules:
+                    profile["audience_rules"] = rules
+
         selected = {}
         for preset in self.presets(niche_id):
             preferred = options.get("presets", {}).get(preset["kind"])

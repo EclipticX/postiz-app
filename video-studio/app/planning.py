@@ -37,12 +37,14 @@ class StudioPlanner:
         self.adapter_factory = adapter_factory
         self.library = StudioLibrary(store)
 
-    def request_ideas(self, trends):
+    def request_ideas(self, trends, brand_id=None):
         trends = trends.strip()
         if not trends or len(trends) > 4000:
             raise ValueError("Enter trends in 1–4,000 characters.")
+        if brand_id is not None:
+            brand_id = brand_id.strip() or None
         with self.store._connection(write=True) as db:
-            db.execute("INSERT INTO idea_generation_requests (trends) VALUES (?)", (trends,))
+            db.execute("INSERT INTO idea_generation_requests (trends, brand_id) VALUES (?, ?)", (trends, brand_id))
 
     def idea_requests(self):
         with self.store._connection() as db:
@@ -125,7 +127,9 @@ class StudioPlanner:
                 "SELECT pattern_json FROM memory WHERE niche_id = 'kids_3d' ORDER BY id DESC LIMIT 10"
             )]
 
-        profile = self.library.profile()
+        brand_id = request["brand_id"] if "brand_id" in request.keys() else None
+        options = {"presets": {"brand": brand_id}} if brand_id else {}
+        profile = self.library.profile(options=options)
         prompt = idea_prompt(profile, request["trends"], memory)
         try:
             adapter, reservation = self._claude(None, now)
@@ -147,8 +151,8 @@ class StudioPlanner:
 
         with self.store._connection(write=True) as db:
             db.executemany(
-                "INSERT INTO ideas (niche_id, title, prompt, source) VALUES (?, ?, ?, 'claude')",
-                [(profile["id"], idea["title"].strip(), idea["prompt"].strip()) for idea in ideas],
+                "INSERT INTO ideas (niche_id, title, prompt, source, brand_id) VALUES (?, ?, ?, 'claude', ?)",
+                [(profile["id"], idea["title"].strip(), idea["prompt"].strip(), brand_id) for idea in ideas],
             )
             db.execute(
                 "UPDATE idea_generation_requests SET status = 'completed', error = NULL WHERE id = ?", (request["id"],)

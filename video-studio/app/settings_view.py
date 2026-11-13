@@ -11,26 +11,36 @@ def _usd(micros):
 _CATEGORIES = (
     ('scripting', 'Scripting', {'llm'}),
     ('character', 'Character', {'image'}),
-    ('animation', 'Animation', {'video', 'tts'}),
+    ('animation', 'Animation', {'video'}),
+    ('audio', 'Audio', {'tts'}),
     ('publishing', 'Publishing', {'publishing'}),
 )
 
 _PLATFORM_META = {
     'FAL_KEY': {
         'slug': 'fal',
-        'active': {'character', 'animation'},
+        'active': {'character', 'animation', 'audio'},
+        'supported': {'character', 'animation', 'audio'},
     },
     'ANTHROPIC_API_KEY': {
         'slug': 'anthropic',
         'active': {'scripting'},
+        'supported': {'scripting'},
     },
     'EVOLINK_API_KEY': {
         'slug': 'evolink',
         'active': {'animation'},
+        'supported': {'animation'},
     },
     'POSTIZ_API_KEY': {
         'slug': 'postiz',
         'active': {'publishing'},
+        'supported': {'publishing'},
+    },
+    'ELEVENLABS_API_KEY': {
+        'slug': 'elevenlabs',
+        'active': {'audio'},
+        'supported': {'audio'},
     },
 }
 
@@ -55,6 +65,7 @@ def providers_page(providers, csrf_token, notice='', *, active_tab='', platforms
             "name": v.get("name", k),
             "slug": v.get("slug", k.lower()),
             "active": v.get("active", ["scripting"]),
+            "supported": v.get("supported", [c[0] for c in _CATEGORIES]),
             "models": [],
         }
 
@@ -175,32 +186,40 @@ def providers_page(providers, csrf_token, notice='', *, active_tab='', platforms
     ]
     add_options = ''.join(f'<option value="{_text(k)}">{_text(title)}</option>' for k, title in available_to_add)
 
-    add_platform_html = f'''
-    <form method="post" action="/settings/platforms/add" class="add-platform-card">
-      {_csrf(csrf_token)}
-      <input type="hidden" name="tab" value="api-keys">
-      <h3>Add platform</h3>
-      <label for="platform-dropdown">Platform</label>
-      <div class="add-platform-control">
-        <select id="platform-dropdown" name="platform_key" required data-platform-dropdown>
-          <option value="" disabled selected>Choose a platform to add…</option>
-          {add_options}
-          <option value="custom">+ Custom platform…</option>
-        </select>
-        <button type="submit" class="btn-add-platform">Add platform</button>
+    add_platform_dialog = f'''
+    <dialog class="brand-dialog add-platform-dialog" id="add-platform-dialog">
+      <div class="brand-dialog-header">
+        <h3>Add platform</h3>
+        <button type="button" class="brand-dialog-close" data-close-dialog="add-platform-dialog" aria-label="Close dialog">&times;</button>
       </div>
-      <div id="custom-platform-inputs" class="custom-platform-fields" style="display:none;">
-        <div class="fields-row">
-          <label>Key Name (ENV)
-            <input type="text" name="custom_key" placeholder="e.g. MISTRAL_API_KEY">
-          </label>
-          <label>Platform Display Name
-            <input type="text" name="custom_name" placeholder="e.g. Mistral AI">
-          </label>
+      <form method="post" action="/settings/platforms/add" class="stack library-body">
+        {_csrf(csrf_token)}
+        <input type="hidden" name="tab" value="{selected_tab or 'api-keys'}">
+        <label for="platform-dropdown">Platform</label>
+        <div class="add-platform-control">
+          <select id="platform-dropdown" name="platform_key" required data-platform-dropdown>
+            <option value="" disabled selected>Choose a platform to add…</option>
+            {add_options}
+            <option value="custom">+ Custom platform…</option>
+          </select>
         </div>
-      </div>
-      <p class="helper-text muted">Suggested categories are ticked for you. Change them below.</p>
-    </form>'''
+        <div id="custom-platform-inputs" class="custom-platform-fields" style="display:none;">
+          <div class="fields-row">
+            <label>Key Name (ENV)
+              <input type="text" name="custom_key" placeholder="e.g. MISTRAL_API_KEY">
+            </label>
+            <label>Platform Display Name
+              <input type="text" name="custom_name" placeholder="e.g. Mistral AI">
+            </label>
+          </div>
+        </div>
+        <p class="helper-text muted">Suggested categories are ticked for you. Change them below.</p>
+        <div class="confirm-dialog-actions" style="margin-top:1.25rem;">
+          <button type="button" class="btn-cancel" data-close-dialog="add-platform-dialog">Cancel</button>
+          <button type="submit" class="primary">Add platform</button>
+        </div>
+      </form>
+    </dialog>'''
 
     key_cards = []
     for name in active_platforms:
@@ -209,17 +228,23 @@ def providers_page(providers, csrf_token, notice='', *, active_tab='', platforms
             'name': name,
             'slug': name.lower().replace('_api_key', '').replace('_key', ''),
             'active': {'scripting'},
+            'supported': {'scripting'},
             'models': [],
         }))
+        supported_cats = set(meta.get('supported', [c[0] for c in _CATEGORIES]))
         if name in platform_categories:
-            active_cats = set(platform_categories[name])
+            active_cats = set(platform_categories[name]) & supported_cats
+            if not active_cats:
+                active_cats = set(meta.get('active', [])) & supported_cats
         else:
-            active_cats = set(meta.get('active', []))
+            active_cats = set(meta.get('active', [])) & supported_cats
 
         badge = '<span class="pill-badge pill-badge-saved">Key saved</span>' if configured else '<span class="pill-badge pill-badge-needs-key">Key required</span>'
 
         pills = []
         for cat_id, cat_title, _ in _CATEGORIES:
+            if cat_id not in supported_cats:
+                continue
             is_active = cat_id in active_cats
             active_cls = ' active' if is_active else ''
             check_prefix = '✓ ' if is_active else ''
@@ -361,11 +386,11 @@ def providers_page(providers, csrf_token, notice='', *, active_tab='', platforms
           <button type="submit" class="btn-danger-confirm">Yes, Remove Key</button>
         </div>
       </form>
-    </dialog>'''
+    </dialog>
+    {add_platform_dialog}'''
 
     panes_html.append(f'''
     <div class="provider-tab-pane{api_pane_active}" data-tab="api-keys" role="tabpanel">
-      {add_platform_html}
       {''.join(key_cards)}
     </div>''')
 
@@ -375,7 +400,8 @@ def providers_page(providers, csrf_token, notice='', *, active_tab='', platforms
     {''.join(panes_html)}
     {dialogs_html}'''
 
-    return _page('Providers', '/providers', content, notice, script='/providers.js')
+    heading_action = '<button type="button" class="primary" id="open-add-platform-dialog">+ Add Platform</button>'
+    return _page('Providers', '/providers', content, notice, script='/providers.js', heading_action=heading_action)
 
 
 def settings_page(budgets, schedule, csrf_token, notice='', *, assets=(), presets=(),

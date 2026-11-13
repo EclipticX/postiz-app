@@ -55,13 +55,14 @@ DEFAULT_PROVIDERS = (
     ("postiz", "publishing", "POSTIZ_API_KEY", 10, "request", {}),
 )
 
-DEFAULT_ACTIVE_PLATFORMS = ("FAL_KEY", "ANTHROPIC_API_KEY", "EVOLINK_API_KEY", "POSTIZ_API_KEY")
+DEFAULT_ACTIVE_PLATFORMS = ("FAL_KEY", "ANTHROPIC_API_KEY", "EVOLINK_API_KEY", "POSTIZ_API_KEY", "ELEVENLABS_API_KEY")
 
 KNOWN_PLATFORMS = {
     "FAL_KEY": {
         "name": "Fal.ai (FAL_KEY)",
         "slug": "fal",
-        "active": ["character", "animation"],
+        "active": ["character", "animation", "audio"],
+        "supported": ["character", "animation", "audio"],
         "models": [
             ("Character model", [
                 ("", "Select model...", ""),
@@ -75,12 +76,17 @@ KNOWN_PLATFORMS = {
                 ("fal-ai/kling-video/v1.5/pro", "fal-ai/kling-video/v1.5/pro", "Smooth motion video generation"),
                 ("fal-ai/luma-dream-machine", "fal-ai/luma-dream-machine", "Fast realistic dynamic video"),
             ]),
+            ("Audio model", [
+                ("", "Select model...", ""),
+                ("fal-ai/elevenlabs/tts", "fal-ai/elevenlabs/tts", "High quality character dialogue voice"),
+            ]),
         ],
     },
     "ANTHROPIC_API_KEY": {
         "name": "Anthropic (Claude) (ANTHROPIC_API_KEY)",
         "slug": "anthropic",
         "active": ["scripting"],
+        "supported": ["scripting"],
         "models": [
             ("Scripting model", [
                 ("", "Select model...", ""),
@@ -100,6 +106,7 @@ KNOWN_PLATFORMS = {
         "name": "EvoLink (Seedance) (EVOLINK_API_KEY)",
         "slug": "evolink",
         "active": ["animation"],
+        "supported": ["animation"],
         "models": [
             ("Animation model", [
                 ("", "Select model...", ""),
@@ -112,17 +119,23 @@ KNOWN_PLATFORMS = {
         "name": "Postiz (POSTIZ_API_KEY)",
         "slug": "postiz",
         "active": ["publishing"],
+        "supported": ["publishing"],
         "models": [],
     },
     "GEMINI_API_KEY": {
-        "name": "Google (Gemini, Veo) (GEMINI_API_KEY)",
+        "name": "Google (Gemini, Veo, Imagen) (GEMINI_API_KEY)",
         "slug": "google",
-        "active": ["scripting", "animation"],
+        "active": ["scripting", "character", "animation"],
+        "supported": ["scripting", "character", "animation"],
         "models": [
             ("Scripting model", [
                 ("", "Select model...", ""),
                 ("gemini-2.0-flash", "gemini-2.0-flash", "Next-gen multimodal speed & reasoning"),
                 ("gemini-1.5-pro", "gemini-1.5-pro", "Long-context reasoning & analysis"),
+            ]),
+            ("Character model", [
+                ("", "Select model...", ""),
+                ("imagen-3.0-generate-002", "Imagen 3", "Photorealistic character & asset generation"),
             ]),
             ("Animation model", [
                 ("", "Select model...", ""),
@@ -131,15 +144,21 @@ KNOWN_PLATFORMS = {
         ],
     },
     "OPENAI_API_KEY": {
-        "name": "OpenAI (GPT-4o, Sora) (OPENAI_API_KEY)",
+        "name": "OpenAI (GPT-4o, DALL-E, Sora) (OPENAI_API_KEY)",
         "slug": "openai",
-        "active": ["scripting", "animation"],
+        "active": ["scripting", "character", "animation"],
+        "supported": ["scripting", "character", "animation"],
         "models": [
             ("Scripting model", [
                 ("", "Select model...", ""),
                 ("gpt-4o", "gpt-4o", "Flagship omni model for text & vision"),
                 ("gpt-4o-mini", "gpt-4o-mini", "Fast & lightweight everyday model"),
                 ("o3-mini", "o3-mini", "High intelligence reasoning model"),
+            ]),
+            ("Character model", [
+                ("", "Select model...", ""),
+                ("dall-e-3", "DALL·E 3", "High fidelity photorealistic character generation"),
+                ("dall-e-2", "DALL·E 2", "Fast general concept generation"),
             ]),
             ("Animation model", [
                 ("", "Select model...", ""),
@@ -151,6 +170,7 @@ KNOWN_PLATFORMS = {
         "name": "Replicate (REPLICATE_API_KEY)",
         "slug": "replicate",
         "active": ["character", "animation"],
+        "supported": ["character", "animation"],
         "models": [
             ("Character model", [
                 ("", "Select model...", ""),
@@ -166,6 +186,7 @@ KNOWN_PLATFORMS = {
         "name": "Runway (RUNWAY_API_KEY)",
         "slug": "runway",
         "active": ["animation"],
+        "supported": ["animation"],
         "models": [
             ("Animation model", [
                 ("", "Select model...", ""),
@@ -176,7 +197,8 @@ KNOWN_PLATFORMS = {
     "ELEVENLABS_API_KEY": {
         "name": "ElevenLabs (ELEVENLABS_API_KEY)",
         "slug": "elevenlabs",
-        "active": ["animation"],
+        "active": ["audio"],
+        "supported": ["audio"],
         "models": [
             ("Audio model", [
                 ("", "Select model...", ""),
@@ -347,6 +369,7 @@ class StudioSettings:
                 "name": name or key_name,
                 "slug": slug or key_name.lower().replace("_api_key", "").replace("_key", ""),
                 "active": ["scripting"],
+                "supported": ["scripting", "character", "animation", "audio", "publishing"],
             }
         KEY_NAMES.add(key_name)
         self.platforms_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -368,11 +391,14 @@ class StudioSettings:
     def update_platform_categories(self, key_name, categories):
         key_name = key_name.strip().upper()
         active, custom, current_categories = self.list_platforms()
-        valid_cats = {"scripting", "character", "animation", "publishing"}
+        valid_cats = {"scripting", "character", "animation", "audio", "publishing"}
+        platform_meta = KNOWN_PLATFORMS.get(key_name) or custom.get(key_name, {})
+        supported = set(platform_meta.get("supported", valid_cats))
         if isinstance(categories, str):
-            cleaned = [c.strip().lower() for c in categories.split(",") if c.strip().lower() in valid_cats]
+            raw = [c.strip().lower() for c in categories.split(",")]
         else:
-            cleaned = [c.strip().lower() for c in categories if c.strip().lower() in valid_cats]
+            raw = [c.strip().lower() for c in categories]
+        cleaned = [c for c in raw if c in valid_cats and c in supported]
         current_categories[key_name] = cleaned
         self.platforms_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.platforms_path.write_text(json.dumps({

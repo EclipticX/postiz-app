@@ -122,6 +122,8 @@ class StudioHTTPTest(unittest.TestCase):
         self.assertEqual(self.store.list_jobs(), [])
         self.assertEqual(self.post("/ideas/1/decision", decision="accept"), 303)
         self.assertIn("A forest visit", self.request("GET", "/?status=approved")[1])
+        status, html = self.request("GET", "/ideas/1")
+        self.assertNotIn("Open video job", html)
         status, html = self.request("GET", "/workspace?job=1")
         self.assertEqual(status, 200)
         self.assertIn("A forest visit", html)
@@ -239,12 +241,20 @@ class StudioHTTPTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn('data-tab="publishing" role="tab" aria-selected="true"', html)
         self.assertIn("Run order", html)
+        self.assertIn('data-tab="audio"', html)
         self.assertIn('data-tab="api-keys"', html)
         self.assertIn("Add platform", html)
+        self.assertIn('id="open-add-platform-dialog"', html)
+        self.assertIn('id="add-platform-dialog"', html)
         self.assertIn("data-disable-provider", html)
         # Verify no inline event handlers violating CSP
         self.assertNotIn("onclick=", html)
         self.assertNotIn("onchange=", html)
+
+        status, html = self.request("GET", "/providers?tab=audio")
+        self.assertEqual(status, 200)
+        self.assertIn('data-tab="audio" role="tab" aria-selected="true"', html)
+        self.assertIn("Run order", html)
 
     def test_providers_add_and_remove_platform(self):
         # 1. Initially GEMINI_API_KEY is in Add platform dropdown
@@ -289,36 +299,77 @@ class StudioHTTPTest(unittest.TestCase):
         self.assertIn('value="GEMINI_API_KEY"', html)
 
     def test_providers_platform_category_toggle_and_persistence(self):
-        # 1. Check initial Anthropic categories: scripting is active, character is inactive
+        # 1. Check initial Anthropic categories: scripting is active, character is not supported
         status, html = self.request("GET", "/providers?tab=api-keys")
         self.assertEqual(status, 200)
         self.assertIn('data-platform="ANTHROPIC_API_KEY"', html)
+        self.assertIn('data-toggle-cat="scripting" data-cat-title="Scripting" data-platform="ANTHROPIC_API_KEY"', html)
+        self.assertNotIn('data-toggle-cat="character" data-cat-title="Character" data-platform="ANTHROPIC_API_KEY"', html)
 
-        # 2. Toggle character to active for Anthropic
+        # Attempting to assign unsupported category 'character' to Anthropic is filtered out
         status, body = self.request(
             "POST", "/settings/platforms/categories",
             fields={"csrf_token": self.csrf, "platform_key": "ANTHROPIC_API_KEY", "categories": "scripting,character"},
             headers={"Accept": "application/json"}
         )
         self.assertEqual(status, 200)
+        self.assertIn('"categories": ["scripting"]', body)
+
+        # 2. Check Fal.ai categories (character, animation, audio supported)
+        self.assertIn('data-toggle-cat="audio" data-cat-title="Audio" data-platform="FAL_KEY"', html)
+
+        # Toggle audio to inactive for Fal.ai
+        status, body = self.request(
+            "POST", "/settings/platforms/categories",
+            fields={"csrf_token": self.csrf, "platform_key": "FAL_KEY", "categories": "character,animation"},
+            headers={"Accept": "application/json"}
+        )
+        self.assertEqual(status, 200)
         self.assertIn('"status": "ok"', body)
 
-        # 3. Verify HTML reflects the updated categories
+        # 3. Verify HTML reflects the updated categories for Fal.ai
         status, html = self.request("GET", "/providers?tab=api-keys")
         self.assertEqual(status, 200)
-        # Check that both Scripting and Character are active for Anthropic
-        self.assertIn('data-toggle-cat="character" data-cat-title="Character" data-platform="ANTHROPIC_API_KEY" aria-pressed="true"', html)
-        self.assertIn('✓ Character</button>', html)
+        self.assertIn('data-toggle-cat="audio" data-cat-title="Audio" data-platform="FAL_KEY" aria-pressed="false"', html)
+        self.assertIn('data-toggle-cat="character" data-cat-title="Character" data-platform="FAL_KEY" aria-pressed="true"', html)
 
-        # 4. Remove scripting, keep only character
-        status = self.post("/settings/platforms/categories", platform_key="ANTHROPIC_API_KEY", categories="character", tab="api-keys")
+        # 4. Re-enable audio for Fal.ai
+        status = self.post("/settings/platforms/categories", platform_key="FAL_KEY", categories="character,animation,audio", tab="api-keys")
         self.assertEqual(status, 303)
 
-        # 5. Verify Scripting is now inactive (aria-pressed="false") and Character remains active
+        # 5. Verify Audio is active again
         status, html = self.request("GET", "/providers?tab=api-keys")
         self.assertEqual(status, 200)
-        self.assertIn('data-toggle-cat="scripting" data-cat-title="Scripting" data-platform="ANTHROPIC_API_KEY" aria-pressed="false"', html)
-        self.assertIn('data-toggle-cat="character" data-cat-title="Character" data-platform="ANTHROPIC_API_KEY" aria-pressed="true"', html)
+        self.assertIn('data-toggle-cat="audio" data-cat-title="Audio" data-platform="FAL_KEY" aria-pressed="true"', html)
+
+        # 6. Verify ElevenLabs has audio category and no scripting
+        self.assertIn('data-toggle-cat="audio" data-cat-title="Audio" data-platform="ELEVENLABS_API_KEY"', html)
+        self.assertNotIn('data-toggle-cat="scripting" data-cat-title="Scripting" data-platform="ELEVENLABS_API_KEY"', html)
+
+    def test_providers_audio_tab_and_models(self):
+        # Verify Audio tab exists and displays fal-elevenlabs
+        status, html = self.request("GET", "/providers?tab=audio")
+        self.assertEqual(status, 200)
+        self.assertIn('data-tab="audio" role="tabpanel"', html)
+        self.assertIn("fal-elevenlabs", html)
+
+        # Add OpenAI platform and verify its Character, Scripting, and Animation models
+        self.assertEqual(self.post("/settings/platforms/add", platform_key="OPENAI_API_KEY"), 303)
+        status, html = self.request("GET", "/providers?tab=api-keys")
+        self.assertEqual(status, 200)
+        self.assertIn("dall-e-3", html)
+        self.assertIn("gpt-4o", html)
+        self.assertIn("sora-1.0", html)
+
+        # Add Google Gemini and verify Imagen 3
+        self.assertEqual(self.post("/settings/platforms/add", platform_key="GEMINI_API_KEY"), 303)
+        status, html = self.request("GET", "/providers?tab=api-keys")
+        self.assertEqual(status, 200)
+        self.assertIn("imagen-3.0-generate-002", html)
+        self.assertIn("gemini-2.0-flash", html)
+
+        # Verify ElevenLabs key card has audio model
+        self.assertIn("eleven_multilingual_v2", html)
 
     def test_workspace_preview_supports_byte_ranges_and_only_serves_registered_media(self):
         idea = self.store.add_idea("A preview test")
@@ -504,7 +555,9 @@ class StudioHTTPTest(unittest.TestCase):
         self.assertIn('href="/assets/crystal_cave/edit"', html)
 
         # Search filter
-        self.assertIn('href="/assets/crystal_cave"', self.request("GET", "/assets?q=CRYSTAL")[1])
+        search_html = self.request("GET", "/assets?q=CRYSTAL")[1]
+        self.assertIn('href="/assets/crystal_cave"', search_html)
+        self.assertIn('<div class="asset-badges">', search_html)
         self.assertNotIn('href="/assets/crystal_cave"', self.request("GET", "/assets?q=DESERT")[1])
 
         # Add variant
@@ -536,6 +589,8 @@ class StudioHTTPTest(unittest.TestCase):
         self.assertIn('data-tab-btn="subtitle"', html)
         self.assertIn('data-tab-btn="audio"', html)
         self.assertIn('href="/presets" aria-current="page"', html)
+        self.assertIn('id="open-add-preset-dialog"', html)
+        self.assertIn('id="add-preset-dialog-visual"', html)
 
         # Create visual preset
         self.assertEqual(self.post("/presets/visual", preset_id="neon_noir", name="Neon Noir",
@@ -572,6 +627,7 @@ class StudioHTTPTest(unittest.TestCase):
         status, js = self.request("GET", "/presets.js")
         self.assertEqual(status, 200)
         self.assertIn("data-tab-btn", js)
+        self.assertIn("open-add-preset-dialog", js)
         self.assertEqual(self.request("GET", "/preset-audio/nonexistent.mp3")[0], 404)
 
         # Test backward-compatible redirect from /settings?presets=1 to /presets
@@ -588,3 +644,184 @@ class StudioHTTPTest(unittest.TestCase):
         self.assertNotIn("<summary>Production Presets</summary>", html)
         self.assertNotIn("Manage places, environments, and prop references", html)
         self.assertNotIn("Manage visual styles, script tone, subtitles, and audio", html)
+
+    def test_brand_rules_page_and_crud(self):
+        status, html = self.request("GET", "/brand-rules")
+        self.assertEqual(status, 200)
+        self.assertIn("Brand Rules", html)
+        self.assertIn('href="/brand-rules" aria-current="page"', html)
+        self.assertIn('id="open-add-brand-dialog"', html)
+        self.assertIn('id="add-brand-dialog"', html)
+        self.assertIn('class="brand-list"', html)
+        self.assertIn('data-open-brand="kids_3d_default"', html)
+        self.assertIn('id="brand-dialog-kids_3d_default"', html)
+        self.assertIn("Mother Prompt / Style Rhythm Directive", html)
+        self.assertIn("Default", html)
+
+        # JS script endpoint
+        js_status, js = self.request("GET", "/brand_rules.js")
+        self.assertEqual(js_status, 200)
+        self.assertIn("open-add-brand-dialog", js)
+
+        # Create new brand profile
+        self.assertEqual(self.post(
+            "/brand-rules",
+            brand_id="bedtime_tales",
+            name="Bedtime Tales",
+            mother_prompt="Warm soothing lighting, slow camera motion, peaceful 3D clay characters.",
+            brand_rules="- No bright flashes\n- Calming color palette",
+            story_rules="- Gentle resolution before sleep",
+            is_default="yes",
+        ), 303)
+
+        status, html = self.request("GET", "/brand-rules")
+        self.assertEqual(status, 200)
+        self.assertIn("Bedtime Tales", html)
+        self.assertIn("Warm soothing lighting, slow camera motion", html)
+        self.assertIn("No bright flashes", html)
+
+        # Switch default back
+        self.assertEqual(self.post("/brand-rules/kids_3d_default/default"), 303)
+
+        # Delete new brand profile
+        self.assertEqual(self.post("/brand-rules/bedtime_tales/delete"), 303)
+        status, html = self.request("GET", "/brand-rules")
+        self.assertEqual(status, 200)
+        self.assertNotIn("Bedtime Tales", html)
+
+    def test_inbox_create_brand_dropdown_and_submission(self):
+        status, html = self.request("GET", "/inbox/create")
+        self.assertEqual(status, 200)
+        self.assertIn('name="brand_id"', html)
+        self.assertIn("kids_3d_default", html)
+        self.assertIn("(Default)", html)
+
+        # Submit manual idea with brand_id
+        self.assertEqual(self.post(
+            "/ideas",
+            title="Tiny Turtle",
+            prompt="A tiny turtle explores a crystal pond.",
+            brand_id="kids_3d_default",
+        ), 303)
+
+        idea = self.store.list_ideas()[0]
+        self.assertEqual(idea["title"], "Tiny Turtle")
+        self.assertEqual(idea["brand_id"], "kids_3d_default")
+
+        # Accept idea into production job
+        self.assertEqual(self.post(f"/ideas/{idea['id']}/decision", decision="accept"), 303)
+        job = self.store.list_jobs()[-1]
+        options = json.loads(job["production_options_json"])
+        self.assertEqual(options.get("presets", {}).get("brand"), "kids_3d_default")
+
+    def test_idea_edit_page_and_update(self):
+        self.assertEqual(self.post("/ideas", title="Draft Idea", prompt="Initial prompt"), 303)
+        status, html = self.request("GET", "/ideas/1/edit")
+        self.assertEqual(status, 200)
+        self.assertIn("Edit Idea", html)
+        self.assertIn("Initial prompt", html)
+
+        self.assertEqual(self.post("/ideas/1/edit", title="Updated Idea", prompt="New prompt"), 303)
+        status, html = self.request("GET", "/ideas/1")
+        self.assertEqual(status, 200)
+        self.assertIn("Updated Idea", html)
+        self.assertIn("New prompt", html)
+
+    def test_approved_idea_pause_resume_and_delete(self):
+        self.assertEqual(self.post("/ideas", title="Queued Idea", prompt="Queued prompt"), 303)
+        self.assertEqual(self.post("/ideas/1/decision", decision="accept"), 303)
+
+        status, html = self.request("GET", "/ideas/1")
+        self.assertEqual(status, 200)
+        self.assertIn("Pause job", html)
+        self.assertIn("Edit idea", html)
+        self.assertIn("Delete", html)
+
+        # Pause job via idea detail
+        self.assertEqual(self.post("/ideas/1/job-control", action="pause"), 303)
+        status, html = self.request("GET", "/ideas/1")
+        self.assertEqual(status, 200)
+        self.assertIn("Resume job", html)
+
+        status, html = self.request("GET", "/workspace?job=1")
+        self.assertEqual(status, 200)
+        self.assertIn("Paused", html)
+
+        # Resume job via idea detail
+        self.assertEqual(self.post("/ideas/1/job-control", action="resume"), 303)
+        status, html = self.request("GET", "/ideas/1")
+        self.assertEqual(status, 200)
+        self.assertIn("Pause job", html)
+
+        # Delete approved idea
+        self.assertEqual(self.post("/ideas/1/archive", action="delete"), 303)
+        self.assertEqual(len(self.store.list_jobs()), 0)
+        idea = self.store.get_idea(1)
+        self.assertIsNotNone(idea["deleted_at"])
+
+    def test_workspace_pause_resume_edit_delete(self):
+        self.assertEqual(self.post("/ideas", title="Workspace Idea", prompt="Prompt to edit"), 303)
+        self.assertEqual(self.post("/ideas/1/decision", decision="accept"), 303)
+
+        status, html = self.request("GET", "/workspace?job=1")
+        self.assertEqual(status, 200)
+        self.assertIn("Pause job", html)
+        self.assertIn("Edit title &amp; prompt", html)
+        self.assertIn("Delete job", html)
+
+        # Pause in workspace
+        self.assertEqual(self.post("/workspace/1/pause"), 303)
+        status, html = self.request("GET", "/workspace?job=1")
+        self.assertEqual(status, 200)
+        self.assertIn("Resume job", html)
+        self.assertIn("Paused", html)
+
+        # Resume in workspace
+        self.assertEqual(self.post("/workspace/1/resume"), 303)
+        status, html = self.request("GET", "/workspace?job=1")
+        self.assertEqual(status, 200)
+        self.assertIn("Pause job", html)
+
+        # Edit title and prompt
+        self.assertEqual(self.post("/workspace/1/edit", title="Modified Job", prompt="Modified prompt"), 303)
+        status, html = self.request("GET", "/workspace?job=1")
+        self.assertEqual(status, 200)
+        self.assertIn("Modified Job", html)
+        self.assertIn("Modified prompt", html)
+
+        # Delete job
+        self.assertEqual(self.post("/workspace/1/delete"), 303)
+        status, _ = self.request("GET", "/workspace?job=1")
+        self.assertEqual(status, 404)
+
+    def test_schedule_edit_page_and_update(self):
+        self.assertEqual(self.post(
+            "/schedules",
+            title="Batch Schedule",
+            prompts="Prompt 1\nPrompt 2",
+            start_date="2026-11-10",
+            run_at="09:00",
+            timezone="Asia/Dhaka",
+            daily_limit="1",
+        ), 303)
+
+        status, html = self.request("GET", "/schedules/1/edit")
+        self.assertEqual(status, 200)
+        self.assertIn("Edit Schedule", html)
+        self.assertIn("Batch Schedule", html)
+
+        self.assertEqual(self.post(
+            "/schedules/1/edit",
+            title="Updated Batch",
+            start_date="2026-11-12",
+            run_at="10:00",
+            timezone="Asia/Dhaka",
+            daily_limit="2",
+        ), 303)
+
+        status, html = self.request("GET", "/schedules/1")
+        self.assertEqual(status, 200)
+        self.assertIn("Updated Batch", html)
+        self.assertIn("10:00", html)
+
+

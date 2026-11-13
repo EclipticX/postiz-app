@@ -4,7 +4,10 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from app.library_view import _choices
-from app.web import _csrf, _label, _page, _text
+from app.web import (
+    _action_menu, _csrf, _label, _menu_button, _menu_divider, _menu_link, _page, _text,
+    _ICON_DELETE, _ICON_EDIT, _ICON_PAUSE, _ICON_RESTORE, _ICON_RESUME,
+)
 
 
 _TYPES = (('manual', 'Manual idea'), ('claude', 'AI idea'), ('schedule', 'Prompt schedule'))
@@ -86,7 +89,7 @@ def inbox_page(records, *, query='', kind='', status='', notice='', idea_request
     )
 
 
-def create_page(csrf_token, *, kind='manual', values=None, notice=''):
+def create_page(csrf_token, *, kind='manual', values=None, notice='', brand_profiles=None):
     values = values or {}
     labels = (('manual', 'Manual idea'), ('claude', 'Generate with Claude'), ('schedule', 'Prompt schedule'))
     links = []
@@ -94,10 +97,21 @@ def create_page(csrf_token, *, kind='manual', values=None, notice=''):
         current = ' aria-current="page"' if kind == key else ''
         links.append(f'<a href="/inbox/create?type={key}"{current}>{label}</a>')
 
+    brand_select = ''
+    if brand_profiles:
+        default_brand_id = next((bp['id'] for bp in brand_profiles if bp.get('is_default')), '')
+        selected_brand = values.get('brand_id') or default_brand_id
+        options = ''.join(
+            f'<option value="{_text(bp["id"])}"{ " selected" if bp["id"] == selected_brand else ""}>{_text(bp["name"])}{ " (Default)" if bp.get("is_default") else ""}</option>'
+            for bp in brand_profiles
+        )
+        brand_select = f'<label>Brand / Rules<select name="brand_id">{options}</select></label>'
+
     title = _text(values.get('title', ''))
     if kind == 'schedule':
         route, button = '/schedules', 'Save schedule draft'
         fields = f'''
+        {brand_select}
         <label>Title<input name="title" value="{title}" maxlength="100" required></label>
         <label>Batch prompts<textarea name="prompts" rows="5" aria-describedby="inbox-prompts-help" required>{_text(values.get('prompts', ''))}</textarea></label>
         <small id="inbox-prompts-help">Paste up to 100 prompts, one per line.</small>
@@ -110,12 +124,14 @@ def create_page(csrf_token, *, kind='manual', values=None, notice=''):
     elif kind == 'claude':
         route, button = '/ideas/generate', 'Generate ideas with Claude'
         fields = f'''
+        {brand_select}
         <label>Trend or theme
           <textarea name="trends" rows="4" maxlength="4000" required>{_text(values.get('trends', ''))}</textarea>
         </label>'''
     else:
         route, button = '/ideas', 'Add idea'
         fields = f'''
+        {brand_select}
         <label>Title <span class="muted">(optional)</span><input name="title" value="{title}"></label>
         <label>Prompt<textarea name="prompt" rows="4" required>{_text(values.get('prompt', ''))}</textarea></label>'''
     return _page('Create', '/', f'''
@@ -149,53 +165,45 @@ def _schedule_details(record):
     </section>'''
 
 
-def _record_actions(record, csrf_token):
-    status = record['status']
-    url = _record_url(record)
-    buttons = []
-    if record['kind'] == 'schedule':
-        action, field = 'status', 'status'
-        if status == 'pending':
-            buttons = [('active', 'Approve and activate', True), ('rejected', 'Reject', False)]
-        elif status == 'approved':
-            buttons = [('active', 'Resume', False)] if record['schedule_status'] == 'paused' else [('paused', 'Pause', False)]
-    else:
-        action, field = 'decision', 'decision'
-        if status in ('pending', 'later'):
-            buttons = [('accept', 'Approve', True)]
-            if status == 'pending':
-                buttons.append(('later', 'Later', False))
-            buttons.append(('reject', 'Reject', False))
-    controls = ''
-    if buttons:
-        controls = ''.join(
-            f'<button class="{"primary" if primary else ""}" type="submit" name="{field}" value="{value}">{label}</button>'
-            for value, label, primary in buttons
-        )
-        controls = f'''
-        <form class="actions" method="post" action="{url}/{action}">
-          {_csrf(csrf_token)}<input type="hidden" name="from_detail" value="1">
-          {controls}
-        </form>'''
-    if status == 'deleted':
-        controls += f'''
-        <form class="actions" method="post" action="{url}/archive">
-          {_csrf(csrf_token)}<button type="submit" name="action" value="restore">Restore</button>
-        </form>'''
-    elif status != 'approved':
-        controls += f'''
-        <details class="inbox-delete">
-          <summary class="button-link">Delete</summary>
-          <form class="actions" method="post" action="{url}/archive">
-            {_csrf(csrf_token)}
-            <p class="muted">You can restore this record from the Deleted filter.</p>
-            <button type="submit" name="action" value="delete">Move to Deleted</button>
-          </form>
-        </details>'''
-    return controls
-
-
 def record_page(record, csrf_token, *, notice=''):
+    url = _record_url(record)
+    status = record['status']
+    is_schedule = (record['kind'] == 'schedule')
+
+    menu_items = []
+
+    if is_schedule:
+        if status != 'deleted':
+            menu_items.append(_menu_link('Edit schedule', f'{url}/edit', icon=_ICON_EDIT))
+        if status == 'approved':
+            if record.get('schedule_status') == 'paused':
+                menu_items.append(_menu_button('Resume', f'{url}/status', {'status': 'active', 'from_detail': '1'}, csrf_token, icon=_ICON_RESUME))
+            else:
+                menu_items.append(_menu_button('Pause', f'{url}/status', {'status': 'paused', 'from_detail': '1'}, csrf_token, icon=_ICON_PAUSE))
+        if status == 'deleted':
+            menu_items.append(_menu_button('Restore', f'{url}/archive', {'action': 'restore'}, csrf_token, icon=_ICON_RESTORE))
+        else:
+            menu_items.append(_menu_divider())
+            menu_items.append(_menu_button('Delete', f'{url}/archive', {'action': 'delete'}, csrf_token, danger=True, confirm_msg='Are you sure you want to move this schedule to Deleted?', icon=_ICON_DELETE))
+    else:
+        # Idea
+        if status != 'deleted':
+            menu_items.append(_menu_link('Edit idea', f'{url}/edit', icon=_ICON_EDIT))
+        if status == 'approved':
+            job_status = record.get('job_status')
+            if job_status == 'paused':
+                menu_items.append(_menu_button('Resume job', f'{url}/job-control', {'action': 'resume', 'from_detail': '1'}, csrf_token, icon=_ICON_RESUME))
+            elif job_status == 'queued':
+                menu_items.append(_menu_button('Pause job', f'{url}/job-control', {'action': 'pause', 'from_detail': '1'}, csrf_token, icon=_ICON_PAUSE))
+        if status == 'deleted':
+            menu_items.append(_menu_button('Restore', f'{url}/archive', {'action': 'restore'}, csrf_token, icon=_ICON_RESTORE))
+        else:
+            menu_items.append(_menu_divider())
+            menu_items.append(_menu_button('Delete', f'{url}/archive', {'action': 'delete'}, csrf_token, danger=True, confirm_msg='Are you sure you want to move this idea to Deleted?', icon=_ICON_DELETE))
+
+    action_menu_html = _action_menu(menu_items)
+    heading_action = f'<div class="header-actions">{action_menu_html}</div>'
+
     metadata = [
         ('Index', _text(record['index'])),
         ('Type', _TYPE_LABELS.get(record['source'], 'Idea')),
@@ -203,23 +211,121 @@ def record_page(record, csrf_token, *, notice=''):
         ('Created date', _date(record['created_at'])),
         ('Publish date', _date(record['publish_at'], with_time=True)),
     ]
-    job_link = ''
-    if record['kind'] == 'schedule':
+    if is_schedule:
         start = f'{_text(record["start_date"])} · {_text(record["run_at"])} {_text(record["timezone"])}'
         metadata.extend((('Production start', start), ('Videos per day', int(record['daily_limit']))))
         if record['status'] == 'approved':
             metadata.append(('Schedule state', _label(record['schedule_status'])))
         details = _schedule_details(record)
     else:
+        if record.get('job_status'):
+            metadata.append(('Job state', _label(record['job_status'])))
         details = f'<section class="record"><h2>Prompt</h2><p class="prompt">{_text(record["details"])}</p></section>'
-        if record['job_id'] is not None:
-            job_link = f'<p><a href="/workspace?job={int(record["job_id"])}">Open video job</a></p>'
+
+    card_actions = ''
+    if is_schedule:
+        if status == 'pending':
+            card_actions = f'''
+            <form class="actions" method="post" action="{url}/status">
+              {_csrf(csrf_token)}<input type="hidden" name="from_detail" value="1">
+              <button class="primary" type="submit" name="status" value="active">Approve and activate</button>
+              <button type="submit" name="status" value="rejected">Reject</button>
+            </form>'''
+    else:
+        if status in ('pending', 'later'):
+            later_button = '<button type="submit" name="decision" value="later">Later</button>' if status == 'pending' else ''
+            card_actions = f'''
+            <form class="actions" method="post" action="{url}/decision">
+              {_csrf(csrf_token)}<input type="hidden" name="from_detail" value="1">
+              <button class="primary" type="submit" name="decision" value="accept">Approve</button>
+              {later_button}
+              <button type="submit" name="decision" value="reject">Reject</button>
+            </form>'''
+
     fields = ''.join(f'<div><dt class="muted">{label}</dt><dd>{value}</dd></div>' for label, value in metadata)
-    return _page(record['title'], '/', f'''
-    <p class="intro"><a href="/">Back to inbox</a></p>
-    <article class="panel">
-      <dl class="inbox-record-fields">{fields}</dl>
-      {details}
-      {job_link}
-      {_record_actions(record, csrf_token)}
-    </article>''', notice)
+    return _page(
+        record['title'], '/', f'''
+        <article class="panel">
+          <dl class="inbox-record-fields">{fields}</dl>
+          {details}
+          {card_actions}
+        </article>''',
+        notice,
+        breadcrumb='<a href="/">← Back to inbox</a>',
+        heading_action=heading_action,
+    )
+
+
+def edit_idea_page(record, csrf_token, *, notice='', brand_profiles=None, values=None):
+    values = values or {}
+    title = _text(values.get('title', record.get('title', '')))
+    prompt = _text(values.get('prompt', record.get('details', record.get('prompt', ''))))
+    brand_select = ''
+    if brand_profiles:
+        selected_brand = values.get('brand_id', record.get('brand_id') or '')
+        options = '<option value="">None (Niche default)</option>' + ''.join(
+            f'<option value="{_text(bp["id"])}"{ " selected" if bp["id"] == selected_brand else ""}>{_text(bp["name"])}{ " (Default)" if bp.get("is_default") else ""}</option>'
+            for bp in brand_profiles
+        )
+        brand_select = f'<label>Brand / Rules<select name="brand_id">{options}</select></label>'
+
+    job_warning = ''
+    if record.get('job_id'):
+        job_warning = '<p class="muted"><small>Note: Updating this idea will keep the active video job in sync (or replan if scenes were already generated).</small></p>'
+
+    content = f'''
+    <p class="intro"><a href="/ideas/{int(record['id'])}">Back to idea</a></p>
+    <section class="panel">
+      <h2>Edit Idea {_text(record.get('index', ''))}</h2>
+      <form class="stack" method="post" action="/ideas/{int(record['id'])}/edit">
+        {_csrf(csrf_token)}
+        {brand_select}
+        <label>Title<input name="title" value="{title}" maxlength="100"></label>
+        <label>Prompt<textarea name="prompt" rows="5" required>{prompt}</textarea></label>
+        {job_warning}
+        <div class="actions">
+          <button type="submit" class="primary">Save changes</button>
+          <a class="button-link" href="/ideas/{int(record['id'])}">Cancel</a>
+        </div>
+      </form>
+    </section>'''
+    return _page(f'Edit {record["title"]}', '/', content, notice)
+
+
+def edit_schedule_page(record, csrf_token, *, notice='', brand_profiles=None, values=None):
+    values = values or {}
+    title = _text(values.get('title', record.get('title', '')))
+    start_date = _text(values.get('start_date', record.get('start_date', '')))
+    run_at = _text(values.get('run_at', record.get('run_at', '09:00')))
+    timezone = _text(values.get('timezone', record.get('timezone', 'Asia/Dhaka')))
+    daily_limit = _text(values.get('daily_limit', str(record.get('daily_limit', '1'))))
+    brand_select = ''
+    if brand_profiles:
+        selected_brand = values.get('brand_id', record.get('brand_id') or '')
+        options = '<option value="">None (Niche default)</option>' + ''.join(
+            f'<option value="{_text(bp["id"])}"{ " selected" if bp["id"] == selected_brand else ""}>{_text(bp["name"])}{ " (Default)" if bp.get("is_default") else ""}</option>'
+            for bp in brand_profiles
+        )
+        brand_select = f'<label>Brand / Rules<select name="brand_id">{options}</select></label>'
+
+    content = f'''
+    <p class="intro"><a href="/schedules/{int(record['id'])}">Back to schedule</a></p>
+    <section class="panel">
+      <h2>Edit Schedule {_text(record.get('index', ''))}</h2>
+      <form class="stack" method="post" action="/schedules/{int(record['id'])}/edit">
+        {_csrf(csrf_token)}
+        {brand_select}
+        <label>Title<input name="title" value="{title}" maxlength="100" required></label>
+        <div class="fields">
+          <label>Start date<input name="start_date" type="date" value="{start_date}" required></label>
+          <label>Daily time<input name="run_at" type="time" value="{run_at}" required></label>
+          <label>Time zone<input name="timezone" value="{timezone}" required></label>
+          <label>Videos per day<input name="daily_limit" type="number" min="1" max="100" value="{daily_limit}" required></label>
+        </div>
+        <div class="actions">
+          <button type="submit" class="primary">Save changes</button>
+          <a class="button-link" href="/schedules/{int(record['id'])}">Cancel</a>
+        </div>
+      </form>
+    </section>'''
+    return _page(f'Edit {record["title"]}', '/', content, notice)

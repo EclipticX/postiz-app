@@ -10,7 +10,8 @@ For a native development run, use Python 3.9 or later and run `python3 -m app.se
 
 ## Configure production
 
-- Add the Claude, fal.ai, EvoLink, and Postiz API keys you have in **Providers**. Studio writes its own private `.env` inside the data directory and uses updated credentials for new jobs.
+- Add the Claude, fal.ai, EvoLink, ElevenLabs, and Postiz API keys you have in **Providers**. Studio writes its own private `.env` inside the data directory and uses updated credentials for new jobs.
+- Configure brand identities, Mother Prompts, and character rhythm constraints in **Brand Rules** to ensure visual and narrative synchronization across videos.
 - Set the daily and per-video budget in **Settings**. Enter the estimated cost for each paid route you enable in **Providers**. A zero limit or unconfigured rate holds paid requests. The guard uses estimates where provider billing is unavailable. Daily spend rolls over in `Asia/Dhaka`.
 - Enable Seedance or Kling with its credential and rate to render 5-second scenes. The configured Veo route handles 4-second scenes.
 - For native media generation, install FFmpeg with `ffprobe` and subtitle support, `rsvg-convert`, and the Python dependencies from `requirements.txt`. The Dockerfile installs these tools.
