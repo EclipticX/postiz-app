@@ -15,7 +15,7 @@ from email.parser import BytesParser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from app.asset_view import asset_page, assets_page
 from app.brand_view import brand_rules_page
@@ -36,7 +36,7 @@ from app.settings import StudioSettings
 from app.settings_view import providers_page, settings_page
 from app.watchdog import get_issue, list_issues
 from app.watchdog_view import watchdog_issue_page, watchdog_page
-from app.web import workspace_page
+from app.web import new_video_page, workspace_page
 
 
 STUDIO_ROOT = Path(__file__).resolve().parents[1]
@@ -344,13 +344,15 @@ class StudioHandler(BaseHTTPRequestHandler):
             options = options_override if options_override is not None else json.loads(job["production_options_json"])
             posts = self.server.publishing.posts.job_posts(job["id"])
             metrics = self.server.publishing.metrics(job["id"])
-            if discover and job["preview_path"] and job["status"] in ("preview_ready", "needs_review"):
+            auto_discover = bool(job["preview_path"] and job["status"] in ("preview_ready", "needs_review"))
+            if (discover or auto_discover):
                 try:
                     channels = self.server.publishing.channels()
-                    if not channels:
+                    if not channels and discover:
                         notice = "Connect a supported channel in Postiz first."
                 except (ValueError, PostizError) as error:
-                    notice = str(error)
+                    if discover:
+                        notice = str(error)
         self._reply(status, workspace_page(
             self.server.store.list_jobs(), job, notice, tasks, self.server.csrf_token,
             posts=posts, channels=channels, metrics=metrics, assets=assets, presets=presets, production_options=options,
@@ -503,7 +505,9 @@ class StudioHandler(BaseHTTPRequestHandler):
 
         url = urlsplit(self.path)
         if url.path == "/":
-            self._show_inbox(params=parse_qs(url.query))
+            params = parse_qs(url.query)
+            notice = params.get("notice", [""])[0]
+            self._show_inbox(params=params, notice=notice)
         elif url.path == "/inbox/create":
             kind = parse_qs(url.query).get("type", ["manual"])[0]
             if kind not in INBOX_RECORD_TYPES:
@@ -593,6 +597,11 @@ class StudioHandler(BaseHTTPRequestHandler):
                     self.send_error(HTTPStatus.NOT_FOUND)
                     return
             self._show_workspace(job, discover=params.get("channels") == ["1"])
+        elif url.path == "/workspace/create":
+            self._reply(HTTPStatus.OK, new_video_page(
+                self.server.csrf_token,
+                brand_profiles=self.server.store.list_brand_profiles(),
+            ))
         elif scene := WORKSPACE_SCENE.fullmatch(url.path):
             self._show_scene_editor(int(scene[1]), scene[2])
         elif url.path.startswith("/media/"):
@@ -766,7 +775,7 @@ class StudioHandler(BaseHTTPRequestHandler):
         preset_default = re.fullmatch(rf"/settings/presets/(visual|script|subtitle|audio)/({ASSET_ID})/default", path)
         brand_default = BRAND_DEFAULT.fullmatch(path)
         brand_delete = BRAND_DELETE.fullmatch(path)
-        workspace_route = re.fullmatch(r"/workspace/(\d{1,18})/(approve-keyframes|retry-render|revise|publish|options|pause|resume|edit|delete)", path)
+        workspace_route = re.fullmatch(r"/workspace/(\d{1,18})/(generate|approve-keyframes|retry-render|revise|publish|options|pause|resume|edit|delete)", path)
         scene_route = WORKSPACE_SCENE.fullmatch(path)
         store = self.server.store
         settings = self.server.settings
@@ -777,11 +786,46 @@ class StudioHandler(BaseHTTPRequestHandler):
         options = None
         try:
             if path == "/ideas":
+                if field("action") == "generate":
+                    job_id = store.create_direct_job(field("prompt"), field("title") or None, brand_id=field("brand_id") or None, source="manual")
+                    self._redirect(f"/workspace?job={job_id}")
+                    return
                 store.add_idea(field("prompt"), field("title") or None, brand_id=field("brand_id") or None)
+            elif path == "/workspace/create":
+                job_id = store.create_direct_job(field("prompt"), field("title") or None, brand_id=field("brand_id") or None, source="direct")
+                self._redirect(f"/workspace?job={job_id}")
+                return
             elif path == "/ideas/generate":
-                planning.request_ideas(field("trends"), brand_id=field("brand_id") or None)
+                trends = field("trends")
+                brand_id = field("brand_id") or None
+                ideas = planning.generate_three_ideas(trends, brand_id=brand_id)
+                self._reply(HTTPStatus.OK, create_page(
+                    self.server.csrf_token, kind="claude",
+                    values={"trends": trends, "brand_id": brand_id},
+                    brand_profiles=self.server.store.list_brand_profiles(),
+                    generated_ideas=ideas,
+                ))
+                return
+            elif path == "/ideas/accept":
+                prompt = field("prompt")
+                title = field("title") or None
+                brand_id = field("brand_id") or None
+                action = field("action")
+                if action == "produce":
+                    job_id = store.create_direct_job(prompt, title, brand_id=brand_id, source="claude")
+                    self._redirect(f"/workspace?job={job_id}")
+                    return
+                else:
+                    store.add_idea(prompt, title, source="claude", brand_id=brand_id)
+                    self._redirect("/?notice=" + quote("Idea saved to inbox."))
+                    return
             elif idea_decision:
                 store.decide_idea(int(idea_decision[1]), field("decision"))
+                if field("decision") == "accept":
+                    idea_row = store.get_idea(int(idea_decision[1]))
+                    if idea_row and idea_row.get("job_id"):
+                        self._redirect(f"/workspace?job={idea_row['job_id']}")
+                        return
             elif idea_control:
                 action = field("action")
                 if action == "pause":
@@ -926,7 +970,25 @@ class StudioHandler(BaseHTTPRequestHandler):
             elif workspace_route:
                 job_id = int(workspace_route[1])
                 action = workspace_route[2]
-                if action == "approve-keyframes":
+                if action == "generate":
+                    job = store.get_job(job_id)
+                    if job is None:
+                        raise LookupError("Video job not found.")
+                    if job["status"] == "paused":
+                        store.resume_job(job_id)
+                    if job["status"] == "review_keyframes":
+                        self.server.production.media.approve_keyframes(job_id, expected_revision=field("revision") or None)
+                        self.server.production.advance(datetime.now(timezone.utc))
+                    elif job["status"] in ("queued", "needs_review", "paused"):
+                        with store._connection(write=True) as db:
+                            db.execute("UPDATE jobs SET stage_error = NULL WHERE id = ?", (job_id,))
+                        now = datetime.now(timezone.utc)
+                        self.server.planning.process_plan(now)
+                        self.server.production.advance(now)
+                        updated_job = store.get_job(job_id)
+                        if updated_job and updated_job.get("stage_error"):
+                            raise ValueError(updated_job["stage_error"])
+                elif action == "approve-keyframes":
                     self.server.production.media.approve_keyframes(job_id, expected_revision=field("revision"))
                 elif action == "retry-render":
                     self.server.production.retry_render(job_id)
@@ -983,6 +1045,13 @@ class StudioHandler(BaseHTTPRequestHandler):
             elif workspace_route:
                 self._show_workspace(store.get_job(job_id), HTTPStatus.BAD_REQUEST, str(error),
                                      discover=workspace_route[2] == "publish", options_override=options)
+            elif path == "/workspace/create":
+                self._reply(HTTPStatus.BAD_REQUEST, new_video_page(
+                    self.server.csrf_token,
+                    values={name: field(name) for name in ("title", "prompt", "brand_id")},
+                    notice=str(error),
+                    brand_profiles=self.server.store.list_brand_profiles(),
+                ))
             elif create_kind:
                 fields = ("title", "prompt", "trends", "prompts", "start_date", "run_at", "timezone", "daily_limit", "brand_id")
                 self._reply(HTTPStatus.BAD_REQUEST, create_page(

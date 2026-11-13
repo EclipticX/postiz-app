@@ -64,6 +64,19 @@ class PlanningTests(unittest.TestCase):
         self.assertEqual(self.store.list_ideas()[0]["status"], "pending")
         self.assertEqual(self.store.list_jobs(), [])
 
+    def test_generate_three_ideas_returns_top_three(self):
+        self.responses = [{"ideas": [
+            {"title": "Idea 1", "prompt": "Prompt 1"},
+            {"title": "Idea 2", "prompt": "Prompt 2"},
+            {"title": "Idea 3", "prompt": "Prompt 3"},
+            {"title": "Idea 4", "prompt": "Prompt 4"},
+        ]}]
+        ideas = self.planner.generate_three_ideas("Gentle garden stories", now=NOW)
+        self.assertEqual(len(ideas), 3)
+        self.assertEqual(ideas[0]["title"], "Idea 1")
+        self.assertEqual(ideas[1]["title"], "Idea 2")
+        self.assertEqual(ideas[2]["title"], "Idea 3")
+
     def test_weekly_schedule_dispatches_only_once_in_local_time(self):
         self.planner.set_idea_schedule(True, "weekly", "09:00", "Asia/Dhaka", 0, "Garden", NOW)
         self.planner.dispatch_idea_schedule(NOW)

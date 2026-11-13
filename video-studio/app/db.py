@@ -454,6 +454,31 @@ class StudioStore:
                 (title, prompt, source, brand_id),
             ).lastrowid
 
+    def create_direct_job(self, prompt, title=None, brand_id=None, source="direct"):
+        prompt = _clean_prompt(prompt)
+        title = (title or "").strip() or _prompt_title(prompt)
+        if brand_id is not None:
+            brand_id = brand_id.strip() or None
+        with self._connection(write=True) as db:
+            idea_id = db.execute(
+                """
+                INSERT INTO ideas (niche_id, title, prompt, source, status, brand_id)
+                VALUES ((SELECT id FROM niches WHERE id = 'kids_3d'), ?, ?, ?, 'accepted', ?)
+                """,
+                (title, prompt, source, brand_id),
+            ).lastrowid
+            production_options = {}
+            if brand_id:
+                production_options = {"presets": {"brand": brand_id}}
+            job_id = db.execute(
+                """
+                INSERT INTO jobs (niche_id, title, prompt, source, idea_id, production_options_json)
+                VALUES ((SELECT id FROM niches WHERE id = 'kids_3d'), ?, ?, ?, ?, ?)
+                """,
+                (title, prompt, source, idea_id, json.dumps(production_options)),
+            ).lastrowid
+            return job_id
+
     def decide_idea(self, idea_id, decision):
         statuses = {"accept": "accepted", "reject": "rejected", "later": "later"}
         if decision not in statuses:

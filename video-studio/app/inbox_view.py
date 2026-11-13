@@ -89,13 +89,63 @@ def inbox_page(records, *, query='', kind='', status='', notice='', idea_request
     )
 
 
-def create_page(csrf_token, *, kind='manual', values=None, notice='', brand_profiles=None):
+def create_page(csrf_token, *, kind='manual', values=None, notice='', brand_profiles=None, generated_ideas=None):
     values = values or {}
     labels = (('manual', 'Manual idea'), ('claude', 'Generate with Claude'), ('schedule', 'Prompt schedule'))
     links = []
     for key, label in labels:
         current = ' aria-current="page"' if kind == key else ''
         links.append(f'<a href="/inbox/create?type={key}"{current}>{label}</a>')
+
+    if kind == 'claude' and generated_ideas:
+        trends = values.get('trends', '')
+        brand_id = values.get('brand_id', '')
+        brand_name = ''
+        if brand_profiles and brand_id:
+            match = next((bp['name'] for bp in brand_profiles if bp['id'] == brand_id), None)
+            if match:
+                brand_name = f' · {match}'
+
+        cards = []
+        for i, idea in enumerate(generated_ideas, 1):
+            ititle = _text(idea['title'])
+            iprompt = _text(idea['prompt'])
+            cards.append(f'''
+            <article class="panel generated-idea-card" style="margin-bottom: 1rem; border: 1px solid var(--border); padding: 1.25rem;">
+              <div style="display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 0.5rem;">
+                <h3 style="margin: 0; font-size: 1.15rem;">Option {i}: {ititle}</h3>
+                <span class="muted" style="font-size: 0.85rem;">Claude generated</span>
+              </div>
+              <p class="prompt" style="margin: 0.75rem 0 1rem; background: var(--bg); padding: 0.75rem; border-radius: 0.5rem; line-height: 1.5;">{iprompt}</p>
+              <form method="post" action="/ideas/accept" class="actions" style="display: flex; gap: 0.75rem; align-items: center;">
+                {_csrf(csrf_token)}
+                <input type="hidden" name="title" value="{ititle}">
+                <input type="hidden" name="prompt" value="{iprompt}">
+                <input type="hidden" name="brand_id" value="{_text(brand_id)}">
+                <button type="submit" name="action" value="produce" class="primary">✓ Accept</button>
+                <button type="submit" name="action" value="save" class="button-link">Save to inbox</button>
+              </form>
+            </article>''')
+
+        return _page('Create', '/', f'''
+        <p class="intro"><a href="/">Back to inbox</a></p>
+        <section class="panel">
+          <nav class="inbox-create-types" aria-label="Create type">{''.join(links)}</nav>
+          <div style="margin: 1.25rem 0 1rem;">
+            <h2 style="margin: 0 0 0.25rem; font-size: 1.3rem;">3 Generated Ideas</h2>
+            <p class="muted" style="margin: 0;">Theme: <em>&ldquo;{_text(trends)}&rdquo;</em>{brand_name}</p>
+          </div>
+          {''.join(cards)}
+          <div class="panel" style="display: flex; justify-content: space-between; align-items: center; margin-top: 1rem; background: var(--bg);">
+            <form method="post" action="/ideas/generate" style="margin: 0;">
+              {_csrf(csrf_token)}
+              <input type="hidden" name="trends" value="{_text(trends)}">
+              <input type="hidden" name="brand_id" value="{_text(brand_id)}">
+              <button type="submit" class="primary">🔄 Regenerate</button>
+            </form>
+            <a href="/inbox/create?type=claude" class="button-link">← Change theme</a>
+          </div>
+        </section>''', notice)
 
     brand_select = ''
     if brand_profiles:
@@ -122,7 +172,7 @@ def create_page(csrf_token, *, kind='manual', values=None, notice='', brand_prof
           <label>Videos per day<input name="daily_limit" type="number" min="1" max="100" value="{_text(values.get('daily_limit', '1'))}" required></label>
         </div>'''
     elif kind == 'claude':
-        route, button = '/ideas/generate', 'Generate ideas with Claude'
+        route, button = '/ideas/generate', 'Generate with Claude'
         fields = f'''
         {brand_select}
         <label>Trend or theme
@@ -237,7 +287,7 @@ def record_page(record, csrf_token, *, notice=''):
             card_actions = f'''
             <form class="actions" method="post" action="{url}/decision">
               {_csrf(csrf_token)}<input type="hidden" name="from_detail" value="1">
-              <button class="primary" type="submit" name="decision" value="accept">Approve</button>
+              <button class="primary" type="submit" name="decision" value="accept">Generate video</button>
               {later_button}
               <button type="submit" name="decision" value="reject">Reject</button>
             </form>'''

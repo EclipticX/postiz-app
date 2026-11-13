@@ -139,7 +139,7 @@ def _publishing_section(job, posts, channels, metrics, csrf_token):
     )
     stats_html = f'<h4>Post analytics</h4><ul>{stats}</ul>' if stats else ''
     discover = ''
-    if job.get('preview_path') and job['status'] in ('preview_ready', 'needs_review'):
+    if not channels and job.get('preview_path') and job['status'] in ('preview_ready', 'needs_review'):
         discover = f'<p><a href="/workspace?job={job_id}&amp;channels=1">Load connected Postiz channels</a></p>'
     form = ''
     if channels:
@@ -211,12 +211,18 @@ def workspace_page(
             for task in tasks if task['error']
         )
         actions = ''
-        if job['status'] == 'review_keyframes':
+        if job['status'] in ('queued', 'paused', 'needs_review') and not job.get('preview_path'):
+            actions += f'''
+            <form method="post" action="/workspace/{int(job['id'])}/generate" class="actions">
+              {_csrf(csrf_token)}
+              <button class="primary" type="submit">Generate video</button>
+            </form>'''
+        elif job['status'] == 'review_keyframes':
             actions = f'''
-            <form method="post" action="/workspace/{int(job['id'])}/approve-keyframes" class="actions">
+            <form method="post" action="/workspace/{int(job['id'])}/generate" class="actions">
               {_csrf(csrf_token)}
               <input type="hidden" name="revision" value="{_text(scene_revision(job, tasks))}">
-              <button class="primary" type="submit">Approve keyframes</button>
+              <button class="primary" type="submit">Generate video</button>
             </form>'''
         if job['status'] in ('review_keyframes', 'preview_ready', 'needs_review'):
             actions += f'''
@@ -323,4 +329,38 @@ def workspace_page(
           <h2 id="jobs-heading">Video jobs</h2>
           {job_list}
         </section>'''
-    return _page('Video Workspace', '/workspace', content, notice)
+    return _page(
+        'Video Workspace', '/workspace', content, notice,
+        heading_action='<a class="button-link primary" href="/workspace/create">+ New Video</a>',
+    )
+
+
+def new_video_page(csrf_token, *, values=None, notice='', brand_profiles=None) -> str:
+    values = values or {}
+    brand_select = ''
+    if brand_profiles:
+        default_brand_id = next((bp['id'] for bp in brand_profiles if bp.get('is_default')), '')
+        selected_brand = values.get('brand_id') or default_brand_id
+        options = ''.join(
+            f'<option value="{_text(bp["id"])}"{ " selected" if bp["id"] == selected_brand else ""}>{_text(bp["name"])}{ " (Default)" if bp.get("is_default") else ""}</option>'
+            for bp in brand_profiles
+        )
+        brand_select = f'<label>Brand / Rules<select name="brand_id">{options}</select></label>'
+
+    title = _text(values.get('title', ''))
+    prompt = _text(values.get('prompt', ''))
+    content = f'''
+    <p class="intro"><a href="/workspace">← Back to video workspace</a></p>
+    <section class="panel">
+      <form class="stack" method="post" action="/workspace/create">
+        {_csrf(csrf_token)}
+        {brand_select}
+        <label>Title <span class="muted">(optional)</span><input name="title" value="{title}" maxlength="100" placeholder="e.g. Tavi and the Garden Seed"></label>
+        <label>Production prompt<textarea name="prompt" rows="5" required placeholder="Describe the scene, actions, characters, and mood...">{prompt}</textarea></label>
+        <div class="actions">
+          <button type="submit" class="primary">Start Production</button>
+          <a href="/workspace">Cancel</a>
+        </div>
+      </form>
+    </section>'''
+    return _page('New Video', '/workspace', content, notice)

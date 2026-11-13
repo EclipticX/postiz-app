@@ -824,4 +824,96 @@ class StudioHTTPTest(unittest.TestCase):
         self.assertIn("Updated Batch", html)
         self.assertIn("10:00", html)
 
+    def test_workspace_create_direct_job(self):
+        status, html = self.request("GET", "/workspace/create")
+        self.assertEqual(status, 200)
+        self.assertIn("New Video", html)
+        self.assertIn("Start Production", html)
+
+        # Post invalid (empty prompt)
+        self.assertEqual(self.post("/workspace/create", prompt=""), 400)
+
+        # Post valid
+        status = self.post("/workspace/create", title="Direct Garden", prompt="A lovely seed grows.")
+        self.assertEqual(status, 303)
+
+        jobs = self.store.list_jobs()
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]["title"], "Direct Garden")
+        self.assertEqual(jobs[0]["prompt"], "A lovely seed grows.")
+
+        status, html = self.request("GET", f"/workspace?job={jobs[0]['id']}")
+        self.assertEqual(status, 200)
+        self.assertIn("Direct Garden", html)
+
+    def test_manual_idea_generate_video_action(self):
+        status = self.post("/ideas", title="Quick Video", prompt="Quick prompt.", action="generate")
+        self.assertEqual(status, 303)
+
+        jobs = self.store.list_jobs()
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]["title"], "Quick Video")
+
+        status, html = self.request("GET", f"/workspace?job={jobs[0]['id']}")
+        self.assertEqual(status, 200)
+        self.assertIn("Quick Video", html)
+
+    def test_approve_idea_decision_redirects_to_workspace_job(self):
+        idea_id = self.store.add_idea("Seed prompt", "Seed Tale")
+        status = self.post(f"/ideas/{idea_id}/decision", decision="accept")
+        self.assertEqual(status, 303)
+
+        jobs = self.store.list_jobs()
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]["idea_id"], idea_id)
+
+        status, html = self.request("GET", f"/workspace?job={jobs[0]['id']}")
+        self.assertEqual(status, 200)
+        self.assertIn("Seed Tale", html)
+        self.assertIn("Generate video", html)
+        self.assertIn(f'/workspace/{jobs[0]["id"]}/generate', html)
+
+    def test_workspace_details_generate_button(self):
+        job_id = self.store.create_direct_job("A cute seed story", "Seed Adventure")
+        status, html = self.request("GET", f"/workspace?job={job_id}")
+        self.assertEqual(status, 200)
+        self.assertIn("Seed Adventure", html)
+        self.assertIn("Generate video", html)
+        self.assertIn(f'/workspace/{job_id}/generate', html)
+
+        # Triggering generate when Claude is not configured sets notice
+        status = self.post(f"/workspace/{job_id}/generate")
+        self.assertEqual(status, 400)
+
+    def test_claude_generate_three_ideas_and_accept(self):
+        sample_ideas = [
+            {"title": "Idea One", "prompt": "Prompt One"},
+            {"title": "Idea Two", "prompt": "Prompt Two"},
+            {"title": "Idea Three", "prompt": "Prompt Three"},
+        ]
+        with patch("app.planning.StudioPlanner.generate_three_ideas", return_value=sample_ideas):
+            # Generate ideas
+            status, html = self.request("POST", "/ideas/generate", {"csrf_token": self.csrf, "trends": "Space theme"})
+            self.assertEqual(status, 200)
+            self.assertIn("3 Generated Ideas", html)
+            self.assertIn("Option 1: Idea One", html)
+            self.assertIn("Option 2: Idea Two", html)
+            self.assertIn("Option 3: Idea Three", html)
+            self.assertIn("Regenerate", html)
+            self.assertIn("Accept", html)
+
+        # Accept and produce video
+        status = self.post("/ideas/accept", title="Idea One", prompt="Prompt One", action="produce")
+        self.assertEqual(status, 303)
+        jobs = self.store.list_jobs()
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]["title"], "Idea One")
+
+        # Save to inbox
+        status = self.post("/ideas/accept", title="Idea Two", prompt="Prompt Two", action="save")
+        self.assertEqual(status, 303)
+        ideas = [i for i in self.store.list_ideas() if i["title"] == "Idea Two"]
+        self.assertEqual(len(ideas), 1)
+
+
 

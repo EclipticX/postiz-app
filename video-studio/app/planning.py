@@ -1,7 +1,7 @@
 """Approved ideas and scheduled prompts enter the same scene planner."""
 
 import json
-from datetime import date, time
+from datetime import date, datetime, time, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.providers import ClaudeAdapter, ProviderError, ProviderRequest
@@ -45,6 +45,34 @@ class StudioPlanner:
             brand_id = brand_id.strip() or None
         with self.store._connection(write=True) as db:
             db.execute("INSERT INTO idea_generation_requests (trends, brand_id) VALUES (?, ?)", (trends, brand_id))
+
+    def generate_three_ideas(self, trends, brand_id=None, now=None):
+        trends = trends.strip()
+        if not trends or len(trends) > 4000:
+            raise ValueError("Enter trends in 1–4,000 characters.")
+        if brand_id is not None:
+            brand_id = brand_id.strip() or None
+        now = now or datetime.now(timezone.utc)
+
+        with self.store._connection() as db:
+            memory = [json.loads(row[0]) for row in db.execute(
+                "SELECT pattern_json FROM memory WHERE niche_id = 'kids_3d' ORDER BY id DESC LIMIT 10"
+            )]
+
+        options = {"presets": {"brand": brand_id}} if brand_id else {}
+        profile = self.library.profile(options=options)
+        prompt = idea_prompt(profile, trends, memory)
+
+        adapter, reservation = self._claude(None, now)
+        try:
+            result = adapter.submit(ProviderRequest(prompt=prompt, output_schema=IDEA_SCHEMA))
+            ideas = self._validated_ideas(result.data)
+        except ProviderError as error:
+            raise ValueError(str(error)) from None
+        finally:
+            self.settings.settle(reservation)
+
+        return ideas[:3]
 
     def idea_requests(self):
         with self.store._connection() as db:
