@@ -131,7 +131,7 @@ class StudioPlanner:
             db.execute("UPDATE jobs SET status = 'needs_review', stage_error = ? WHERE status = 'planning'", (reason,))
             db.execute("UPDATE idea_generation_requests SET status = 'needs_review', error = ? WHERE status = 'generating'", (reason,))
 
-    def _claude(self, job_id, now, *, vision=False):
+    def _claude_configuration(self, *, vision=False):
         provider = next((row for row in self.settings.list_providers() if row["name"] == CLAUDE_ROUTE), None)
         blockers = provider_blockers(provider) if provider else ("disabled",)
         key = self.settings.key(provider["key_env"]) if provider else None
@@ -141,6 +141,10 @@ class StudioPlanner:
             raise ValueError("Set Claude's estimated cost per request in Settings.")
         if vision and not provider["capabilities"].get("vision"):
             raise ValueError("Enable a Scripting provider with vision for visual QA.")
+        return provider, key
+
+    def _claude(self, job_id, now, *, vision=False):
+        provider, key = self._claude_configuration(vision=vision)
         try:
             adapter = self.adapter_factory(key)
         except ProviderError as error:
@@ -224,9 +228,9 @@ class StudioPlanner:
                 (status, error, request_id),
             )
 
-    def process_plan(self, now):
+    def process_plan(self, now, *, job_id=None):
         with self.store._connection(write=True) as db:
-            job = self._claim_plan(db, now)
+            job = self._claim_plan(db, now, job_id=job_id)
         if job is None:
             return
 
@@ -283,14 +287,16 @@ class StudioPlanner:
         self._update_plan(job["id"], "planned", None, scenes=scenes)
 
     @staticmethod
-    def _claim_plan(db, now):
+    def _claim_plan(db, now, *, job_id=None):
         candidates = db.execute(
             """SELECT jobs.*, prompt_schedules.id AS batch_id, prompt_schedules.status AS batch_status,
                 prompt_schedules.timezone AS batch_timezone, prompt_schedules.run_at AS batch_time,
                 prompt_schedules.daily_limit AS batch_limit
                 FROM jobs LEFT JOIN schedule_entries ON schedule_entries.id = jobs.schedule_entry_id
                 LEFT JOIN prompt_schedules ON prompt_schedules.id = schedule_entries.schedule_id
-                WHERE jobs.status = 'queued' ORDER BY jobs.stage_error IS NOT NULL, jobs.id"""
+                WHERE jobs.status = 'queued' AND (? IS NULL OR jobs.id = ?)
+                ORDER BY jobs.stage_error IS NOT NULL, jobs.id""",
+            (job_id, job_id),
         ).fetchall()
         for job in candidates:
             started_for = job["planning_started_for"]

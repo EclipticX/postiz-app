@@ -2,6 +2,10 @@
 
 import re
 
+from app.postiz_client import META_MEDIA_REQUIRED
+from app.publishing_store import (
+    POSTIZ_HANDOFF_EXPIRED, POSTIZ_PUBLISH_DRAFT, POSTIZ_PUBLISH_FAILED, POSTIZ_PUBLISH_PENDING, POSTIZ_STATUS_UNAVAILABLE,
+)
 from app.settings import PROVIDER_WARNING_MESSAGES, provider_blockers
 
 
@@ -25,8 +29,13 @@ _ISSUE_QUERIES = {
     """,
     "publish": """
         SELECT id, 'Publishing' AS source, status, error, NULL AS attempts,
-            identifier || ' request #' || id || ' · video job #' || job_id AS item, job_id
+            channel_name || ' · ' || identifier || ' request #' || id || ' · video job #' || job_id AS item, job_id
         FROM publishing_requests
+    """,
+    "copy": """
+        SELECT d.job_id AS id, 'Post draft' AS source, d.status, d.error, NULL AS attempts,
+            'Video job #' || d.job_id AS item, d.job_id
+        FROM post_drafts d JOIN jobs j ON j.id = d.job_id AND j.preview_path = d.preview_path
     """,
     "analytics": """
         SELECT id, 'Publishing analytics' AS source, 'error' AS status, analytics_error AS error,
@@ -50,6 +59,9 @@ _BLOCK_REASONS = {
     PROVIDER_WARNING_MESSAGES["invalid_credential"],
 }
 _SAFE_REASONS = _BLOCK_REASONS | set(PROVIDER_WARNING_MESSAGES.values()) | {
+    META_MEDIA_REQUIRED, POSTIZ_HANDOFF_EXPIRED, POSTIZ_PUBLISH_DRAFT, POSTIZ_PUBLISH_FAILED,
+    POSTIZ_PUBLISH_PENDING, POSTIZ_STATUS_UNAVAILABLE,
+    "Automatic keyframe review flagged this video. Review the keyframes manually.",
     "Claude returned invalid visual QA results.",
     "Claude returned an idea without a title or prompt.",
     "Claude must return between one and ten ideas.",
@@ -63,6 +75,8 @@ _SAFE_REASONS = _BLOCK_REASONS | set(PROVIDER_WARNING_MESSAGES.values()) | {
     "Postiz did not confirm the post ID. Check Postiz before retrying.",
     "Postiz did not return a usable response.",
     "Postiz rate limit reached. Try again later.",
+    "Studio could not generate post details. You can edit and save them in Video Workspace.",
+    "Post copy generation was interrupted. Review and save the post details in Video Workspace.",
     "Provider connection failed.",
     "Provider returned an unexpected response.",
     "Provider returned invalid JSON.",
@@ -70,10 +84,10 @@ _SAFE_REASONS = _BLOCK_REASONS | set(PROVIDER_WARNING_MESSAGES.values()) | {
     "Publishing was interrupted. Check Postiz for the post before trying again.",
     "Set STUDIO_WHISPER_MODEL_PATH to an existing local faster-whisper model directory",
     "Studio restarted during a provider call. Review its status before resubmitting.",
+    "Studio restarted during automatic keyframe review. Review the keyframes manually.",
     "Studio restarted during visual QA. Review the saved preview.",
     "The approved preview changed before publishing.",
     "The approved preview file is missing.",
-    "The approved publication time passed before Postiz handoff.",
 }
 _HTTP_REASON = re.compile(
     r"(?:Provider service unavailable|Provider rejected the request|Postiz rejected the request|"
@@ -81,6 +95,7 @@ _HTTP_REASON = re.compile(
 )
 _ROUTE_REASON = re.compile(
     r"(?:Configure an eligible (?:keyframe|video|voice) route and rate in Settings\.|"
+    r"Configure an enabled animation route with a key and rate that supports [0-9]+-second scenes at 720p\.|"
     r"No provider accepted this (?:keyframe|video|voice) request\. "
     r"Check provider access, account credit, or rate limits in Providers\.)"
 )
@@ -91,6 +106,7 @@ _FALLBACK_REASONS = {
     "Media production": "The media task recorded an error. Review the affected video job.",
     "Publishing": "The publishing request recorded an error. Review the affected video job.",
     "Publishing analytics": "The analytics check recorded an error.",
+    "Post draft": "Review and save the post details in Video Workspace.",
 }
 
 
@@ -99,6 +115,8 @@ def _reason(error, source):
     if message in _SAFE_REASONS or _HTTP_REASON.fullmatch(message) or _ROUTE_REASON.fullmatch(message):
         return message
     if source == "Video production":
+        if message.startswith("Automatic keyframe review needs manual attention."):
+            return "Automatic keyframe review needs manual attention. Review the keyframes manually."
         if message.startswith("ffmpeg failed."):
             return "FFmpeg could not render the video."
         if message.startswith("ffprobe failed."):

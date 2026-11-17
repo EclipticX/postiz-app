@@ -520,6 +520,21 @@ class StudioStoreTests(unittest.TestCase):
         self.assertEqual(sched["run_at"], "11:00")
         self.assertEqual(sched["daily_limit"], 2)
 
+    def test_schedule_keyframe_policy_is_opt_in_and_ready_previews_are_counted(self):
+        schedule = self.store.create_schedule(["Prompt"], "2026-11-09", "09:00", "Asia/Dhaka", 1, title="Schedule")
+        self.assertFalse(self.store.get_schedule(schedule)["auto_approve_keyframes"])
+        self.store.update_schedule(schedule, "Schedule", "2026-11-09", "09:00", "Asia/Dhaka", 1,
+                                   auto_approve_keyframes=True)
+        self.store.update_schedule(schedule, "New title", "2026-11-09", "09:00", "Asia/Dhaka", 1)
+        self.assertTrue(self.open_store().get_schedule(schedule)["auto_approve_keyframes"])
+        self.store.set_schedule_status(schedule, "active")
+        self.store.dispatch_due(datetime(2026, 11, 9, 3, tzinfo=timezone.utc))
+        job = self.store.list_jobs()[0]["id"]
+        with self.store._connection(write=True) as db:
+            db.execute("UPDATE jobs SET status = 'needs_review', preview_path = ? WHERE id = ?", (f"{job}/preview.mp4", job))
+        self.assertEqual(self.store.get_schedule(schedule)["progress"]["preview_ready"], 1)
+        self.assertEqual(self.store.get_schedule(schedule)["progress"]["waiting"], 0)
+
 
 
 if __name__ == "__main__":

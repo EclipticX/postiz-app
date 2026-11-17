@@ -6,12 +6,15 @@ import re
 import stat
 from datetime import date, datetime, timedelta, timezone
 from http.client import HTTPConnection, HTTPException, HTTPSConnection
+from ipaddress import ip_address
 from pathlib import Path
 from urllib.parse import urlencode, urlsplit
 from uuid import uuid4
 
 
 _CHANNELS = ('youtube', 'facebook', 'instagram', 'instagram-standalone', 'tiktok')
+META_CHANNELS = frozenset(('facebook', 'instagram', 'instagram-standalone'))
+META_MEDIA_REQUIRED = 'Facebook and Instagram require an HTTPS video URL that Meta can access. Configure hosted Postiz uploads.'
 _MAX_MP4_BYTES = 1024**3
 _MAX_RESPONSE_BYTES = 4 * 1024**2
 
@@ -88,6 +91,9 @@ class PostizClient:
         identifier = channel['identifier']
         if identifier == 'tiktok' and not draft:
             raise PostizError('Create a TikTok draft and select publishing options in Postiz.')
+        media = _media(media)
+        if identifier in META_CHANNELS and not draft and not _hosted_video_url(media['path']):
+            raise PostizError(META_MEDIA_REQUIRED)
         tags = _hashtags(hashtags)
         title = title.strip()
         description = caption.strip()
@@ -107,7 +113,7 @@ class PostizClient:
             'posts': [{
                 'integration': {'id': channel['id']},
                 'settings': _post_settings(identifier, title, tags),
-                'value': [{'content': content, 'image': [_media(media)]}],
+                'value': [{'content': content, 'image': [media]}],
             }],
         }
         result = self._request(
@@ -132,10 +138,14 @@ class PostizClient:
         raise PostizError('Postiz did not return post analytics.')
 
     def original_post_url(self, post_id, scheduled_at):
+        state, release_url = self.post_status(post_id, scheduled_at)
+        return release_url if state == 'PUBLISHED' else None
+
+    def post_status(self, post_id, scheduled_at):
         if not _valid_id(post_id):
             raise PostizError('A valid Postiz post ID is required.')
         if scheduled_at is None:
-            return None
+            return None, None
         day = date.fromisoformat(_post_date(scheduled_at)[:10])
         try:
             query = urlencode({
@@ -148,9 +158,12 @@ class PostizClient:
         if not isinstance(result, dict) or not isinstance(result.get('posts'), list):
             raise PostizError('Postiz did not return a post list.')
         for post in result['posts']:
-            if isinstance(post, dict) and post.get('id') == post_id and post.get('state') == 'PUBLISHED':
-                return _safe_release_url(post.get('releaseURL'))
-        return None
+            if not isinstance(post, dict) or post.get('id') != post_id:
+                continue
+            state = post.get('state')
+            if state in ('QUEUE', 'PUBLISHED', 'ERROR', 'DRAFT'):
+                return state, _safe_release_url(post.get('releaseURL')) if state == 'PUBLISHED' else None
+        return None, None
 
     def _request(self, method, path, *, body=None, headers=None, creating=False):
         scheme, host, port = self._origin
@@ -228,6 +241,16 @@ def _safe_release_url(value):
     except ValueError:
         pass
     return None
+
+
+def _hosted_video_url(value):
+    if not _safe_release_url(value):
+        return False
+    host = urlsplit(value).hostname.rstrip('.').lower()
+    try:
+        return ip_address(host).is_global
+    except ValueError:
+        return '.' in host and not host.endswith(('.localhost', '.local', '.internal', '.test'))
 
 
 def _media(value):

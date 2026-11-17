@@ -10,6 +10,7 @@ from app.postiz_client import PostizClient, PostizError
 
 _KEY = 'test-postiz-key'
 _MEDIA = {'id': 'media-1', 'path': 'http://localhost:4007/uploads/clip.mp4'}
+_HOSTED_MEDIA = {'id': 'media-1', 'path': 'https://cdn.example.com/uploads/clip.mp4'}
 _MP4 = b'\x00\x00\x00\x18ftypisom' + b'video-bytes'
 
 
@@ -117,20 +118,36 @@ class PostizClientTests(unittest.TestCase):
             }],
         })
 
-    def test_meta_reels_match_local_provider_settings(self):
+    def test_meta_reels_use_hosted_media_and_the_scheduled_publish_time(self):
         self.connection.getresponse.return_value = _response([{'postId': 'post-1', 'integration': 'channel-1'}])
         for identifier in ('facebook', 'instagram', 'instagram-standalone'):
             with self.subTest(identifier=identifier):
-                self.client.create_post({'id': 'channel-1', 'identifier': identifier}, _MEDIA, 'Studio clip', '', [], None)
+                self.client.create_post(
+                    {'id': 'channel-1', 'identifier': identifier}, _HOSTED_MEDIA, 'Studio clip', '', [],
+                    '2026-11-10T09:30:00+06:00',
+                )
                 sent = json.loads(self.connection.request.call_args.kwargs['body'])
-                self.assertEqual(sent['type'], 'now')
-                self.assertTrue(sent['date'].endswith('Z'))
+                self.assertEqual(sent['type'], 'schedule')
+                self.assertEqual(sent['date'], '2026-11-10T03:30:00Z')
                 post = sent['posts'][0]
-                self.assertEqual(post['value'][0]['image'], [_MEDIA])
+                self.assertEqual(post['value'][0]['image'], [_HOSTED_MEDIA])
                 self.assertEqual(post['settings']['__type'], identifier)
                 self.assertEqual(post['settings']['post_type'], 'post')
                 if identifier == 'facebook':
                     self.assertEqual(post['settings']['title'], 'Studio clip')
+
+    def test_meta_schedule_rejects_local_or_insecure_media_before_queuing(self):
+        channel = {'id': 'channel-1', 'identifier': 'instagram'}
+        for url in (
+            _MEDIA['path'], '/uploads/clip.mp4', 'https://localhost/clip.mp4',
+            'https://127.0.0.1/clip.mp4', 'https://192.168.0.10/clip.mp4',
+            'http://cdn.example.com/uploads/clip.mp4',
+        ):
+            with self.subTest(url=url), self.assertRaisesRegex(PostizError, 'HTTPS video URL'):
+                self.client.create_post(
+                    channel, {'id': 'media-1', 'path': url}, 'Studio clip', '', [], '2026-11-10T03:30:00Z',
+                )
+        self.connection.request.assert_not_called()
 
     def test_tiktok_rejects_direct_scheduling_and_only_creates_a_postiz_draft(self):
         channel = {'id': 'channel-1', 'identifier': 'tiktok'}
@@ -159,7 +176,7 @@ class PostizClientTests(unittest.TestCase):
         self.assertEqual(json.loads(self.connection.request.call_args.kwargs['body'])['type'], 'draft')
         self.connection.request.reset_mock()
         with self.assertRaisesRegex(PostizError, 'timezone'):
-            self.client.create_post(channel, _MEDIA, '', 'Caption', [], '2026-11-10T09:30:00')
+            self.client.create_post(channel, _HOSTED_MEDIA, '', 'Caption', [], '2026-11-10T09:30:00')
         with self.assertRaisesRegex(PostizError, 'MP4'):
             self.client.create_post(channel, {'id': 'media-1', 'path': 'file:/private/video.mp4'}, '', 'Caption', [], None)
         with self.assertRaisesRegex(PostizError, 'supported'):
@@ -174,7 +191,7 @@ class PostizClientTests(unittest.TestCase):
                 response = _response({'detail': _KEY, 'location': 'https://other.example'}, status=status)
                 self.connection.getresponse.return_value = response
                 with self.assertRaises(PostizError) as raised:
-                    self.client.create_post(channel, _MEDIA, '', 'Caption', [], None)
+                    self.client.create_post(channel, _HOSTED_MEDIA, '', 'Caption', [], None)
                 self.assertEqual(raised.exception.uncertain, uncertain)
                 self.assertNotIn(_KEY, str(raised.exception))
                 self.connection.request.assert_called_once()
@@ -183,12 +200,12 @@ class PostizClientTests(unittest.TestCase):
         for payload in ([], {'postId': 'post-1'}, [{'postId': 'post-1', 'integration': 'different'}]):
             self.connection.getresponse.return_value = _response(payload)
             with self.assertRaises(PostizError) as raised:
-                self.client.create_post(channel, _MEDIA, '', 'Caption', [], None)
+                self.client.create_post(channel, _HOSTED_MEDIA, '', 'Caption', [], None)
             self.assertTrue(raised.exception.uncertain)
 
         self.connection.getresponse.side_effect = TimeoutError(_KEY)
         with self.assertRaises(PostizError) as raised:
-            self.client.create_post(channel, _MEDIA, '', 'Caption', [], None)
+            self.client.create_post(channel, _HOSTED_MEDIA, '', 'Caption', [], None)
         self.assertTrue(raised.exception.uncertain)
         self.assertNotIn(_KEY, str(raised.exception))
 
@@ -208,7 +225,7 @@ class PostizClientTests(unittest.TestCase):
         release = 'https://www.youtube.com/watch?v=real-video'
         self.connection.getresponse.return_value = _response({'posts': [
             {'id': 'another-post', 'state': 'PUBLISHED', 'releaseURL': 'https://www.youtube.com/watch?v=other'},
-            {'id': 'post-1', 'state': 'QUEUE', 'releaseURL': 'https://www.youtube.com/watch?v=pending'},
+            {'id': 'queued-post', 'state': 'QUEUE', 'releaseURL': 'https://www.youtube.com/watch?v=pending'},
             {'id': 'post-1', 'state': 'PUBLISHED', 'releaseURL': release},
         ]})
 
@@ -217,6 +234,16 @@ class PostizClientTests(unittest.TestCase):
             'GET', '/api/public/v1/posts?startDate=2026-11-08&endDate=2026-11-11', body=None,
             headers={'Accept': 'application/json', 'Authorization': _KEY},
         )
+
+    def test_post_status_keeps_queue_and_error_distinct_from_publication(self):
+        scheduled = '2026-11-09T09:00:00Z'
+        self.connection.getresponse.return_value = _response({'posts': [
+            {'id': 'post-1', 'state': 'ERROR', 'error': _KEY},
+            {'id': 'post-2', 'state': 'QUEUE', 'releaseURL': 'https://example.com/draft'},
+        ]})
+        self.assertEqual(self.client.post_status('post-1', scheduled), ('ERROR', None))
+        self.assertEqual(self.client.post_status('post-2', scheduled), ('QUEUE', None))
+        self.assertEqual(self.client.post_status('post-3', scheduled), (None, None))
 
     def test_original_post_lookup_ignores_unpublished_and_unsafe_links(self):
         scheduled = '2026-11-09T09:00:00Z'

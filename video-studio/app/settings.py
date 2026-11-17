@@ -536,12 +536,41 @@ class StudioSettings:
                 (daily_micros, video_micros),
             )
 
-    def reserve(self, job_id, provider_name, amount_micros, now):
-        """Reserve estimated micros of USD before sending a paid request."""
+    @staticmethod
+    def _budget_day(amount_micros, now):
         _check_whole_number(amount_micros, "Reservation", minimum=1)
         if now.utcoffset() is None:
             raise ValueError("Use a timezone-aware budget time.")
-        day = now.astimezone(ZoneInfo(BUDGET_TIMEZONE)).date().isoformat()
+        return now.astimezone(ZoneInfo(BUDGET_TIMEZONE)).date().isoformat()
+
+    @staticmethod
+    def _require_budget(db, job_id, amount_micros, day, *, daily_amount_micros=None):
+        budgets = db.execute("SELECT daily_micros, video_micros FROM budget_settings").fetchone()
+        daily_used = db.execute(
+            """SELECT COALESCE(SUM(amount_micros), 0) FROM spend_reservations
+                WHERE budget_day = ? AND status <> 'released'""", (day,),
+        ).fetchone()[0]
+        if daily_used + (daily_amount_micros or amount_micros) > budgets["daily_micros"]:
+            raise ValueError("Daily budget is unset or has insufficient funds.")
+        if job_id is not None:
+            video_used = db.execute(
+                """SELECT COALESCE(SUM(amount_micros), 0) FROM spend_reservations
+                    WHERE job_id = ? AND status <> 'released'""", (job_id,),
+            ).fetchone()[0]
+            if video_used + amount_micros > budgets["video_micros"]:
+                raise ValueError("Per-video budget is unset or has insufficient funds.")
+
+    def check_budget(self, job_id, amount_micros, now, *, daily_amount_micros):
+        """Check an estimate without creating a reservation or promising future funds."""
+        day = self._budget_day(amount_micros, now)
+        _check_whole_number(daily_amount_micros, "Daily preflight amount", minimum=1)
+        with self.store._connection() as db:
+            db.execute("BEGIN")
+            self._require_budget(db, job_id, amount_micros, day, daily_amount_micros=daily_amount_micros)
+
+    def reserve(self, job_id, provider_name, amount_micros, now):
+        """Reserve estimated micros of USD before sending a paid request."""
+        day = self._budget_day(amount_micros, now)
         with self.store._connection(write=True) as db:
             if db.execute("SELECT 1 FROM providers WHERE name = ?", (provider_name,)).fetchone() is None:
                 raise LookupError("Provider not found.")
@@ -549,30 +578,7 @@ class StudioSettings:
                 "SELECT 1 FROM jobs WHERE id = ?", (job_id,)
             ).fetchone() is None:
                 raise LookupError("Video job not found.")
-            budgets = db.execute("SELECT daily_micros, video_micros FROM budget_settings").fetchone()
-            daily_used = sum(
-                row[0] for row in db.execute(
-                    """
-                    SELECT amount_micros FROM spend_reservations
-                    WHERE budget_day = ? AND status <> 'released'
-                    """,
-                    (day,),
-                )
-            )
-            if daily_used + amount_micros > budgets["daily_micros"]:
-                raise ValueError("Daily budget is unset or has insufficient funds.")
-            if job_id is not None:
-                video_used = sum(
-                    row[0] for row in db.execute(
-                        """
-                        SELECT amount_micros FROM spend_reservations
-                        WHERE job_id = ? AND status <> 'released'
-                        """,
-                        (job_id,),
-                    )
-                )
-                if video_used + amount_micros > budgets["video_micros"]:
-                    raise ValueError("Per-video budget is unset or has insufficient funds.")
+            self._require_budget(db, job_id, amount_micros, day)
             return db.execute(
                 """
                 INSERT INTO spend_reservations (job_id, provider_name, budget_day, amount_micros)

@@ -11,7 +11,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from app.media_routes import adapter_for, download_artifact, eligible_routes, estimated_micros, local_image
-from app.media_store import MediaStore, can_edit_scene, queue_scene_media, scene_revision
+from app.media_store import MediaStore, can_edit_scene, queue_scene_media, ready_keyframes, scene_revision
 from app.niche import load_profile
 from app.providers import ProviderError, ProviderRequest
 from app.publishing_store import PublishingStore
@@ -23,6 +23,7 @@ from app.studio_library import select_references
 MAX_ATTEMPTS = 3
 DEFAULT_VOICE = "Rachel"
 MAX_ASSET_REFERENCES = 12
+KEYFRAME_AUTO_APPROVAL_SCORE = 85
 EXTENSIONS = {"keyframe": "png", "video": "mp4", "voice": "mp3"}
 QA_SCHEMA = {
     "type": "object",
@@ -57,14 +58,69 @@ class StudioProduction:
                 ("Studio restarted during visual QA. Review the saved preview.",),
             )
 
-    def advance(self, now):
-        self.media.queue_keyframes()
-        tasks = self.media.tasks()[:4]
+    def advance(self, now, *, job_id=None):
+        self.media.queue_keyframes(job_id=job_id, preflight=lambda target, scenes: self._preflight(target, scenes, now))
+        tasks = self.media.tasks(job_id=job_id)[:4]
         if tasks:
             with ThreadPoolExecutor(max_workers=4) as pool:
                 list(pool.map(lambda task: self._process(task, now), tasks))
-        self._render()
-        self._review(now)
+        self._automatic_keyframe_review(now, job_id=job_id)
+        self._render(job_id=job_id)
+        self._review(now, job_id=job_id)
+
+    def _preflight(self, job_id, scenes, now):
+        def estimate(kind, request, message):
+            routes = eligible_routes(self.settings, kind, request)
+            if not routes:
+                raise ValueError(message)
+            return min(estimated_micros(route, request) for route in routes)
+
+        durations = [scene.get("duration") for scene in scenes]
+        if any(type(duration) is not int or duration <= 0 for duration in durations):
+            raise ValueError("The saved scene plan has an invalid scene duration. Edit the prompt to rebuild it.")
+        keyframe_cost = estimate(
+            "keyframe", ProviderRequest(prompt="Keyframe", reference_image="reference"),
+            "Configure an eligible keyframe route and rate in Settings.",
+        )
+        total = len(scenes) * keyframe_cost
+        for duration in sorted(set(durations)):
+            total += durations.count(duration) * estimate(
+                "video", ProviderRequest(prompt="Animate", reference_image="keyframe", duration=duration),
+                f"Configure an enabled animation route with a key and rate that supports {duration}-second scenes at 720p.",
+            )
+        for scene in scenes:
+            for line in spoken_lines(scene):
+                total += estimate(
+                    "voice", ProviderRequest(prompt=line["text"]),
+                    "Configure an eligible voice route and rate in Settings.",
+                )
+        qa_provider, _ = self.planner._claude_configuration(vision=True)
+        total += qa_provider["rate_micros"]
+        self.settings.check_budget(job_id, total, now, daily_amount_micros=keyframe_cost)
+
+    def _automatic_keyframe_review(self, now, *, job_id=None):
+        claim = self.media.claim_automatic_keyframe_review(job_id=job_id)
+        if claim is None:
+            return
+        job, tasks, revision = claim
+        job_id = job["id"]
+        try:
+            scenes = json.loads(job["plan_json"])
+            frames = [self.root / path for path in ready_keyframes(scenes, tasks)]
+            request = self._visual_review_request(job, scenes, frames, keyframes=True)
+            adapter, reservation, key = self.planner._claude(job_id, now, vision=True)
+            try:
+                qa = self._checked_qa_result(self.planner._submit_claude(adapter, key, request, now))
+            finally:
+                self.settings.settle(reservation)
+            if (qa["decision"] == "pass" and qa["score"] >= KEYFRAME_AUTO_APPROVAL_SCORE
+                    and not qa["issues"] and not qa["failed_scene_ids"]):
+                self.media.approve_keyframes(job_id, expected_revision=revision, automatic=True)
+                return
+            reason = "Automatic keyframe review flagged this video. Review the keyframes manually."
+        except (OSError, ProviderError, ValueError) as error:
+            reason = f"Automatic keyframe review needs manual attention. {error}"
+        self.media.hold_automatic_keyframe_review(job_id, revision, reason)
 
     def revise(self, job_id, feedback):
         feedback = feedback.strip()
@@ -366,8 +422,8 @@ class StudioProduction:
                 db.execute("UPDATE jobs SET status = ? WHERE id = ?", (running, job["id"]))
             return job
 
-    def _render(self):
-        job = self._take_job("render_ready", "rendering")
+    def _render(self, *, job_id=None):
+        job = self._take_job("render_ready", "rendering", job_id=job_id)
         if job is None:
             return
         tasks = self.media.job_tasks(job["id"])
@@ -411,17 +467,19 @@ class StudioProduction:
                 except OSError:
                     logging.warning("Could not remove superseded preview file %s", previous)
 
-    def _review(self, now):
-        # Give each pending job one turn before retrying jobs blocked by budget or settings.
-        if not self._qa_round:
-            with self.store._connection() as db:
-                self._qa_round.extend(
-                    row["id"] for row in db.execute("SELECT id FROM jobs WHERE status = 'qa_pending' ORDER BY id")
-                )
-        if not self._qa_round:
-            return
+    def _review(self, now, *, job_id=None):
+        if job_id is None:
+            # Give each pending job one turn before retrying jobs blocked by budget or settings.
+            if not self._qa_round:
+                with self.store._connection() as db:
+                    self._qa_round.extend(
+                        row["id"] for row in db.execute("SELECT id FROM jobs WHERE status = 'qa_pending' ORDER BY id")
+                    )
+            if not self._qa_round:
+                return
+            job_id = self._qa_round.popleft()
 
-        job = self._take_job("qa_pending", "qa_running", job_id=self._qa_round.popleft())
+        job = self._take_job("qa_pending", "qa_running", job_id=job_id)
         if job is None:
             return
         try:
@@ -431,27 +489,12 @@ class StudioProduction:
             return
         submitted = False
         try:
-            profile = self._job_profile(job)
             scenes = json.loads(job["plan_json"])
             path = self.root / job["preview_path"]
             frames = sample_frames(path, path.parent / "qa", scenes)
-            used_assets = {asset_id for scene in scenes for asset_id in scene["characters"] + [scene["place"]] + scene.get("items", [])}
-            cast = [asset for asset in profile["assets"] if asset["id"] in used_assets][:MAX_ASSET_REFERENCES]
-            references = [select_references(asset, "front")[0] for asset in cast]
-            reference_order = ", ".join(asset["id"] for asset in cast)
-            request = ProviderRequest(
-                prompt=qa_prompt(profile, scenes) + f"\nThe initial references match these asset IDs in order: {reference_order}."
-                " The remaining images are scene samples in timeline order. Include failed_scene_ids for visual retries.",
-                reference_images=tuple(local_image(self.library.assets.reference_path(ref)) for ref in references)
-                + tuple(local_image(frame) for frame in frames), output_schema=QA_SCHEMA,
-            )
+            request = self._visual_review_request(job, scenes, frames)
             submitted = True
-            result = self.planner._submit_claude(adapter, key, request, now)
-            qa = result.data
-            if (not isinstance(qa, dict) or qa.get("decision") not in {"pass", "review", "retry"}
-                    or type(qa.get("score")) is not int or not 0 <= qa["score"] <= 100
-                    or not isinstance(qa.get("issues"), list) or not isinstance(qa.get("failed_scene_ids"), list)):
-                raise ValueError("Claude returned invalid visual QA results.")
+            qa = self._checked_qa_result(self.planner._submit_claude(adapter, key, request, now))
         except (OSError, RuntimeError, ValueError) as error:
             self._update_job(job["id"], "needs_review", str(error))
             return
@@ -478,6 +521,37 @@ class StudioProduction:
             else:
                 status = "preview_ready" if qa["decision"] == "pass" and qa["score"] >= 85 else "needs_review"
             db.execute("UPDATE jobs SET status = ?, stage_error = NULL WHERE id = ?", (status, job["id"]))
+
+    def _visual_review_request(self, job, scenes, frames, *, keyframes=False):
+        profile = self._job_profile(job)
+        used_assets = {asset_id for scene in scenes
+                       for asset_id in scene["characters"] + [scene["place"]] + scene.get("items", [])}
+        cast = [asset for asset in profile["assets"] if asset["id"] in used_assets][:MAX_ASSET_REFERENCES]
+        references = [select_references(asset, "front")[0] for asset in cast]
+        reference_order = ", ".join(asset["id"] for asset in cast)
+        if keyframes:
+            review = (
+                " Review only the submitted opening keyframe for each scene in timeline order. "
+                "Assess character identity, setting, continuity and visual suitability. "
+                "Motion, narration, subtitles and pacing are reviewed after rendering. "
+                "Choose review when any keyframe needs human judgment. Include failed_scene_ids for affected scenes."
+            )
+        else:
+            review = " The remaining images are scene samples in timeline order. Include failed_scene_ids for visual retries."
+        return ProviderRequest(
+            prompt=qa_prompt(profile, scenes) + f"\nThe initial references match these asset IDs in order: {reference_order}." + review,
+            reference_images=tuple(local_image(self.library.assets.reference_path(ref)) for ref in references)
+            + tuple(local_image(frame) for frame in frames), output_schema=QA_SCHEMA,
+        )
+
+    @staticmethod
+    def _checked_qa_result(result):
+        qa = result.data
+        if (not isinstance(qa, dict) or qa.get("decision") not in {"pass", "review", "retry"}
+                or type(qa.get("score")) is not int or not 0 <= qa["score"] <= 100
+                or not isinstance(qa.get("issues"), list) or not isinstance(qa.get("failed_scene_ids"), list)):
+            raise ValueError("Claude returned invalid visual QA results.")
+        return qa
 
     def _update_job(self, job_id, status, error):
         with self.store._connection(write=True) as db:

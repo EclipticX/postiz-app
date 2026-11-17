@@ -2,6 +2,7 @@ import json
 import unittest
 from html.parser import HTMLParser
 
+from app.inbox_view import create_page, edit_schedule_page
 from app.library_view import asset_library_section, production_presets_section
 from app.settings_view import settings_page
 from app.web import workspace_page
@@ -143,6 +144,58 @@ class LibraryViewTests(unittest.TestCase):
         self.assertIn('Dialogue: An old line', html)
         queued = workspace_page([], {**_JOB, 'status': 'queued'})
         self.assertIn('Options apply when planning starts.', queued)
+
+    def test_ready_for_review_filter_requires_a_finished_preview(self):
+        jobs = [
+            {**_JOB, 'id': 12, 'title': 'Finished video', 'status': 'preview_ready', 'preview_path': '12/preview.mp4'},
+            {**_JOB, 'id': 13, 'title': 'Missing preview', 'status': 'needs_review'},
+            {**_JOB, 'id': 14, 'title': 'QA review video', 'status': 'needs_review', 'preview_path': '14/preview.mp4'},
+            {**_JOB, 'id': 15, 'title': 'Queued job', 'status': 'queued'},
+        ]
+        html = workspace_page(jobs, status_filter='ready-for-review')
+        self.assertIn('status=ready-for-review" aria-current="page"', html)
+        self.assertIn('Finished video', html)
+        self.assertIn('QA review video', html)
+        self.assertNotIn('Missing preview', html)
+        self.assertNotIn('Queued job', html)
+
+    def test_post_review_uses_saved_draft_and_keeps_draft_only_channel_visible(self):
+        job = {**_JOB, 'status': 'preview_ready', 'preview_path': '12/version.mp4', 'plan_json': '[]',
+               'qa_json': json.dumps({'score': 90, 'issues': ['Check framing']})}
+        post_draft = {
+            'title': 'Garden & forest', 'caption': '<Preview>', 'hashtags': 'story nature',
+            'channels': ['yt'], 'scheduled_at': '2099-01-01T13:00', 'timezone': 'Asia/Dhaka',
+            'channel_times': {'yt': '2099-01-01T14:00'}, 'status': 'ready',
+        }
+        channels = [
+            {'id': 'yt', 'name': 'Video channel', 'identifier': 'youtube', 'can_schedule': True},
+            {'id': 'tt', 'name': 'Shorts channel', 'identifier': 'tiktok', 'can_schedule': False,
+             'schedule_note': 'Postiz drafts only'},
+        ]
+        html = workspace_page([], job, csrf_token='token', channels=channels, post_draft=post_draft)
+        fields = Forms(html).forms['/workspace/12/publish']['fields']
+        self.assertEqual(fields['preview_path']['value'], '12/version.mp4')
+        self.assertEqual(fields['title']['value'], 'Garden & forest')
+        self.assertEqual(fields['hashtags']['value'], 'story nature')
+        self.assertEqual(fields['scheduled_at']['value'], '2099-01-01T13:00')
+        self.assertEqual(fields['scheduled_at.yt']['value'], '2099-01-01T14:00')
+        self.assertNotIn('scheduled_at.tt', fields)
+        self.assertIn('value="yt" checked data-schedule-channel', html)
+        self.assertIn('name="channel" value="tt"', html)
+        self.assertIn('Postiz drafts only', html)
+        self.assertIn('Approve &amp; schedule', html)
+        self.assertIn('Request video revision', html)
+        self.assertIn('&lt;Preview&gt;', html)
+        self.assertIn('src="/media/12/version.mp4"', html)
+        self.assertIn('Check framing', html)
+
+    def test_scheduled_keyframe_approval_is_opt_in_and_editable(self):
+        create = Forms(create_page('token', kind='schedule')).forms['/schedules']['fields']
+        self.assertEqual(create['auto_approve_keyframes_present']['value'], '1')
+        self.assertNotIn('checked', create['auto_approve_keyframes'])
+        schedule = {'id': 3, 'title': 'Studio batch', 'auto_approve_keyframes': True}
+        edit = Forms(edit_schedule_page(schedule, 'token')).forms['/schedules/3/edit']['fields']
+        self.assertIn('checked', edit['auto_approve_keyframes'])
 
 
 if __name__ == '__main__':

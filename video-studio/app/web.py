@@ -2,6 +2,7 @@ import json
 from html import escape
 
 from app.media_store import can_edit_scene, scene_revision
+from app.postiz_client import _safe_release_url
 
 
 def _text(value):
@@ -122,15 +123,24 @@ def _csrf(csrf_token):
     return f'<input type="hidden" name="csrf_token" value="{_text(csrf_token)}">'
 
 
-def _publishing_section(job, posts, channels, metrics, csrf_token):
-    if not (posts or (job.get('preview_path') and job['status'] in ('preview_ready', 'needs_review'))):
+def _ready_for_review(job):
+    return bool(job.get('preview_path') and job['status'] in ('preview_ready', 'needs_review'))
+
+
+def _publishing_section(job, posts, channels, metrics, csrf_token, post_draft, preview, qa, revision):
+    ready = _ready_for_review(job)
+    if not (posts or ready):
         return ''
     job_id = int(job['id'])
-    request_list = ''.join(
-        f'<li>{_text(post["channel_name"])} · {_label(post["status"])} '
-        f'{_text(post.get("error") or "")}</li>' for post in posts
-    )
-    request_html = f'<ul>{request_list}</ul>' if request_list else ''
+    request_list = []
+    for post in posts:
+        url = _safe_release_url(post.get('release_url')) if post['status'] == 'published' else None
+        live_link = f' · <a href="{_text(url)}" rel="noopener noreferrer">Open post</a>' if url else ''
+        request_list.append(
+            f'<li>{_text(post["channel_name"])} · {_label(post["status"])}{live_link} '
+            f'{_text(post.get("error") or "")}</li>'
+        )
+    request_html = f'<h3>Channel delivery</h3><ul>{"".join(request_list)}</ul>' if request_list else ''
     stats = ''.join(
         f'<li>{_text(entry["platform"])} · ' + ' · '.join(
             f'{_label(key)} {_text(value) if value is not None else "unavailable"}'
@@ -138,32 +148,90 @@ def _publishing_section(job, posts, channels, metrics, csrf_token):
         ) + '</li>' for entry in metrics
     )
     stats_html = f'<h4>Post analytics</h4><ul>{stats}</ul>' if stats else ''
-    discover = ''
-    if not channels and job.get('preview_path') and job['status'] in ('preview_ready', 'needs_review'):
-        discover = f'<p><a href="/workspace?job={job_id}&amp;channels=1">Load connected Postiz channels</a></p>'
     form = ''
-    if channels:
-        options = ''.join(f'<option value="{_text(channel["id"])}">{_text(channel["name"])} · '
-                          f'{_text(channel["identifier"])}</option>' for channel in channels)
+    if ready:
+        saved = post_draft or {}
+        draft_status = saved.get('status')
+        draft_notice = ''
+        if saved.get('error'):
+            draft_notice = f'<p class="notice" role="status">{_text(saved["error"])}</p>'
+        elif draft_status in ('pending', 'generating'):
+            draft_notice = '<p class="muted" role="status">Post details are being prepared. You can enter your own.</p>'
+        selected = set(saved.get('channels') or ())
+        channel_times = saved.get('channel_times') or {}
+        deliveries = {post.get('channel_id'): post for post in posts}
+        channel_rows = []
+        allow_scheduling = False
+        allow_draft = False
+        for channel in channels:
+            channel_id = channel['id']
+            delivery = deliveries.get(channel_id)
+            locked = delivery and (delivery['status'] != 'failed' or delivery.get('post_id'))
+            checked = ' checked' if channel_id in selected and not locked else ''
+            channel_name = _text(channel['name'])
+            can_schedule = not locked and channel.get('can_schedule', channel['identifier'] == 'youtube')
+            allow_draft = allow_draft or not locked
+            allow_scheduling = allow_scheduling or can_schedule
+            note = channel.get('schedule_note')
+            if locked:
+                note = 'Delivery already approved.'
+                if delivery['status'] == 'failed':
+                    note = 'Retry this existing delivery in Postiz.'
+            elif delivery:
+                note = 'Handoff failed. Select this channel to try again.'
+            availability = f'<small>{_text(note)}</small>' if note else ''
+            schedule_attr = ' data-schedule-channel' if can_schedule else ''
+            disabled = ' disabled' if locked else ''
+            channel_time = ''
+            if can_schedule:
+                channel_time = f'''
+                <label>{channel_name} publish time <small>(optional)</small>
+                  <input name="scheduled_at.{_text(channel_id)}" type="datetime-local"
+                    value="{_text(channel_times.get(channel_id, ''))}"></label>'''
+            channel_rows.append(f'''
+              <div class="record fields">
+                <div>
+                  <label><input type="checkbox" name="channel" value="{_text(channel_id)}"{checked}{disabled}{schedule_attr}>
+                    {channel_name} · {_text(channel['identifier'])}</label>
+                  {availability}
+                </div>
+                {channel_time}
+              </div>''')
+        destinations = (
+            '<input type="hidden" name="channels_loaded" value="1">'
+            f'<fieldset class="post-review-channels"><legend>Postiz channels</legend>{"".join(channel_rows)}</fieldset>'
+            if channels else f'<p><a href="/workspace?job={job_id}&amp;channels=1">Load connected Postiz channels</a></p>'
+        )
+        draft_button = '<button name="mode" value="draft" type="submit">Send Postiz draft</button>' if allow_draft else ''
+        schedule_button = (
+            '<button class="primary" name="mode" value="schedule" type="submit">Approve &amp; schedule</button>'
+            if allow_scheduling else ''
+        )
         form = f'''
-        <form class="stack" method="post" action="/workspace/{job_id}/publish">
+        <form class="stack" method="post" action="/workspace/{job_id}/publish" data-post-review>
           {_csrf(csrf_token)}
           <input type="hidden" name="preview_path" value="{_text(job['preview_path'])}">
-          <label>Channel<select name="channel" required>{options}</select></label>
-          <label>Title<input name="title" value="{_text(job['title'])}" maxlength="100" required></label>
-          <label>Caption<textarea name="caption" rows="3"></textarea></label>
-          <label>Hashtags<input name="hashtags" placeholder="#animation #story"></label>
+          {draft_notice}
+          <label>Title<input name="title" value="{_text(saved.get('title', job['title']))}" maxlength="100" required></label>
+          <label>Description<textarea name="caption" rows="3">{_text(saved.get('caption', ''))}</textarea></label>
+          <label>Hashtags<input name="hashtags" value="{_text(saved.get('hashtags', ''))}" placeholder="#animation #story"></label>
           <div class="fields">
-            <label>Schedule date and time<input name="scheduled_at" type="datetime-local"></label>
-            <label>Time zone<input name="timezone" value="Asia/Dhaka"></label>
+            <label>Publish at<input name="scheduled_at" type="datetime-local" value="{_text(saved.get('scheduled_at', ''))}"></label>
+            <label>Time zone<input name="timezone" value="{_text(saved.get('timezone', 'Asia/Dhaka'))}"></label>
           </div>
-          <small>Drafts are available for all four platforms. Studio can schedule a public YouTube post.</small>
+          {destinations}
           <div class="actions">
-            <button name="mode" value="draft" type="submit">Approve draft</button>
-            <button class="primary" name="mode" value="schedule" type="submit">Approve public YouTube schedule</button>
+            <button type="submit" formaction="/workspace/{job_id}/save-post-draft">Save review draft</button>
+            {draft_button}
+            {schedule_button}
           </div>
+          <small role="status" data-post-review-notice hidden></small>
         </form>'''
-    return f'<section class="panel records"><h2>Publishing</h2>{request_html}{stats_html}{discover}{form}</section>'
+    review = f'<div class="columns"><div>{preview}{qa}{revision}</div>{form}</div>' if ready else ''
+    heading = 'Post review' if ready else 'Publishing'
+    panel_spacing = 'post-review' if ready else 'records'
+    anchor = ' id="post-review"' if ready else ''
+    return f'<section class="panel {panel_spacing}"{anchor}><h2>{heading}</h2>{review}{request_html}{stats_html}</section>'
 
 
 def _scene_dialogue(scene, asset_names):
@@ -183,6 +251,7 @@ def _scene_dialogue(scene, asset_names):
 def workspace_page(
     jobs, job=None, notice='', tasks=(), csrf_token='', *, posts=(), channels=(), metrics=(),
     assets=(), presets=(), production_options=None, production_options_open=False, brand_profiles=None,
+    status_filter='', post_draft=None,
 ) -> str:
     if job is not None:
         from app.library_view import production_options_section
@@ -211,6 +280,8 @@ def workspace_page(
             for task in tasks if task['error']
         )
         actions = ''
+        revision = ''
+        ready = _ready_for_review(job)
         if job['status'] in ('queued', 'paused', 'needs_review') and not job.get('preview_path'):
             actions += f'''
             <form method="post" action="/workspace/{int(job['id'])}/generate" class="actions">
@@ -225,11 +296,11 @@ def workspace_page(
               <button class="primary" type="submit">Generate video</button>
             </form>'''
         if job['status'] in ('review_keyframes', 'preview_ready', 'needs_review'):
-            actions += f'''
+            revision = f'''
             <form method="post" action="/workspace/{int(job['id'])}/revise" class="stack records">
               {_csrf(csrf_token)}<label for="revision">Revision feedback</label>
               <textarea id="revision" name="feedback" rows="3" maxlength="4000" required></textarea>
-              <button type="submit">Revise</button>
+              <button type="submit">Request video revision</button>
             </form>'''
         media_tasks = [task for task in tasks if task['kind'] in ('video', 'voice')]
         if (job['status'] == 'needs_review' and not job.get('preview_path') and media_tasks
@@ -288,7 +359,13 @@ def workspace_page(
           </form>
         </dialog>'''
 
+        scene_review = f'<p><a href="#scene-plan">{scene_link}s</a></p>' if scenes_html else ''
+        publishing = _publishing_section(
+            job, posts, channels, metrics, csrf_token, post_draft, preview_html, qa_html + error_html,
+            scene_review + revision,
+        )
         content = f'''
+        {publishing if ready else ''}
         <section class="panel" aria-labelledby="job-heading">
           <div class="record-title">
             <h2 id="job-heading">{_text(job['title'])}</h2>
@@ -296,38 +373,49 @@ def workspace_page(
           </div>
           <h3>Production prompt</h3>
           <p class="prompt">{_text(job['prompt'])}</p>
-          {error_html}
+          {error_html if not ready else ''}
           {production_options_section(job, assets, presets, production_options, csrf_token, expanded=production_options_open, brand_profiles=brand_profiles)}
-          {'<h3>Scene plan</h3><ol>' + scenes_html + '</ol>' if scenes_html else ''}
+          {'<h3 id="scene-plan">Scene plan</h3><ol>' + scenes_html + '</ol>' if scenes_html else ''}
           {'<h3>Keyframes</h3><div class="keyframes">' + frames + '</div>' if frames else ''}
           {'<ul class="notice">' + errors + '</ul>' if errors else ''}
-          {preview_html}
-          {qa_html}
+          {preview_html + qa_html + revision if not ready else ''}
           {actions}
         </section>
         {edit_dialog}
-        {_publishing_section(job, posts, channels, metrics, csrf_token)}'''
+        {publishing if not ready else ''}'''
         return _page(
             job['title'], '/workspace', content, notice,
             breadcrumb='<a href="/workspace">← All video jobs</a>',
             heading_action=heading_action,
         )
     else:
+        ready_only = status_filter == 'ready-for-review'
+        visible_jobs = [job for job in jobs if _ready_for_review(job)] if ready_only else jobs
+        current = ' aria-current="page"'
+        filters = ''.join(
+            f'<a href="{path}"{current if selected else ""}>{label}</a>'
+            for path, label, selected in (
+                ('/workspace', 'All jobs', not ready_only),
+                ('/workspace?status=ready-for-review', 'Ready for review', ready_only),
+            )
+        )
         jobs_html = ''.join(
             f'''<li class="record-title">
               <a href="/workspace?job={int(item['id'])}">{_text(item['title'])}</a>
-              <span class="status">{_label(item['status'])}</span>
+              <span class="status">{'Ready for review' if item['status'] == 'preview_ready' else _label(item['status'])}</span>
             </li>'''
-            for item in jobs
+            for item in visible_jobs
         )
+        empty = ('Finished videos ready for review will appear here.' if ready_only
+                 else 'Accepted ideas and prompts from active schedules will appear here.')
         job_list = (
             f'<ul class="job-list">{jobs_html}</ul>' if jobs_html
-            else '<p class="muted">Accepted ideas and prompts from active schedules will appear here.</p>'
+            else f'<p class="muted">{empty}</p>'
         )
         content = f'''
-        <p class="intro">Track approved prompts as they move through production.</p>
         <section class="panel" aria-labelledby="jobs-heading">
           <h2 id="jobs-heading">Video jobs</h2>
+          <nav class="inbox-create-types" aria-label="Video job filters">{filters}</nav>
           {job_list}
         </section>'''
     return _page(

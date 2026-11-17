@@ -120,6 +120,9 @@ button, .button-link {
 button:hover, .button-link:hover { background: var(--selected); text-decoration: none; }
 button.primary, .button-link.primary { background: var(--primary); border-color: var(--primary); color: white; }
 button.primary:hover, .button-link.primary:hover { background: #4c1cae; }
+[data-post-review] button:disabled { cursor: not-allowed; opacity: .65; }
+.post-review { margin-bottom: 1.25rem; }
+.post-review-channels { min-width: 0; margin: 0; border: 1px solid var(--border); border-radius: .5rem; }
 
 .records { margin-top: 1.25rem; }
 .record, .job-list li { border-top: 1px solid var(--border); padding-block: .75rem; }

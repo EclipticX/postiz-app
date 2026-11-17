@@ -128,7 +128,7 @@ class StudioHTTPTest(unittest.TestCase):
     def request(self, method, path, fields=None, headers=None, *, payload=None, binary=False):
         headers = dict(headers or {})
         if fields is not None:
-            payload = urlencode(fields)
+            payload = urlencode(fields, doseq=True)
             headers["Content-Type"] = "application/x-www-form-urlencoded"
         connection = HTTPConnection("127.0.0.1", self.port, timeout=2)
         try:
@@ -232,6 +232,7 @@ class StudioHTTPTest(unittest.TestCase):
         posts.finish(youtube, "youtube-post")
         self.assertEqual(self.request("GET", detail)[0], 404)
         self.assertNotIn("A garden video", self.request("GET", "/published-posts")[1])
+        posts.record_postiz_state(youtube, "PUBLISHED", None, release)
         posts.record_analytics(youtube, {"views": 20, "likes": 3, "comments": 0}, release)
 
         instagram = posts.queue(
@@ -239,6 +240,7 @@ class StudioHTTPTest(unittest.TestCase):
         )
         posts.next_request()
         posts.finish(instagram, "instagram-post")
+        posts.record_postiz_state(instagram, "PUBLISHED", None, release)
         posts.record_analytics(instagram, {"views": 10, "likes": 2, "comments": None}, release)
         with self.store._connection(write=True) as db:
             db.execute("UPDATE jobs SET preview_path = ? WHERE id = ?", (f"{job_id}/new-preview.mp4", job_id))
@@ -506,6 +508,50 @@ class StudioHTTPTest(unittest.TestCase):
         with self.store._connection() as db:
             previews = db.execute("SELECT preview_path FROM publishing_requests").fetchall()
         self.assertEqual([row["preview_path"] for row in previews], [replacement])
+
+    def test_saved_review_draft_schedules_selected_channels_at_their_own_times(self):
+        self.store.create_direct_job("Still queued", "Unfinished video fixture")
+        job = self.store.create_direct_job("A story about a seed", "Ready video fixture")
+        preview = f"{job}/preview.first.mp4"
+        with self.store._connection(write=True) as db:
+            db.execute("UPDATE jobs SET status = 'preview_ready', preview_path = ? WHERE id = ?", (preview, job))
+
+        channels = [
+            {"id": "yt", "identifier": "youtube", "name": "YouTube", "can_schedule": True},
+            {"id": "ig", "identifier": "instagram", "name": "Instagram", "can_schedule": True},
+        ]
+        fields = {
+            "preview_path": preview, "title": "Reviewed title", "caption": "Edited description", "hashtags": "#garden",
+            "channels_loaded": "1", "channel": ["yt", "ig"], "timezone": "Asia/Dhaka",
+            "scheduled_at": "2099-11-19T15:00", "scheduled_at.ig": "2099-11-19T17:00",
+        }
+        _, listing = self.request("GET", "/workspace?status=ready-for-review")
+        self.assertIn("Ready video fixture", listing)
+        self.assertNotIn("Unfinished video fixture", listing)
+        with patch("app.publishing.StudioPublishing.channels", return_value=channels):
+            self.assertEqual(self.post(f"/workspace/{job}/save-post-draft", **fields), 303)
+            _, review = self.request("GET", f"/workspace?job={job}")
+            self.assertIn("Edited description", review)
+            self.assertIn(f'src="/media/{preview}"', review)
+            self.assertIn('name="channel" value="ig" checked', review)
+            self.assertEqual(PublishingStore(self.store).job_posts(job), [])
+            self.assertEqual(self.post(f"/workspace/{job}/publish", mode="schedule", **fields), 303)
+            _, review = self.request("GET", f"/workspace?job={job}")
+            self.assertIn('name="channel" value="ig" disabled', review)
+            self.assertIn('name="channel" value="yt" disabled', review)
+        posts = {post["channel_id"]: post for post in PublishingStore(self.store).job_posts(job)}
+        self.assertEqual(set(posts), {"yt", "ig"})
+        self.assertEqual(datetime.fromisoformat(posts["yt"]["scheduled_at"]), datetime(2099, 11, 19, 9, tzinfo=timezone.utc))
+        self.assertEqual(datetime.fromisoformat(posts["ig"]["scheduled_at"]), datetime(2099, 11, 19, 11, tzinfo=timezone.utc))
+        self.assertTrue(all(post["preview_path"] == preview for post in posts.values()))
+
+    def test_workspace_generate_targets_selected_queued_job(self):
+        other = self.store.create_direct_job("First prompt", "Older job")
+        selected = self.store.create_direct_job("Second prompt", "Selected job")
+        status = self.post(f"/workspace/{selected}/generate")
+        self.assertEqual(status, 400)
+        self.assertIsNone(self.store.get_job(other)["stage_error"])
+        self.assertIn("Claude", self.store.get_job(selected)["stage_error"])
 
     @REQUIRES_FFMPEG
     def test_character_profile_upload_and_per_video_options_through_http(self):

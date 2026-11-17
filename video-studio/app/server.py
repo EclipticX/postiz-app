@@ -25,6 +25,7 @@ from app.inbox_view import create_page, edit_idea_page, edit_schedule_page, inbo
 from app.media_store import can_edit_scene, scene_revision
 from app.niche import load_profile
 from app.planning import StudioPlanner
+from app.post_drafts import StudioPostDrafts
 from app.postiz_client import PostizError
 from app.preset_view import presets_page
 from app.production import StudioProduction
@@ -134,6 +135,7 @@ class StudioServer(ThreadingHTTPServer):
         self.settings = StudioSettings(store, store.path.parent / ".env")
         self.settings.seed()
         self.planning = StudioPlanner(store, self.settings)
+        self.post_drafts = StudioPostDrafts(store, self.planning)
         self.library = self.planning.library
         self.production = StudioProduction(store, self.settings, self.planning)
         self.publishing = StudioPublishing(
@@ -330,7 +332,8 @@ class StudioHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
-    def _show_workspace(self, job=None, status=HTTPStatus.OK, notice="", discover=False, *, options_override=None):
+    def _show_workspace(self, job=None, status=HTTPStatus.OK, notice="", discover=False, *, options_override=None,
+                        status_filter="", post_draft_override=None):
         tasks = self.server.production.media.job_tasks(job["id"]) if job else ()
         posts, metrics, channels = (), (), ()
         assets, presets, options = (), (), None
@@ -355,6 +358,8 @@ class StudioHandler(BaseHTTPRequestHandler):
             posts=posts, channels=channels, metrics=metrics, assets=assets, presets=presets, production_options=options,
             production_options_open=options_override is not None,
             brand_profiles=self.server.store.list_brand_profiles(),
+            status_filter=status_filter,
+            post_draft=post_draft_override if post_draft_override is not None else self.server.post_drafts.get(job),
         ))
 
     def _show_scene_editor(self, job_id, scene_id, status=HTTPStatus.OK, notice="", *, values=None):
@@ -593,7 +598,8 @@ class StudioHandler(BaseHTTPRequestHandler):
                 if job is None:
                     self.send_error(HTTPStatus.NOT_FOUND)
                     return
-            self._show_workspace(job, discover=params.get("channels") == ["1"])
+            self._show_workspace(job, discover=params.get("channels") == ["1"],
+                                 status_filter=params.get("status", [""])[0])
         elif url.path == "/workspace/create":
             self._reply(HTTPStatus.OK, new_video_page(
                 self.server.csrf_token,
@@ -772,7 +778,10 @@ class StudioHandler(BaseHTTPRequestHandler):
         preset_default = re.fullmatch(rf"/settings/presets/(visual|script|subtitle|audio)/({ASSET_ID})/default", path)
         brand_default = BRAND_DEFAULT.fullmatch(path)
         brand_delete = BRAND_DELETE.fullmatch(path)
-        workspace_route = re.fullmatch(r"/workspace/(\d{1,18})/(generate|approve-keyframes|retry-render|revise|publish|options|pause|resume|edit|delete)", path)
+        workspace_route = re.fullmatch(
+            r"/workspace/(\d{1,18})/(generate|approve-keyframes|retry-render|revise|save-post-draft|publish|options|pause|resume|edit|delete)",
+            path,
+        )
         scene_route = WORKSPACE_SCENE.fullmatch(path)
         store = self.server.store
         settings = self.server.settings
@@ -781,6 +790,7 @@ class StudioHandler(BaseHTTPRequestHandler):
         niche_id = "kids_3d"
         in_settings = path.startswith("/settings/")
         options = None
+        post_draft = None
         try:
             if path == "/ideas":
                 if field("action") == "generate":
@@ -847,6 +857,7 @@ class StudioHandler(BaseHTTPRequestHandler):
                     prompts, field("start_date"), field("run_at"),
                     field("timezone"), int(daily_limit), title=title or None,
                     brand_id=field("brand_id") or None,
+                    auto_approve_keyframes=field("auto_approve_keyframes") == "1",
                 )
             elif schedule_status:
                 store.set_schedule_status(int(schedule_status[1]), field("status"))
@@ -857,6 +868,8 @@ class StudioHandler(BaseHTTPRequestHandler):
                 store.update_schedule(
                     int(schedule_edit[1]), field("title"), field("start_date"), field("run_at"),
                     field("timezone"), int(daily_limit), brand_id=field("brand_id") or None,
+                    auto_approve_keyframes=(field("auto_approve_keyframes") == "1"
+                                            if field("auto_approve_keyframes_present") == "1" else None),
                 )
             elif inbox_archive:
                 action = field("action")
@@ -971,24 +984,24 @@ class StudioHandler(BaseHTTPRequestHandler):
                     job = store.get_job(job_id)
                     if job is None:
                         raise LookupError("Video job not found.")
+                    now = datetime.now(timezone.utc)
                     if job["status"] == "paused":
                         store.resume_job(job_id)
                     if job["status"] == "review_keyframes":
                         self.server.production.media.approve_keyframes(job_id, expected_revision=field("revision") or None)
-                        self.server.production.advance(datetime.now(timezone.utc))
-                    elif job["status"] in ("queued", "needs_review", "paused"):
-                        with store._connection(write=True) as db:
-                            db.execute("UPDATE jobs SET stage_error = NULL WHERE id = ?", (job_id,))
-                        now = datetime.now(timezone.utc)
-                        self.server.planning.process_plan(now)
-                        self.server.production.advance(now)
-                        updated_job = store.get_job(job_id)
-                        if updated_job and updated_job.get("stage_error"):
-                            raise ValueError(updated_job["stage_error"])
+                    elif job["status"] in ("queued", "paused"):
+                        self.server.planning.process_plan(now, job_id=job_id)
+                    else:
+                        raise ValueError("Review the current job status before starting another generation step.")
+                    self.server.production.advance(now, job_id=job_id)
+                    updated_job = store.get_job(job_id)
+                    if updated_job and updated_job.get("stage_error"):
+                        raise ValueError(updated_job["stage_error"])
                 elif action == "approve-keyframes":
                     self.server.production.media.approve_keyframes(job_id, expected_revision=field("revision"))
                 elif action == "retry-render":
                     self.server.production.retry_render(job_id)
+                    self.server.production.advance(datetime.now(timezone.utc), job_id=job_id)
                 elif action == "pause":
                     store.pause_job(job_id)
                 elif action == "resume":
@@ -1005,14 +1018,28 @@ class StudioHandler(BaseHTTPRequestHandler):
                                for group, prefix in (("presets", "preset."), ("variants", "variant."), ("voices", "voice."))}
                     options["characters"] = sorted(set(form.get("characters", [])))
                     self.server.production.configure(job_id, options)
-                elif action == "publish":
+                elif action in ("save-post-draft", "publish"):
+                    post_draft = {
+                        "title": field("title").strip(), "caption": field("caption").strip(),
+                        "hashtags": field("hashtags").strip(), "scheduled_at": field("scheduled_at"),
+                        "timezone": field("timezone") or "Asia/Dhaka", "channels": form.get("channel", []),
+                        "channel_times": {name.removeprefix("scheduled_at."): field(name) for name in form
+                                          if name.startswith("scheduled_at.") and field(name)},
+                    }
+                    if action == "save-post-draft":
+                        self.server.post_drafts.save(job_id, field("preview_path"), post_draft,
+                                                     preserve_destinations=field("channels_loaded") != "1")
+                        self._redirect(f"/workspace?job={job_id}#post-review")
+                        return
                     mode = field("mode")
                     if mode not in ("draft", "schedule"):
                         raise ValueError("Choose to create a draft or schedule a post.")
-                    self.server.publishing.approve(
-                        job_id, field("channel"), field("title").strip(), field("caption").strip(),
-                        field("hashtags"), field("scheduled_at"), field("timezone"), mode == "draft",
+                    self.server.post_drafts.save(job_id, field("preview_path"), post_draft)
+                    self.server.publishing.approve_channels(
+                        job_id, post_draft["channels"], post_draft["title"], post_draft["caption"],
+                        post_draft["hashtags"], post_draft["scheduled_at"], post_draft["timezone"], mode == "draft",
                         expected_preview_path=field("preview_path"),
+                        channel_times=post_draft["channel_times"],
                     )
                 else:
                     self.server.production.revise(job_id, field("feedback"))
@@ -1041,7 +1068,7 @@ class StudioHandler(BaseHTTPRequestHandler):
                                         values=scene_values)
             elif workspace_route:
                 self._show_workspace(store.get_job(job_id), HTTPStatus.BAD_REQUEST, str(error),
-                                     discover=workspace_route[2] == "publish", options_override=options)
+                                     options_override=options, post_draft_override=post_draft)
             elif path == "/workspace/create":
                 self._reply(HTTPStatus.BAD_REQUEST, new_video_page(
                     self.server.csrf_token,
@@ -1050,7 +1077,8 @@ class StudioHandler(BaseHTTPRequestHandler):
                     brand_profiles=self.server.store.list_brand_profiles(),
                 ))
             elif create_kind:
-                fields = ("title", "prompt", "trends", "prompts", "start_date", "run_at", "timezone", "daily_limit", "brand_id")
+                fields = ("title", "prompt", "trends", "prompts", "start_date", "run_at", "timezone", "daily_limit",
+                          "brand_id", "auto_approve_keyframes")
                 self._reply(HTTPStatus.BAD_REQUEST, create_page(
                     self.server.csrf_token, kind=create_kind, values={name: field(name) for name in fields},
                     notice=str(error), brand_profiles=self.server.store.list_brand_profiles(),
@@ -1129,6 +1157,7 @@ def run_schedule_clock(server, stopped):
         ("scene planning", server.planning.process_plan),
         ("media production", server.production.advance),
         ("publishing", server.publishing.process),
+        ("post copy", server.post_drafts.prepare),
     )
     while not stopped.is_set():
         for name, process in stages:
@@ -1154,6 +1183,7 @@ def main():
         server.planning.recover_interrupted()
         server.production.recover_interrupted()
         server.publishing.posts.recover_interrupted()
+        server.post_drafts.recover_interrupted()
         clock = threading.Thread(target=run_schedule_clock, args=(server, stopped), daemon=True)
         clock.start()
         logging.info("Studio is listening on port %s", server.server_port)

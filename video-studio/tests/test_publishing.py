@@ -122,6 +122,18 @@ class PublishingFlowTests(unittest.TestCase):
             post, = self.publishing.posts.job_posts(self.job)
             self.assertEqual(post["status"], "failed")
 
+    def test_missed_handoff_is_recorded_when_postiz_is_disabled(self):
+        self.set_preview()
+        with patch("app.publishing.PostizClient") as cls:
+            cls.return_value.channels.return_value = [{"id": "youtube", "identifier": "youtube", "name": "YouTube"}]
+            self.approve("youtube", False)
+            self.publishing.settings.update_platform_categories("POSTIZ_API_KEY", [])
+            self.publishing.process(datetime(2099, 1, 2, tzinfo=timezone.utc))
+            cls.return_value.upload.assert_not_called()
+            post, = self.publishing.posts.job_posts(self.job)
+            self.assertEqual(post["status"], "failed")
+            self.assertIn("time passed", post["error"])
+
     def test_schedule_expiring_during_upload_does_not_create_post(self):
         self.set_preview()
         scheduled = datetime(2099, 1, 1, 3, tzinfo=timezone.utc)
@@ -140,3 +152,50 @@ class PublishingFlowTests(unittest.TestCase):
             post, = self.publishing.posts.job_posts(self.job)
             self.assertEqual(post["status"], "failed")
             self.assertIn("time passed", post["error"])
+
+    def test_multi_channel_schedule_uses_overrides_and_confirms_each_release(self):
+        self.set_preview()
+        with patch("app.publishing.PostizClient") as cls:
+            client = cls.return_value
+            client.channels.return_value = [
+                {"id": name, "identifier": name, "name": name.title()}
+                for name in ("youtube", "facebook", "instagram", "tiktok")
+            ]
+            base = (self.job, "Garden story", "Caption", "#garden", "2099-01-01T09:00", "Asia/Dhaka", False)
+            channel_selection = ["youtube", "facebook", "instagram"]
+            options = {
+                "channel_times": {"facebook": "2099-01-01T10:00"},
+                "expected_preview_path": f"{self.job}/preview.mp4",
+            }
+            with self.assertRaisesRegex(ValueError, "approved Direct Post"):
+                self.publishing.approve_channels(base[0], [*channel_selection, "tiktok"], *base[1:], **options)
+            self.assertEqual(self.publishing.posts.job_posts(self.job), [])
+            self.assertFalse(self.publishing.channels()[-1]["can_schedule"])
+
+            ids = self.publishing.approve_channels(base[0], channel_selection, *base[1:], **options)
+            self.assertEqual(ids, self.publishing.approve_channels(base[0], channel_selection, *base[1:], **options))
+            client.upload.return_value = {"id": "uploaded", "path": "https://cdn.example.com/media.mp4"}
+            client.create_post.side_effect = ["yt", "fb", "ig"]
+            for _ in ids:
+                self.publishing.process(NOW)
+            self.assertEqual(
+                [call.args[5] for call in client.create_post.call_args_list],
+                ["2099-01-01T03:00:00.000000+00:00", "2099-01-01T04:00:00.000000+00:00",
+                 "2099-01-01T03:00:00.000000+00:00"],
+            )
+            self.assertEqual(client.create_post.call_count, 3)
+
+            client.post_status.side_effect = [
+                ("PUBLISHED", "https://www.youtube.com/shorts/garden"),
+                ("PUBLISHED", "https://www.instagram.com/reel/garden"),
+                ("ERROR", None),
+            ]
+            client.analytics.return_value = []
+            self.publishing.process(datetime(2099, 1, 1, 4, tzinfo=timezone.utc))
+            youtube, facebook, instagram = self.publishing.posts.job_posts(self.job)
+            self.assertEqual([youtube["status"], facebook["status"], instagram["status"]],
+                             ["published", "failed", "published"])
+            self.assertIn("publishing failure", facebook["error"])
+            self.assertEqual(youtube["release_url"], "https://www.youtube.com/shorts/garden")
+            self.assertEqual(self.publishing.original_post_url(instagram), "https://www.instagram.com/reel/garden")
+            client.original_post_url.assert_not_called()

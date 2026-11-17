@@ -1,6 +1,24 @@
 // studio.js - Shared UI interactions for Video Studio
 
 document.addEventListener('DOMContentLoaded', () => {
+  const postReview = document.querySelector('[data-post-review]');
+  if (postReview) {
+    const channels = postReview.querySelectorAll('input[name="channel"]');
+    const draft = postReview.querySelector('button[value="draft"]');
+    const schedule = postReview.querySelector('button[value="schedule"]');
+    const notice = postReview.querySelector('[data-post-review-notice]');
+    const updateActions = () => {
+      const selected = Array.from(channels).filter((channel) => channel.checked);
+      const draftOnly = selected.some((channel) => !channel.hasAttribute('data-schedule-channel'));
+      if (draft) draft.disabled = selected.length === 0;
+      if (schedule) schedule.disabled = selected.length === 0 || draftOnly;
+      notice.hidden = !draftOnly || !schedule;
+      notice.textContent = notice.hidden ? '' : 'Select channels that support scheduling, or send a Postiz draft.';
+    };
+    channels.forEach((channel) => channel.addEventListener('change', updateActions));
+    updateActions();
+  }
+
   // Close any open action menu when clicking outside
   document.addEventListener('click', (event) => {
     document.querySelectorAll('.action-menu[open]').forEach((menu) => {

@@ -167,10 +167,11 @@ def create_page(csrf_token, *, kind='manual', values=None, notice='', brand_prof
         <small id="inbox-prompts-help">Paste up to 100 prompts, one per line.</small>
         <div class="fields">
           <label>Start date<input name="start_date" type="date" value="{_text(values.get('start_date', ''))}" required></label>
-          <label>Daily time<input name="run_at" type="time" value="{_text(values.get('run_at', '09:00'))}" required></label>
+          <label>Generate at<input name="run_at" type="time" value="{_text(values.get('run_at', '09:00'))}" required></label>
           <label>Time zone<input name="timezone" value="{_text(values.get('timezone', 'Asia/Dhaka'))}" required></label>
           <label>Videos per day<input name="daily_limit" type="number" min="1" max="100" value="{_text(values.get('daily_limit', '1'))}" required></label>
-        </div>'''
+        </div>
+        {_keyframe_approval_control(values.get('auto_approve_keyframes'))}'''
     elif kind == 'claude':
         route, button = '/ideas/generate', 'Generate with Claude'
         fields = f'''
@@ -196,17 +197,27 @@ def create_page(csrf_token, *, kind='manual', values=None, notice='', brand_prof
     </section>''', notice)
 
 
+def _keyframe_approval_control(enabled):
+    checked = ' checked' if enabled in (True, '1') else ''
+    return f'''
+      <input name="auto_approve_keyframes_present" type="hidden" value="1">
+      <label><input name="auto_approve_keyframes" type="checkbox" value="1"{checked}>
+        Automatically approve keyframes that pass visual QA</label>
+      <small>Applies to scheduled videos. Review and approve the finished post before publishing.</small>'''
+
+
 def _schedule_details(record):
     progress = record['progress']
-    counts = ''.join(f'<div><dt>{label}</dt><dd>{int(progress[key])}</dd></div>' for key, label in (
+    counts = ''.join(f'<div><dt>{label}</dt><dd>{int(progress.get(key, 0))}</dd></div>' for key, label in (
         ('pending', 'Pending'), ('queued', 'Queued'), ('waiting', 'Waiting for review'),
-        ('completed', 'Completed'), ('failed', 'Failed'),
+        ('preview_ready', 'Ready for review'), ('completed', 'Completed'), ('failed', 'Failed'),
     ))
     prompts = []
     for entry in record['entries']:
         job = entry['job_id']
         job_link = f' · <a href="/workspace?job={int(job)}">Open job</a>' if job is not None else ''
-        prompts.append(f'<li><span class="prompt">{_text(entry["prompt"])}</span><small>{_label(entry["status"])}{job_link}</small></li>')
+        status = 'Ready for review' if entry['status'] == 'preview_ready' else _label(entry['status'])
+        prompts.append(f'<li><span class="prompt">{_text(entry["prompt"])}</span><small>{status}{job_link}</small></li>')
     return f'''
     <section class="record" aria-labelledby="inbox-batch-heading">
       <h2 id="inbox-batch-heading">Batch prompts</h2>
@@ -263,7 +274,10 @@ def record_page(record, csrf_token, *, notice=''):
     ]
     if is_schedule:
         start = f'{_text(record["start_date"])} · {_text(record["run_at"])} {_text(record["timezone"])}'
-        metadata.extend((('Production start', start), ('Videos per day', int(record['daily_limit']))))
+        approval = 'Automatic after visual QA' if record.get('auto_approve_keyframes') else 'Manual'
+        metadata.extend((
+            ('Production start', start), ('Videos per day', int(record['daily_limit'])), ('Keyframe approval', approval),
+        ))
         if record['status'] == 'approved':
             metadata.append(('Schedule state', _label(record['schedule_status'])))
         details = _schedule_details(record)
@@ -350,6 +364,7 @@ def edit_schedule_page(record, csrf_token, *, notice='', brand_profiles=None, va
     run_at = _text(values.get('run_at', record.get('run_at', '09:00')))
     timezone = _text(values.get('timezone', record.get('timezone', 'Asia/Dhaka')))
     daily_limit = _text(values.get('daily_limit', str(record.get('daily_limit', '1'))))
+    auto_approve = values.get('auto_approve_keyframes', record.get('auto_approve_keyframes'))
     brand_select = ''
     if brand_profiles:
         selected_brand = values.get('brand_id', record.get('brand_id') or '')
@@ -369,10 +384,11 @@ def edit_schedule_page(record, csrf_token, *, notice='', brand_profiles=None, va
         <label>Title<input name="title" value="{title}" maxlength="100" required></label>
         <div class="fields">
           <label>Start date<input name="start_date" type="date" value="{start_date}" required></label>
-          <label>Daily time<input name="run_at" type="time" value="{run_at}" required></label>
+          <label>Generate at<input name="run_at" type="time" value="{run_at}" required></label>
           <label>Time zone<input name="timezone" value="{timezone}" required></label>
           <label>Videos per day<input name="daily_limit" type="number" min="1" max="100" value="{daily_limit}" required></label>
         </div>
+        {_keyframe_approval_control(auto_approve)}
         <div class="actions">
           <button type="submit" class="primary">Save changes</button>
           <a class="button-link" href="/schedules/{int(record['id'])}">Cancel</a>

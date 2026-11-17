@@ -76,6 +76,94 @@ class ProductionTests(unittest.TestCase):
         path.write_bytes(b"media fixture")
         return path
 
+    def prepare_scheduled_job(self, *, auto_approve_keyframes):
+        plan_json = self.store.get_job(self.job)["plan_json"]
+        schedule = self.store.create_schedule(
+            ["Scheduled garden video"], "2026-11-09", "09:00", "Asia/Dhaka", 1,
+            auto_approve_keyframes=auto_approve_keyframes,
+        )
+        self.store.set_schedule_status(schedule, "active")
+        self.store.dispatch_due(NOW)
+        job = self.store.list_jobs()[0]["id"]
+        with self.store._connection(write=True) as db:
+            db.execute("UPDATE jobs SET status = 'planned', plan_json = ? WHERE id = ?", (plan_json, job))
+        return job, schedule
+
+    def test_targeted_production_runs_only_the_selected_job(self):
+        selected, _ = self.prepare_scheduled_job(auto_approve_keyframes=False)
+        with patch("app.production.adapter_for", self.adapter), \
+                patch("app.production.local_image", return_value=FRAME), \
+                patch("app.production.download_artifact", side_effect=lambda url, path, kind: self.write_fixture(path)):
+            self.production.advance(NOW, job_id=selected)
+
+        self.assertEqual(self.store.get_job(self.job)["status"], "planned")
+        self.assertEqual(self.production.media.job_tasks(self.job), [])
+        self.assertEqual(self.store.get_job(selected)["status"], "review_keyframes")
+        self.assertEqual([name for name, _ in self.requests], ["fal-nano-banana-pro"])
+
+    def test_generation_preflight_blocks_incompatible_animation_and_insufficient_budget(self):
+        plan = json.loads(self.store.get_job(self.job)["plan_json"])
+        plan[0]["duration"] = 5
+        with self.store._connection(write=True) as db:
+            db.execute("UPDATE jobs SET plan_json = ? WHERE id = ?", (json.dumps(plan), self.job))
+        self.settings.set_key("EVOLINK_API_KEY", None)
+        with patch("app.production.adapter_for") as provider:
+            self.production.advance(NOW, job_id=self.job)
+            self.assertIn("5-second scenes", self.store.get_job(self.job)["stage_error"])
+            self.assertEqual(self.store.get_job(self.job)["status"], "planned")
+
+            self.settings.set_key("EVOLINK_API_KEY", "replacement-key")
+            self.settings.set_budgets(100_000, 120)
+            self.production.advance(NOW, job_id=self.job)
+            self.assertIn("Per-video budget", self.store.get_job(self.job)["stage_error"])
+            provider.assert_not_called()
+        self.assertEqual(self.production.media.job_tasks(self.job), [])
+
+    def test_opted_in_schedule_uses_visual_qa_before_creating_clip_tasks(self):
+        job, _ = self.prepare_scheduled_job(auto_approve_keyframes=True)
+        with patch("app.production.adapter_for", self.adapter), \
+                patch("app.production.local_image", return_value=FRAME), \
+                patch("app.production.download_artifact", side_effect=lambda url, path, kind: self.write_fixture(path)), \
+                patch.object(self, "submit", wraps=self.submit) as review:
+            self.production.advance(NOW, job_id=job)
+
+        review.assert_called_once()
+        self.assertIn("Review only the submitted opening keyframe", review.call_args.args[0].prompt)
+        self.assertEqual(self.store.get_job(job)["status"], "making_media")
+        self.assertTrue(any(task["kind"] == "video" for task in self.production.media.job_tasks(job)))
+
+    def test_uncertain_keyframe_review_keeps_manual_gate_and_does_not_repeat(self):
+        job, _ = self.prepare_scheduled_job(auto_approve_keyframes=True)
+        with patch("app.production.adapter_for", self.adapter), \
+                patch("app.production.local_image", return_value=FRAME), \
+                patch("app.production.download_artifact", side_effect=lambda url, path, kind: self.write_fixture(path)), \
+                patch.object(self, "submit", side_effect=ProviderError("Unknown visual QA outcome", uncertain=True)) as review:
+            self.production.advance(NOW, job_id=job)
+            self.production.recover_interrupted()
+            self.production.advance(NOW, job_id=job)
+
+        review.assert_called_once()
+        self.assertEqual(self.store.get_job(job)["status"], "review_keyframes")
+        self.assertIn("manual attention", self.store.get_job(job)["stage_error"])
+        self.assertTrue(all(task["kind"] == "keyframe" for task in self.production.media.job_tasks(job)))
+        self.production.media.approve_keyframes(job)
+        self.assertEqual(self.store.get_job(job)["status"], "making_media")
+
+    def test_interrupted_automatic_keyframe_claim_waits_for_manual_review(self):
+        job, _ = self.prepare_scheduled_job(auto_approve_keyframes=True)
+        with patch("app.production.adapter_for", self.adapter), \
+                patch("app.production.local_image", return_value=FRAME), \
+                patch("app.production.download_artifact", side_effect=lambda url, path, kind: self.write_fixture(path)), \
+                patch.object(self.production, "_automatic_keyframe_review"):
+            self.production.advance(NOW, job_id=job)
+
+        self.assertIsNotNone(self.production.media.claim_automatic_keyframe_review(job_id=job))
+        self.assertIsNone(self.store.get_job(job)["stage_error"])
+        self.production.recover_interrupted()
+
+        self.assertIn("restarted during automatic keyframe review", self.store.get_job(job)["stage_error"])
+        self.assertIsNone(self.production.media.claim_automatic_keyframe_review(job_id=job))
+
     def prepare_scene_edit(self, *, structured_dialogue=False):
         scenes = load_profile()["few_shot"][0]["scenes"]
         if structured_dialogue:

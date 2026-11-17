@@ -323,12 +323,31 @@ CREATE TABLE IF NOT EXISTS provider_warnings (
 """
 
 
+POST_DRAFTS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS post_drafts (
+    job_id INTEGER PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+    preview_path TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'generating', 'ready', 'needs_review', 'failed')),
+    content_json TEXT NOT NULL,
+    error TEXT
+);
+"""
+
+
 IDEA_RECORDS = """
 SELECT ideas.*, jobs.id AS job_id, jobs.status AS job_status, (
     SELECT MIN(scheduled_at) FROM publishing_requests
     WHERE job_id = jobs.id AND draft = 0 AND status IN ('scheduled', 'published')
 ) AS publish_at
 FROM ideas LEFT JOIN jobs ON jobs.idea_id = ideas.id
+"""
+
+
+SCHEDULE_GENERATION_SCHEMA = """
+CREATE TABLE IF NOT EXISTS schedule_generation_options (
+    schedule_id INTEGER PRIMARY KEY REFERENCES prompt_schedules(id) ON DELETE CASCADE,
+    auto_approve_keyframes INTEGER NOT NULL CHECK (auto_approve_keyframes IN (0, 1))
+);
 """
 
 
@@ -341,8 +360,9 @@ SELECT prompt_schedules.*, (
     WHERE schedule_entries.schedule_id = prompt_schedules.id
         AND publishing_requests.draft = 0
         AND publishing_requests.status IN ('scheduled', 'published')
-) AS publish_at
-FROM prompt_schedules
+) AS publish_at, COALESCE(schedule_generation_options.auto_approve_keyframes, 0) AS auto_approve_keyframes
+FROM prompt_schedules LEFT JOIN schedule_generation_options
+    ON schedule_generation_options.schedule_id = prompt_schedules.id
 """
 
 
@@ -409,8 +429,12 @@ class StudioStore:
                 _apply_schema(db, BRAND_SCHEMA)
             if version < 8:
                 _apply_schema(db, LIFECYCLE_SCHEMA)
+            _apply_schema(db, SCHEDULE_GENERATION_SCHEMA)
             # Older Studio builds can still open this database and ignore these warnings.
             _apply_schema(db, PROVIDER_WARNINGS_SCHEMA)
+            _apply_schema(db, POST_DRAFTS_SCHEMA)
+            if "release_url" not in {row["name"] for row in db.execute("PRAGMA table_info(publishing_requests)")}:
+                db.execute("ALTER TABLE publishing_requests ADD COLUMN release_url TEXT")
 
     def seed_niche(self, profile):
         with self._connection(write=True) as db:
@@ -792,7 +816,8 @@ class StudioStore:
                 raise ValueError("Cannot delete the default brand profile. Set another as default first.")
             db.execute("DELETE FROM brand_profiles WHERE niche_id = ? AND id = ?", (niche_id, brand_id))
 
-    def create_schedule(self, prompts, start_date, run_at, timezone, daily_limit, *, title=None, brand_id=None):
+    def create_schedule(self, prompts, start_date, run_at, timezone, daily_limit, *, title=None, brand_id=None,
+                        auto_approve_keyframes=False):
         if not isinstance(prompts, (list, tuple)) or not prompts:
             raise ValueError("Enter at least one prompt.")
         if len(prompts) > 100:
@@ -836,7 +861,18 @@ class StudioStore:
                 "INSERT INTO schedule_entries (schedule_id, prompt) VALUES (?, ?)",
                 [(schedule_id, prompt) for prompt in prompts],
             )
+            self._save_schedule_generation(db, schedule_id, auto_approve_keyframes)
             return schedule_id
+
+    @staticmethod
+    def _save_schedule_generation(db, schedule_id, auto_approve_keyframes):
+        if type(auto_approve_keyframes) is not bool:
+            raise ValueError("Choose whether to automatically approve keyframes after visual QA.")
+        db.execute(
+            """INSERT INTO schedule_generation_options (schedule_id, auto_approve_keyframes) VALUES (?, ?)
+            ON CONFLICT (schedule_id) DO UPDATE SET auto_approve_keyframes = excluded.auto_approve_keyframes""",
+            (schedule_id, auto_approve_keyframes),
+        )
 
     def list_schedules(self, *, include_deleted=False):
         return self._read_schedules(
@@ -853,12 +889,14 @@ class StudioStore:
             db.execute("BEGIN")
             schedules = [dict(row) for row in db.execute(query, parameters)]
             for schedule in schedules:
+                schedule["auto_approve_keyframes"] = bool(schedule["auto_approve_keyframes"])
                 schedule["entries"] = [
                     dict(row)
                     for row in db.execute(
                         """
                         SELECT schedule_entries.id, schedule_entries.prompt, jobs.id AS job_id,
-                            COALESCE(jobs.status, 'pending') AS status, jobs.scheduled_for AS queued_on
+                            COALESCE(jobs.status, 'pending') AS status, jobs.scheduled_for AS queued_on,
+                            jobs.preview_path IS NOT NULL AS has_preview
                         FROM schedule_entries
                         LEFT JOIN jobs ON jobs.schedule_entry_id = schedule_entries.id
                         WHERE schedule_entries.schedule_id = ?
@@ -867,9 +905,11 @@ class StudioStore:
                         (schedule["id"],),
                     )
                 ]
-                progress = dict.fromkeys(("pending", "queued", "waiting", "completed", "failed"), 0)
+                progress = dict.fromkeys(("pending", "queued", "waiting", "preview_ready", "completed", "failed"), 0)
                 for entry in schedule["entries"]:
                     status = entry["status"]
+                    if status == "needs_review" and entry["has_preview"]:
+                        status = "preview_ready"
                     progress[status if status in progress else "waiting"] += 1
                 schedule["progress"] = progress
             return schedules
@@ -901,7 +941,8 @@ class StudioStore:
                 raise ValueError("Activate this schedule before pausing it.")
             db.execute("UPDATE prompt_schedules SET status = ? WHERE id = ?", (status, schedule_id))
 
-    def update_schedule(self, schedule_id, title, start_date, run_at, timezone, daily_limit, brand_id=None):
+    def update_schedule(self, schedule_id, title, start_date, run_at, timezone, daily_limit, brand_id=None, *,
+                        auto_approve_keyframes=None):
         if type(daily_limit) is not int or daily_limit < 1:
             raise ValueError("Videos per day must be at least 1.")
         if not isinstance(title, str) or not title.strip() or len(title.strip()) > 100:
@@ -940,6 +981,8 @@ class StudioStore:
                 """,
                 (title, start_date, run_at, timezone, daily_limit, brand_id, schedule_id),
             )
+            if auto_approve_keyframes is not None:
+                self._save_schedule_generation(db, schedule_id, auto_approve_keyframes)
 
     def set_inbox_deleted(self, kind, record_id, deleted):
         tables = {"idea": "ideas", "schedule": "prompt_schedules"}

@@ -59,6 +59,7 @@ class StudioWatchDogTests(unittest.TestCase):
         scheduled = posts.queue(job_id, {"id": "yt-b", "identifier": "youtube"}, "Video", "", [], release)
         self.assertEqual(posts.next_request()["id"], scheduled)
         posts.finish(scheduled, "test-post")
+        posts.record_postiz_state(scheduled, "PUBLISHED", None, release)
         posts.defer_analytics(scheduled, release)
 
         issues = {issue["id"]: issue for issue in list_issues(self.store, self.settings)}

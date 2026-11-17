@@ -139,6 +139,9 @@ class PublishingStoreTests(unittest.TestCase):
             self.assertEqual(self.posts.next_request()["id"], request_id)
             self.posts.finish(request_id, f"post-{request_id}")
         self.assertEqual(self.posts.due_analytics(self.when - timedelta(seconds=1)), [])
+        self.assertEqual([post["id"] for post in self.posts.due_postiz_status(self.when)], [scheduled])
+        self.assertEqual(self.posts.due_analytics(self.when), [])
+        self.posts.record_postiz_state(scheduled, "PUBLISHED", None, self.when)
         self.assertEqual([post["id"] for post in self.posts.due_analytics(self.when)], [scheduled])
         self.posts.defer_analytics(scheduled, self.when)
         self.assertEqual(self.posts.due_analytics(self.when + timedelta(minutes=59)), [])
@@ -170,6 +173,8 @@ class PublishingStoreTests(unittest.TestCase):
             self.posts.finish(request_id, f"post-{request_id}")
 
         self.assertEqual(self.posts.published_posts(), [])
+        self.posts.record_postiz_state(first, "PUBLISHED", None, self.when)
+        self.posts.record_postiz_state(second, "PUBLISHED", None, later)
         self.posts.record_analytics(first, {"views": 0, "likes": None}, self.when)
         self.posts.record_analytics(second, {"views": 4}, later)
         releases = self.posts.published_posts()
@@ -193,6 +198,7 @@ class PublishingStoreTests(unittest.TestCase):
         request_id = self.approve()
         self.posts.next_request()
         self.posts.finish(request_id, "shared-post")
+        self.posts.record_postiz_state(request_id, "PUBLISHED", None, self.when)
         for day in range(15):
             self.posts.record_analytics(
                 request_id, {"views": 0 if day == 1 else day, "comments": None},
@@ -238,6 +244,7 @@ class PublishingStoreTests(unittest.TestCase):
 
         self.assertEqual(self.posts.delivered_preview_paths(self.job), {"1/scheduled.mp4"})
         self.assertEqual(self.posts.delivered_preview_paths(self.job + 1), set())
+        self.posts.record_postiz_state(scheduled, "PUBLISHED", None, self.when)
         self.posts.record_analytics(scheduled, {"views": 0}, self.when)
         self.assertEqual(self.posts.delivered_preview_paths(self.job), {"1/scheduled.mp4"})
 
@@ -252,6 +259,42 @@ class PublishingStoreTests(unittest.TestCase):
         self.assertEqual(post["id"], request_id)
         self.assertEqual(post["scheduled_at"], "2026-11-10T03:00:00.000000+00:00")
         self.assertEqual(post["hashtags"], ["#garden", "#stories"])
+
+    def test_batch_approval_rolls_back_if_one_channel_conflicts(self):
+        self.preview()
+        approved = self.approve()
+        second = {**self.channel, "id": "youtube-2"}
+        with self.assertRaisesRegex(ValueError, "already has a publishing request"):
+            self.posts.queue_many(
+                self.job, [(second, self.when), (self.channel, self.when)],
+                "Changed title", "Caption", ["garden"],
+                expected_preview_path="1/preview.mp4",
+            )
+        self.assertEqual([post["id"] for post in self.posts.job_posts(self.job)], [approved])
+
+    def test_postiz_failure_preserves_post_id_and_prevents_resubmission(self):
+        self.preview()
+        request_id = self.approve()
+        self.posts.next_request()
+        self.posts.finish(request_id, "handed-off-post")
+        missed_time = self.when + timedelta(minutes=11)
+        self.posts.record_postiz_state(request_id, "QUEUE", None, missed_time)
+        self.assertIn("not confirmed publication", self.posts.job_posts(self.job)[0]["error"])
+        self.posts.record_postiz_state(request_id, "ERROR", None, missed_time)
+        failed, = self.posts.job_posts(self.job)
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["post_id"], "handed-off-post")
+        self.assertEqual(self.approve(), request_id)
+        self.assertIsNone(self.posts.next_request())
+
+        retry_observed = missed_time + timedelta(minutes=15)
+        self.assertEqual([item["id"] for item in self.posts.due_postiz_status(retry_observed)], [request_id])
+        url = "https://www.example.com/released"
+        self.posts.record_postiz_state(request_id, "PUBLISHED", url, retry_observed)
+        published, = self.posts.published_posts(self.job)
+        self.assertEqual(published["release_url"], url)
+        self.assertIsNone(published["error"])
+        self.assertIsNone(published["metrics"])
 
 
 if __name__ == "__main__":

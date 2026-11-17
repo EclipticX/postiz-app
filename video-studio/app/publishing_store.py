@@ -8,6 +8,11 @@ PUBLISHABLE = ("preview_ready", "needs_review")
 CHANNEL_IDENTIFIERS = {
     "youtube", "facebook", "instagram", "instagram-standalone", "tiktok", "tiktok-business",
 }
+POSTIZ_PUBLISH_FAILED = "Postiz reported a publishing failure. Check this channel's post in Postiz."
+POSTIZ_PUBLISH_PENDING = "Postiz has not confirmed publication. Check this channel's post in Postiz."
+POSTIZ_PUBLISH_DRAFT = "The scheduled post is now a draft in Postiz."
+POSTIZ_STATUS_UNAVAILABLE = "Postiz publishing status is temporarily unavailable."
+POSTIZ_HANDOFF_EXPIRED = "The approved publication time passed before Postiz handoff."
 _LATEST_ANALYTICS_JOIN = """
 LEFT JOIN analytics ON analytics.id = (
     SELECT id FROM analytics
@@ -49,6 +54,14 @@ class PublishingStore:
 
     def queue(self, job_id, channel, title, caption, hashtags, scheduled_at, draft=False, *,
               expected_preview_path=None):
+        request_id, = self.queue_many(
+            job_id, [(channel, scheduled_at)], title, caption, hashtags, draft,
+            expected_preview_path=expected_preview_path,
+        )
+        return request_id
+
+    @staticmethod
+    def _destination(channel, scheduled_at, draft):
         if not isinstance(channel, dict):
             raise ValueError("Choose a connected Postiz channel.")
         channel_id, identifier = channel.get("id"), channel.get("identifier")
@@ -57,7 +70,13 @@ class PublishingStore:
         if not isinstance(identifier, str) or identifier not in CHANNEL_IDENTIFIERS:
             raise ValueError("This channel type is unsupported for Studio publishing.")
         channel_name = channel.get("name") or channel_id
-        if not isinstance(channel_name, str) or not isinstance(title, str) or not isinstance(caption, str):
+        if not isinstance(channel_name, str):
+            raise ValueError("Choose a connected Postiz channel.")
+        return channel_id, identifier, channel_name, _timestamp(scheduled_at) if scheduled_at or not draft else None
+
+    def queue_many(self, job_id, deliveries, title, caption, hashtags, draft=False, *, expected_preview_path=None):
+        """Approve the reviewed preview for all selected destinations in one transaction."""
+        if not isinstance(title, str) or not isinstance(caption, str):
             raise ValueError("Enter a valid channel name, title, and caption.")
         if isinstance(hashtags, str):
             hashtags = hashtags.replace(",", " ").split()
@@ -66,7 +85,9 @@ class PublishingStore:
         hashtags_json = json.dumps([tag.strip() for tag in hashtags if tag.strip()])
         if type(draft) is not bool:
             raise ValueError("Choose draft or scheduled publishing.")
-        scheduled_at = _timestamp(scheduled_at) if scheduled_at or not draft else None
+        destinations = [self._destination(channel, scheduled_at, draft) for channel, scheduled_at in deliveries]
+        if not destinations or len(destinations) != len({item[0] for item in destinations}):
+            raise ValueError("Choose one or more distinct Postiz channels.")
         title, caption = title.strip(), caption.strip()
 
         with self.store._connection(write=True) as db:
@@ -78,46 +99,56 @@ class PublishingStore:
                 not expected_preview_path or expected_preview_path != preview_path
             ):
                 raise ValueError("The video preview changed. Reload the workspace and review it before approving.")
-            existing = db.execute(
-                "SELECT * FROM publishing_requests WHERE job_id = ? AND channel_id = ?",
-                (job_id, channel_id),
-            ).fetchone()
-            if existing is not None and (existing["status"] != "failed" or existing["post_id"] is not None):
-                if (
-                    existing["title"] != title or existing["caption"] != caption
-                    or existing["hashtags_json"] != hashtags_json
-                    or existing["scheduled_at"] != scheduled_at or bool(existing["draft"]) != draft
-                ):
-                    raise ValueError("This video already has a publishing request for this channel.")
-                return existing["id"]
-            if job["status"] not in PUBLISHABLE or not preview_path:
-                raise ValueError("Wait for the final video preview before approving publishing.")
-            if existing is not None:
-                db.execute(
-                    """
-                    UPDATE publishing_requests
-                    SET identifier = ?, channel_name = ?, preview_path = ?, title = ?, caption = ?,
-                        hashtags_json = ?, scheduled_at = ?, draft = ?, status = 'queued', error = NULL
-                    WHERE id = ?
-                    """,
-                    (
-                        identifier, channel_name, preview_path, title, caption, hashtags_json,
-                        scheduled_at, draft, existing["id"],
-                    ),
-                )
-                return existing["id"]
-            return db.execute(
+            return [
+                self._queue_channel(db, job_id, job, destination, title, caption, hashtags_json, draft)
+                for destination in destinations
+            ]
+
+    @staticmethod
+    def _queue_channel(db, job_id, job, destination, title, caption, hashtags_json, draft):
+        channel_id, identifier, channel_name, scheduled_at = destination
+        preview_path = job["preview_path"]
+        existing = db.execute(
+            "SELECT * FROM publishing_requests WHERE job_id = ? AND channel_id = ?",
+            (job_id, channel_id),
+        ).fetchone()
+        if existing is not None and (existing["status"] != "failed" or existing["post_id"] is not None):
+            if (
+                existing["title"] != title or existing["caption"] != caption
+                or existing["hashtags_json"] != hashtags_json
+                or existing["scheduled_at"] != scheduled_at or bool(existing["draft"]) != draft
+                or existing["preview_path"] != preview_path
+            ):
+                raise ValueError("This video already has a publishing request for this channel.")
+            return existing["id"]
+        if job["status"] not in PUBLISHABLE or not preview_path:
+            raise ValueError("Wait for the final video preview before approving publishing.")
+        if existing is not None:
+            db.execute(
                 """
-                INSERT INTO publishing_requests (
-                    job_id, channel_id, identifier, channel_name, preview_path, title,
-                    caption, hashtags_json, scheduled_at, draft
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                UPDATE publishing_requests
+                SET identifier = ?, channel_name = ?, preview_path = ?, title = ?, caption = ?,
+                    hashtags_json = ?, scheduled_at = ?, draft = ?, status = 'queued', error = NULL
+                WHERE id = ?
                 """,
                 (
-                    job_id, channel_id, identifier, channel_name, preview_path, title,
-                    caption, hashtags_json, scheduled_at, draft,
+                    identifier, channel_name, preview_path, title, caption, hashtags_json,
+                    scheduled_at, draft, existing["id"],
                 ),
-            ).lastrowid
+            )
+            return existing["id"]
+        return db.execute(
+            """
+            INSERT INTO publishing_requests (
+                job_id, channel_id, identifier, channel_name, preview_path, title,
+                caption, hashtags_json, scheduled_at, draft
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                job_id, channel_id, identifier, channel_name, preview_path, title,
+                caption, hashtags_json, scheduled_at, draft,
+            ),
+        ).lastrowid
 
     def next_request(self):
         """Claim one approved request and prevent delivery of a stale preview."""
@@ -139,6 +170,16 @@ class PublishingStore:
                 return None
             db.execute("UPDATE publishing_requests SET status = 'sending' WHERE id = ?", (request["id"],))
             return dict(_post_record(request), status="sending")
+
+    def expire_queued_handoffs(self, now):
+        with self.store._connection(write=True) as db:
+            db.execute(
+                """
+                UPDATE publishing_requests SET status = 'failed', error = ?
+                WHERE status = 'queued' AND draft = 0 AND scheduled_at <= ?
+                """,
+                (POSTIZ_HANDOFF_EXPIRED, _timestamp(now)),
+            )
 
     def finish(self, request_id, post_id):
         if not isinstance(post_id, str) or not post_id.strip():
@@ -239,6 +280,63 @@ class PublishingStore:
                 )
             }
 
+    def due_postiz_status(self, now, limit=3):
+        with self.store._connection() as db:
+            return [
+                dict(row)
+                for row in db.execute(
+                    """
+                    SELECT id, post_id, scheduled_at FROM publishing_requests
+                    WHERE status IN ('scheduled', 'failed', 'needs_review') AND draft = 0
+                        AND post_id IS NOT NULL AND COALESCE(analytics_after_at, scheduled_at) <= ?
+                    ORDER BY COALESCE(analytics_after_at, scheduled_at), id LIMIT ?
+                    """,
+                    (_timestamp(now), limit),
+                )
+            ]
+
+    def record_postiz_state(self, request_id, state, release_url, now):
+        """Keep publication confirmation separate from engagement metrics."""
+        observed = _utc_time(now)
+        with self.store._connection(write=True) as db:
+            request = db.execute(
+                """
+                SELECT status, scheduled_at, error FROM publishing_requests
+                WHERE id = ? AND status IN ('scheduled', 'failed', 'needs_review')
+                    AND draft = 0 AND post_id IS NOT NULL
+                """,
+                (request_id,),
+            ).fetchone()
+            if request is None:
+                return
+            next_check = observed + timedelta(minutes=1)
+            status = request["status"]
+            error = request["error"]
+            if state == "PUBLISHED":
+                status, error, next_check = "published", None, observed
+            elif state == "ERROR":
+                status, error = "failed", POSTIZ_PUBLISH_FAILED
+                next_check = observed + timedelta(minutes=15)
+            elif state == "DRAFT":
+                status, error = "needs_review", POSTIZ_PUBLISH_DRAFT
+                next_check = observed + timedelta(minutes=15)
+            elif state == "UNAVAILABLE":
+                error = error or POSTIZ_STATUS_UNAVAILABLE
+                next_check = observed + timedelta(minutes=5)
+            else:
+                missed_deadline = observed >= _utc_time(request["scheduled_at"]) + timedelta(minutes=10)
+                if state == "QUEUE":
+                    status = "scheduled"
+                if status == "scheduled":
+                    error = POSTIZ_PUBLISH_PENDING if missed_deadline else None
+            db.execute(
+                """
+                UPDATE publishing_requests SET status = ?, release_url = ?, error = ?, analytics_after_at = ?
+                WHERE id = ?
+                """,
+                (status, release_url if status == "published" else None, error, _timestamp(next_check), request_id),
+            )
+
     def due_analytics(self, now, limit=10):
         if type(limit) is not int or not 1 <= limit <= 100:
             raise ValueError("Analytics batch limit must be between 1 and 100.")
@@ -249,7 +347,7 @@ class PublishingStore:
                     """
                     SELECT publishing_requests.*, jobs.niche_id
                     FROM publishing_requests JOIN jobs ON jobs.id = publishing_requests.job_id
-                    WHERE publishing_requests.status IN ('scheduled', 'published')
+                    WHERE publishing_requests.status = 'published'
                         AND post_id IS NOT NULL AND analytics_after_at <= ?
                     ORDER BY analytics_after_at, publishing_requests.id LIMIT ?
                     """,
@@ -266,12 +364,12 @@ class PublishingStore:
             request = db.execute(
                 """
                 SELECT job_id, identifier, post_id FROM publishing_requests
-                WHERE id = ? AND status IN ('scheduled', 'published') AND post_id IS NOT NULL
+                WHERE id = ? AND status = 'published' AND post_id IS NOT NULL
                 """,
                 (request_id,),
             ).fetchone()
             if request is None:
-                raise LookupError("Scheduled Postiz post not found.")
+                raise LookupError("Published Postiz post not found.")
             db.execute(
                 """
                 INSERT INTO analytics (job_id, platform, post_id, metrics_json, collected_at)
@@ -284,11 +382,9 @@ class PublishingStore:
             )
             db.execute(
                 """
-                UPDATE publishing_requests SET analytics_after_at = ?, analytics_error = NULL,
-                    status = CASE WHEN ? THEN 'published' ELSE status END
-                WHERE id = ?
+                UPDATE publishing_requests SET analytics_after_at = ?, analytics_error = NULL WHERE id = ?
                 """,
-                (_timestamp(observed + timedelta(days=1)), any(value is not None for value in metrics.values()), request_id),
+                (_timestamp(observed + timedelta(days=1)), request_id),
             )
 
     def defer_analytics(self, request_id, now, message="Postiz analytics are temporarily unavailable."):
@@ -296,7 +392,7 @@ class PublishingStore:
             db.execute(
                 """
                 UPDATE publishing_requests SET analytics_after_at = ?, analytics_error = ?
-                WHERE id = ? AND status IN ('scheduled', 'published')
+                WHERE id = ? AND status = 'published'
                 """,
                 (_timestamp(_utc_time(now) + timedelta(hours=1)), message, request_id),
             )

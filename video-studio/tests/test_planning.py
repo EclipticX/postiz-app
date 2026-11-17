@@ -53,6 +53,20 @@ class PlanningTests(unittest.TestCase):
         self.store.decide_idea(idea, "accept")
         return self.store.list_jobs()[0]["id"]
 
+    def test_selected_job_runs_without_claiming_an_older_job_or_uncertain_work(self):
+        older = self.queue_job()
+        selected = self.queue_job()
+        self.responses.append(self.valid_plan())
+
+        self.planner.process_plan(NOW, job_id=selected)
+        self.assertEqual(self.store.get_job(selected)["status"], "planned")
+        self.assertEqual(self.store.get_job(older)["status"], "queued")
+        with self.store._connection(write=True) as db:
+            db.execute("UPDATE jobs SET status = 'needs_review', stage_error = 'Unknown submission' WHERE id = ?", (selected,))
+        self.planner.process_plan(NOW, job_id=selected)
+        self.assertEqual(self.store.get_job(selected)["stage_error"], "Unknown submission")
+        self.assertEqual(len(self.requests), 1)
+
     def test_manual_trend_uses_memory_and_creates_pending_ideas(self):
         with self.store._connection(write=True) as db:
             db.execute("INSERT INTO memory (niche_id, pattern_json) VALUES ('kids_3d', ?)", ('{"hook":"seed reveal"}',))
