@@ -46,7 +46,13 @@ import { TrialTracker } from '@gitroom/frontend/components/layout/gtm.component'
 import { setSentryUser } from '@gitroom/react/sentry/initialize.sentry.client';
 import { setUserTimezone } from '@gitroom/frontend/components/layout/set.timezone';
 
-export const LayoutComponent = ({ children }: { children: ReactNode }) => {
+export const LayoutComponent = ({
+  children,
+  videoStudioUrl,
+}: {
+  children: ReactNode;
+  videoStudioUrl?: string;
+}) => {
   const fetch = useFetch();
 
   const { backendUrl, billingEnabled, isGeneral } = useVariables();
@@ -137,7 +143,7 @@ export const LayoutComponent = ({ children }: { children: ReactNode }) => {
                           <div className="flex justify-center">
                             <Logo />
                           </div>
-                          <TopMenu />
+                          <TopMenu videoStudioUrl={videoStudioUrl} />
                         </div>
                       </div>
                     </div>

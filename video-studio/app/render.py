@@ -23,14 +23,14 @@ class RenderError(RuntimeError):
 
 def render_video(
     scenes, clip_paths, voice_paths, output_path, *, music_path=None, transcribe=None,
-    subtitle_style=None, sfx_path=None,
+    subtitle_style=None, sfx_path=None, native_audio=False,
 ) -> Path:
     """Render an approved plan and save its MP4 and, when spoken, an SRT sidecar.
 
     An optional transcriber returns (word, start_seconds, end_seconds) entries
     relative to the supplied narration file. Structured dialogue uses one
     voice path per line in scene order. Background music loops, and the sound
-    effect plays once at the beginning.
+    effect plays once at the beginning. Native audio uses the clip's audio track.
     """
     total_duration = _total_duration(scenes)
     output_path = Path(output_path).resolve()
@@ -50,6 +50,8 @@ def render_video(
         scene_id = scene["scene_id"]
         duration = scene["duration"]
         clip = _input_file(clip_paths.get(scene_id), f"Video clip for {scene_id}")
+        if native_audio:
+            inputs.extend(["-protocol_whitelist", "file,pipe", "-f", "mov"])
         inputs.extend(["-i", str(clip)])
         filters.append(
             f"[{input_index}:v]scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=increase,"
@@ -57,16 +59,21 @@ def render_video(
             f"tpad=stop_mode=clone:stop_duration={duration},trim=duration={duration},"
             f"setpts=PTS-STARTPTS[v{index}]"
         )
+        if native_audio:
+            if _mp4_stream(_probe_mp4(clip), "audio"):
+                filters.append(_audio_filter(f"[{input_index}:a:0]", duration, f"[a{index}]"))
+            else:
+                filters.append(_silence_filter(duration, f"[a{index}]"))
+        else:
+            paths, narration_filters, scene_cues = _narration(
+                scene, voice_paths.get(scene_id), index, input_index + 1, offset, transcribe,
+            )
+            for path in paths:
+                inputs.extend(["-i", str(path)])
+            input_index += len(paths)
+            filters.extend(narration_filters)
+            cues.extend(scene_cues)
         input_index += 1
-
-        paths, narration_filters, scene_cues = _narration(
-            scene, voice_paths.get(scene_id), index, input_index, offset, transcribe,
-        )
-        for path in paths:
-            inputs.extend(["-i", str(path)])
-        input_index += len(paths)
-        filters.extend(narration_filters)
-        cues.extend(scene_cues)
         concat_inputs.append(f"[v{index}][a{index}]")
         offset += duration
 
@@ -123,6 +130,64 @@ def render_video(
     return output_path
 
 
+def render_direct_video(clip_path, voice_path, output_path, duration) -> Path:
+    """Finalize a direct video with its native audio or an explicit narration track."""
+    if type(duration) is not int or not 4 <= duration <= 30:
+        raise RenderError("A direct video must be 4 to 30 seconds long")
+    clip = _input_file(clip_path, "Direct video")
+    output_path = Path(output_path).resolve()
+    if output_path.suffix.lower() != ".mp4":
+        raise RenderError("The render output path must end in .mp4")
+    probe = _verify_direct_video(clip, duration)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    inputs = ["-protocol_whitelist", "file,pipe", "-f", "mov", "-i", str(clip)]
+    audio = _mp4_stream(probe, "audio")
+    if voice_path is None:
+        audio_codec = "aac" if audio and audio.get("codec_name") != "aac" else "copy"
+        audio_options = ["-map", "0:a:0?", "-c:a", audio_codec]
+    else:
+        voice = _input_file(voice_path, "Direct video narration")
+        if audio_duration(voice) > duration + DURATION_TOLERANCE:
+            raise RenderError("Narration exceeds the direct video's duration")
+        inputs.extend(["-protocol_whitelist", "file,pipe", "-i", str(voice)])
+        audio_options = ["-map", "1:a:0", "-af", f"apad,atrim=duration={duration}", "-c:a", "aac"]
+
+    with TemporaryDirectory(prefix=".render-", dir=output_path.parent) as directory:
+        temporary_video = Path(directory) / "render.mp4"
+        _ffmpeg([
+            *inputs, "-map", "0:v:0", *audio_options, "-map_metadata", "-1", "-map_chapters", "-1",
+            "-c:v", "copy", "-t", str(duration), "-movflags", "+faststart", str(temporary_video),
+        ])
+        rendered = _verify_direct_video(temporary_video, duration)
+        if (voice_path is not None or audio) and _mp4_stream(rendered, "audio").get("codec_name") != "aac":
+            raise RenderError("The direct video lost its audio track during rendering")
+        temporary_video.replace(output_path)
+    return output_path
+
+
+def _probe_mp4(path):
+    raw = _run([
+        "ffprobe", "-v", "error", "-protocol_whitelist", "file,pipe", "-f", "mov",
+        "-show_streams", "-show_format", "-of", "json", str(path),
+    ])
+    return json.loads(raw)
+
+
+def _mp4_stream(probe, kind):
+    return next((stream for stream in probe.get("streams", []) if stream.get("codec_type") == kind), {})
+
+
+def _verify_direct_video(path, duration):
+    probe = _probe_mp4(path)
+    video = _mp4_stream(probe, "video")
+    if video.get("codec_name") != "h264" or not video.get("width") or not video.get("height"):
+        raise RenderError("The direct video must contain an H.264 video track")
+    length = float(video.get("duration", "nan"))
+    if not math.isfinite(length) or abs(length - duration) > DURATION_TOLERANCE:
+        raise RenderError(f"The direct video does not match the requested {duration}-second duration")
+    return probe
+
+
 def sample_frames(path, output_dir, scenes) -> list[Path]:
     """Save one midpoint JPEG for each scene, in approved scene order."""
     _total_duration(scenes)
@@ -158,6 +223,15 @@ def _input_file(path, label) -> Path:
     return Path(path).resolve()
 
 
+def _audio_filter(source, length, output):
+    return (f"{source}aformat=sample_rates=48000:channel_layouts=stereo,"
+            f"apad,atrim=duration={length:.6f},asetpts=PTS-STARTPTS{output}")
+
+
+def _silence_filter(duration, output):
+    return f"anullsrc=r=48000:cl=stereo,atrim=duration={duration},asetpts=PTS-STARTPTS{output}"
+
+
 def _narration(scene, voice_paths, scene_index, first_input, offset, transcribe):
     scene_id = scene["scene_id"]
     duration = scene["duration"]
@@ -170,7 +244,7 @@ def _narration(scene, voice_paths, scene_index, first_input, offset, transcribe)
     else:
         dialogue = scene.get("dialogue", "").strip()
         if not dialogue:
-            return [], [f"anullsrc=r=48000:cl=stereo,atrim=duration={duration},asetpts=PTS-STARTPTS{output}"], []
+            return [], [_silence_filter(duration, output)], []
         texts = [dialogue]
         voice_paths = [voice_paths]
 
@@ -181,7 +255,7 @@ def _narration(scene, voice_paths, scene_index, first_input, offset, transcribe)
         path = _input_file(path, f"Narration for {label}")
         length = duration
         if lines:
-            length = _audio_duration(path)
+            length = audio_duration(path)
             remaining = duration - elapsed
             if remaining <= 0 or length > remaining + DURATION_TOLERANCE:
                 raise RenderError(f"Narration for {scene_id} exceeds its {duration}-second scene")
@@ -190,10 +264,7 @@ def _narration(scene, voice_paths, scene_index, first_input, offset, transcribe)
         paths.append(path)
         track = f"[n{scene_index}_{line_index}]" if lines else output
         tracks.append(track)
-        filters.append(
-            f"[{first_input + line_index}:a]aformat=sample_rates=48000:channel_layouts=stereo,"
-            f"apad,atrim=duration={length:.6f},asetpts=PTS-STARTPTS{track}"
-        )
+        filters.append(_audio_filter(f"[{first_input + line_index}:a]", length, track))
         elapsed += length
 
     if lines:
@@ -205,9 +276,11 @@ def _narration(scene, voice_paths, scene_index, first_input, offset, transcribe)
     return paths, filters, cues
 
 
-def _audio_duration(path):
+def audio_duration(path, *, input_format=None):
+    input_options = ["-f", input_format] if input_format else []
     raw = _run([
-        "ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=duration:format=duration",
+        "ffprobe", "-v", "error", "-protocol_whitelist", "file,pipe", *input_options,
+        "-select_streams", "a:0", "-show_entries", "stream=duration:format=duration",
         "-of", "json", str(path),
     ])
     probe = json.loads(raw)

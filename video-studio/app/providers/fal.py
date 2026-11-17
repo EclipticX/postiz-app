@@ -1,14 +1,22 @@
+import base64
+from urllib.parse import urlsplit
+
 from .common import (
     ProviderError, ProviderRequest, ProviderResult, credential, is_https_url,
     reference_images, request_json, task_identifier,
 )
 
 
+SEEDANCE_FLASH_ROUTE = 'fal-seedance-25-flash'
+SEEDANCE_FLASH_RESOLUTIONS = ('480p', '720p')
+SEEDANCE_FLASH_ASPECT_RATIOS = ('auto', '21:9', '16:9', '4:3', '1:1', '3:4', '9:16')
+SEEDANCE_FLASH_MAX_AUDIO_BYTES = 15_000_000
 _ROUTES = {
     'fal-nano-banana-pro': ('fal-ai/nano-banana-pro', 'images'),
     'fal-veo': ('fal-ai/veo3.1/image-to-video', 'video'),
     'fal-kling': ('kling/v4/flash/reference-to-video', 'video'),
     'fal-elevenlabs': ('fal-ai/elevenlabs/tts/turbo-v2.5', 'audio'),
+    SEEDANCE_FLASH_ROUTE: ('bytedance/seedance-2.5/flash', 'video'),
 }
 _RETRYABLE_TASK_ERRORS = {
     'request_timeout', 'startup_timeout', 'runner_scheduling_failure',
@@ -16,6 +24,44 @@ _RETRYABLE_TASK_ERRORS = {
     'runner_connection_error', 'runner_incomplete_response', 'runner_server_error',
     'internal_error',
 }
+
+
+def supports_seedance_flash(request):
+    image_count = int(bool(request.reference_image)) + len(request.reference_images)
+    audio_count = len(request.audio_references)
+    return (
+        bool(request.prompt.strip()) and type(request.duration) is int and 4 <= request.duration <= 30
+        and request.resolution in SEEDANCE_FLASH_RESOLUTIONS
+        and request.aspect_ratio in SEEDANCE_FLASH_ASPECT_RATIOS
+        and type(request.generate_audio) is bool and image_count <= 10
+        and (not audio_count or (image_count > 0 and audio_count <= 5 and request.generate_audio))
+    )
+
+
+def _validate_audio_reference(reference):
+    message = 'Audio references need a supported MP3 or WAV data URL or HTTPS URL.'
+    if is_https_url(reference):
+        if len(reference) <= 4096 and all(33 <= ord(char) <= 126 for char in reference) and '\\' not in reference:
+            try:
+                parts = urlsplit(reference)
+                if parts.port in (None, 443) and not parts.fragment:
+                    return
+            except ValueError:
+                pass
+        raise ProviderError(message)
+    if not isinstance(reference, str):
+        raise ProviderError(message)
+    metadata, _, data = reference.partition(',')
+    if metadata not in ('data:audio/mpeg;base64', 'data:audio/wav;base64') or not data:
+        raise ProviderError(message)
+    if len(data) > (SEEDANCE_FLASH_MAX_AUDIO_BYTES + 2) // 3 * 4:
+        raise ProviderError('Audio references must be at most 15 MB.')
+    try:
+        decoded = base64.b64decode(data, validate=True)
+    except ValueError:
+        raise ProviderError(message) from None
+    if not decoded or len(decoded) > SEEDANCE_FLASH_MAX_AUDIO_BYTES:
+        raise ProviderError(message)
 
 
 class FalAdapter:
@@ -77,6 +123,21 @@ class FalAdapter:
 
         images = reference_images(request)
         payload = {'prompt': request.prompt, 'aspect_ratio': request.aspect_ratio}
+        if self.route == SEEDANCE_FLASH_ROUTE:
+            if not supports_seedance_flash(request):
+                raise ProviderError('Seedance 2.5 Flash requires 4–30 seconds, 480p or 720p, and supported references.')
+            payload.update({
+                'resolution': request.resolution, 'duration': request.duration,
+                'generate_audio': request.generate_audio, 'codec': 'H264',
+            })
+            if images:
+                payload['image_urls'] = images
+                if request.audio_references:
+                    for audio in request.audio_references:
+                        _validate_audio_reference(audio)
+                    payload['audio_urls'] = list(request.audio_references)
+                return f'{self.endpoint}/reference-to-video', payload
+            return f'{self.endpoint}/text-to-video', payload
         if self.route == 'fal-nano-banana-pro':
             if images:
                 payload['image_urls'] = images
@@ -94,7 +155,7 @@ class FalAdapter:
                 raise ProviderError('This Veo route accepts one first-frame image.')
             payload.update({
                 'image_url': images[0], 'duration': f'{duration}s',
-                'generate_audio': False, 'auto_fix': False,
+                'generate_audio': request.generate_audio, 'auto_fix': False,
             })
         else:
             if request.resolution != '720p' or type(duration) is not int or not 3 <= duration <= 20:

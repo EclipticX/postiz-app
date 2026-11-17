@@ -415,13 +415,26 @@ def providers_page(providers, csrf_token, notice='', *, active_tab='', platforms
 
 
 def settings_page(budgets, schedule, csrf_token, notice='', *, assets=(), presets=(),
-                  open_asset=None, open_presets=False):
+                  open_asset=None, open_presets=False, generation=None):
+    generation = generation or {}
     cadence = schedule['cadence']
     weekdays = ''.join(
         f'<option value="{number}"{" selected" if number == schedule["weekday"] else ""}>{day}</option>'
         for number, day in enumerate(('Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'))
     )
     content = f'''
+    <section class="panel records" id="video-generation">
+      <h2>Video Generation</h2>
+      <form class="stack" method="post" action="/settings/generation">
+        {_csrf(csrf_token)}
+        <label><input type="checkbox" name="scene_plan" value="1"{' checked' if generation.get('scene_plan') else ''}>
+          Claude scene plan</label>
+        <label><input type="checkbox" name="separate_voice" value="1"{' checked' if generation.get('separate_voice') else ''}>
+          Generate separate voice clips</label>
+        <small class="muted">New jobs and schedules save these choices when created.</small>
+        <button type="submit">Save video generation settings</button>
+      </form>
+    </section>
     <div class="columns">
       <section class="panel">
         <h2>Budget</h2>

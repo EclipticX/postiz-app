@@ -1,6 +1,8 @@
 import json
 from html import escape
+from os import environ
 
+from app.generation import DIRECT_MODEL
 from app.media_store import can_edit_scene, scene_revision
 from app.postiz_client import _safe_release_url
 
@@ -24,6 +26,9 @@ def _page(title, active, content, notice, *, script=None, heading_action='', bre
     for path, label in links:
         current = ' aria-current="page"' if active == path else ''
         navigation_links.append(f'<a href="{path}"{current}>{label}</a>')
+    postiz_calendar_url = environ.get('STUDIO_POSTIZ_CALENDAR_URL', '').strip()
+    if postiz_calendar_url.startswith(('http://', 'https://')):
+        navigation_links.insert(0, f'<a href="{_text(postiz_calendar_url)}">Postiz Calendar</a>')
     navigation = ''.join(navigation_links)
     title_text = _text(title)
     if breadcrumb:
@@ -127,7 +132,128 @@ def _ready_for_review(job):
     return bool(job.get('preview_path') and job['status'] in ('preview_ready', 'needs_review'))
 
 
-def _publishing_section(job, posts, channels, metrics, csrf_token, post_draft, preview, qa, revision):
+_DIRECT_MODEL_LABEL = 'Seedance 2.5 Flash'
+
+
+def _generation_summary(generation):
+    if generation.get('scene_plan'):
+        video = 'Claude scene plan · 30 seconds · 9:16 · 720p'
+    else:
+        video = f'{_DIRECT_MODEL_LABEL} · {generation.get("duration", 30)} seconds · {generation.get("aspect_ratio", "9:16")} · {generation.get("resolution", "720p")}'
+    audio = 'Separate voice clips' if generation.get('separate_voice') else 'Native video audio'
+    return f'{_text(video)} · {audio}'
+
+
+def _price(micros):
+    return f'${micros / 1_000_000:,.6f}'.rstrip('0').rstrip('.') if micros else '$0'
+
+
+def _selected_values(values, name):
+    selected = values.get(name, ())
+    return {selected} if isinstance(selected, str) else set(selected or ())
+
+
+def generation_fields(generation, assets, rates, values):
+    if generation is None:
+        return ''
+    rates = rates or {}
+    expected_mode = ''.join(
+        f'<input type="hidden" name="expected_{name}" value="{int(bool(generation.get(name)))}">'
+        for name in ('scene_plan', 'separate_voice')
+    )
+    characters = [asset for asset in assets if asset['kind'] == 'character']
+    elements = [asset for asset in assets if asset['kind'] in ('item', 'place')]
+
+    def references(legend, field, choices):
+        if not choices:
+            return ''
+        selected = _selected_values(values, field)
+        checks = ''.join(
+            f'<label><input type="checkbox" name="{field}" value="{_text(asset["id"])}"'
+            f'{" checked" if asset["id"] in selected else ""}> {_text(asset["name"])}</label>'
+            for asset in choices
+        )
+        return f'<fieldset class="stack"><legend>{legend}</legend>{checks}</fieldset>'
+
+    casting = references('Characters', 'character', characters)
+    if generation.get('scene_plan'):
+        stage_rates = (
+            ('Claude planning', 'planning_per_request', 'request'),
+            ('Keyframe', 'keyframe_per_image', 'image'),
+            ('Animation', 'animation_per_second', 'second'),
+            ('Visual review', 'planning_per_request', 'request'),
+        )
+        if generation.get('separate_voice'):
+            stage_rates += (('Voice clips', 'voice_per_1000_chars', '1,000 characters'),)
+        costs = ''.join(
+            f'<li>{name} · {_price(rates[key])} per {unit}</li>'
+            if rates.get(key) else f'<li>{name} · Rate required</li>'
+            for name, key, unit in stage_rates
+        )
+        return f'''
+        <section class="record stack generation-fields" aria-label="Video generation settings">
+          {expected_mode}
+          <p>{_generation_summary(generation)} · <a href="/settings#video-generation">Settings</a></p>
+          {casting}
+          <p class="muted">Estimated cost depends on the scene plan.</p><ul>{costs}</ul>
+        </section>'''
+
+    duration = str(values.get('duration', 30))
+    aspect = values.get('aspect_ratio', '9:16')
+    resolution = values.get('resolution', '720p')
+    aspects = ''.join(
+        f'<option value="{ratio}"{" selected" if ratio == aspect else ""}>{label}</option>'
+        for ratio, label in (('9:16', '9:16 vertical'), ('16:9', '16:9 horizontal'), ('1:1', '1:1 square'),
+                             ('3:4', '3:4'), ('4:3', '4:3'), ('21:9', '21:9'))
+    )
+    resolutions = ''.join(f'<option value="{size}"{" selected" if size == resolution else ""}>{size}</option>'
+                          for size in ('720p', '480p'))
+    video_rate = rates.get('direct_per_second') or 0
+    voice_rate = 0
+    narration = values.get('narration', '')
+    if generation.get('separate_voice'):
+        voice_rate = rates.get('voice_per_1000_chars') or 0
+        audio_control = f'''
+          <label>Narration<textarea name="narration" maxlength="4000" rows="3" required>{_text(narration)}</textarea></label>
+          <small>This recording plays over the generated video.</small>'''
+    else:
+        samples = [asset for asset in characters if asset.get('audio')]
+        sample_options = ''.join(
+            f'<option value="{_text(asset["id"])}"{" selected" if values.get("voice_reference") == asset["id"] else ""}>'
+            f'{_text(asset["name"])}</option>' for asset in samples
+        )
+        audio_control = f'''
+          <label>Voice reference <small>(optional)</small><select name="voice_reference">
+            <option value="">Use native generated voice</option>{sample_options}
+          </select></label>
+          <small>Select the character above to use its saved voice sample.</small>''' if samples else ''
+    estimate = 'Set the video rate in Providers to estimate cost.'
+    if video_rate and duration.isdecimal() and 4 <= int(duration) <= 30:
+        total = int(duration) * video_rate + (len(narration.strip()) * voice_rate + 999) // 1000
+        estimate = f'Estimated cost · {_price(total)} per video'
+        if generation.get('separate_voice') and not voice_rate:
+            estimate = f'Estimated video cost · {_price(total)}. Set the voice rate in Providers to estimate the total.'
+    return f'''
+    <section class="record stack generation-fields" aria-label="Video generation settings" data-generation-estimate
+        data-video-rate="{video_rate}" data-voice-rate="{voice_rate}">
+      {expected_mode}
+      <p>Direct video · {'Separate voice clips' if generation.get('separate_voice') else 'Native video audio'}
+        · <a href="/settings#video-generation">Settings</a></p>
+      <div class="fields">
+        <label>Video model<select name="model"><option value="{DIRECT_MODEL}">{_DIRECT_MODEL_LABEL}</option></select></label>
+        <label>Duration (seconds)<input name="duration" type="number" min="4" max="30" value="{_text(duration)}" required></label>
+        <label>Aspect ratio<select name="aspect_ratio">{aspects}</select></label>
+        <label>Resolution<select name="resolution">{resolutions}</select></label>
+      </div>
+      {casting}
+      {references('Scene elements', 'element', elements)}
+      {audio_control}
+      <p class="muted" aria-live="polite" data-estimated-cost>{estimate}</p>
+    </section>'''
+
+
+def _publishing_section(job, posts, channels, metrics, csrf_token, post_draft, preview, qa, revision,
+                        *, explicit_copy=False, copy_rate=None):
     ready = _ready_for_review(job)
     if not (posts or ready):
         return ''
@@ -155,7 +281,7 @@ def _publishing_section(job, posts, channels, metrics, csrf_token, post_draft, p
         draft_notice = ''
         if saved.get('error'):
             draft_notice = f'<p class="notice" role="status">{_text(saved["error"])}</p>'
-        elif draft_status in ('pending', 'generating'):
+        elif draft_status == 'generating' or (draft_status == 'pending' and not explicit_copy):
             draft_notice = '<p class="muted" role="status">Post details are being prepared. You can enter your own.</p>'
         selected = set(saved.get('channels') or ())
         channel_times = saved.get('channel_times') or {}
@@ -227,6 +353,14 @@ def _publishing_section(job, posts, channels, metrics, csrf_token, post_draft, p
           </div>
           <small role="status" data-post-review-notice hidden></small>
         </form>'''
+        if explicit_copy:
+            cost_label = f'Estimated cost · {_price(copy_rate)} per request' if copy_rate else 'Uses the Claude rate in Providers.'
+            form = f'''<div>{form}
+            <form method="post" action="/workspace/{job_id}/generate-post-details" class="actions">
+              {_csrf(csrf_token)}
+              <input type="hidden" name="preview_path" value="{_text(job['preview_path'])}">
+              <button type="submit">Generate post details</button><small>{cost_label}</small>
+            </form></div>'''
     review = f'<div class="columns"><div>{preview}{qa}{revision}</div>{form}</div>' if ready else ''
     heading = 'Post review' if ready else 'Publishing'
     panel_spacing = 'post-review' if ready else 'records'
@@ -251,15 +385,26 @@ def _scene_dialogue(scene, asset_names):
 def workspace_page(
     jobs, job=None, notice='', tasks=(), csrf_token='', *, posts=(), channels=(), metrics=(),
     assets=(), presets=(), production_options=None, production_options_open=False, brand_profiles=None,
-    status_filter='', post_draft=None,
+    status_filter='', post_draft=None, generation_rates=None,
 ) -> str:
     if job is not None:
         from app.library_view import production_options_section
 
         error = job.get('stage_error')
         error_html = f'<p class="notice">{_text(error)}</p>' if error else ''
-        scenes = json.loads(job.get('plan_json') or '[]')
+        options = production_options if production_options is not None else json.loads(job.get('production_options_json') or '{}')
+        generation = options.get('generation')
+        direct = bool(generation) and not generation.get('scene_plan')
+        scenes = [] if direct else json.loads(job.get('plan_json') or '[]')
         asset_names = {asset['id']: asset['name'] for asset in assets}
+        generation_details = ''
+        if generation:
+            references = [*options.get('characters', ()), *generation.get('elements', ())]
+            choices = ', '.join(asset_names.get(asset_id, asset_id) for asset_id in references)
+            voice = generation.get('voice_reference')
+            ref_label = f'<p class="muted">References · {_text(choices)}</p>' if choices else ''
+            voice_label = f'<p class="muted">Voice sample · {_text(asset_names.get(voice, voice))}</p>' if voice else ''
+            generation_details = f'<p class="muted">{_generation_summary(generation)}</p>{ref_label}{voice_label}'
         scene_link = 'Edit scene' if can_edit_scene(job, tasks) else 'View scene'
         scenes_html = ''.join(
             f'''<li><h4>{_text(scene['scene_id'])} · {int(scene['duration'])} seconds</h4>
@@ -336,11 +481,10 @@ def workspace_page(
         action_menu_html = _action_menu(menu_items)
         heading_action = f'<div class="header-actions"><span class="status">{_label(job["status"])}</span>{action_menu_html}</div>'
 
-        plan_warning = (
-            '<p class="muted"><small>Title changes preserve video progress. Changing the prompt starts a new plan '
-            'and clears the generated media and preview.</small></p>'
-            if job.get('plan_json') else ''
-        )
+        plan_warning = ''
+        if job.get('plan_json'):
+            rerun = 'starts a new generation' if direct else 'starts a new plan'
+            plan_warning = f'<p class="muted"><small>Title changes preserve video progress. Changing the prompt {rerun} and clears the generated media and preview.</small></p>'
         edit_dialog = f'''
         <dialog class="brand-dialog" id="edit-job-dialog">
           <div class="brand-dialog-header">
@@ -362,7 +506,11 @@ def workspace_page(
         scene_review = f'<p><a href="#scene-plan">{scene_link}s</a></p>' if scenes_html else ''
         publishing = _publishing_section(
             job, posts, channels, metrics, csrf_token, post_draft, preview_html, qa_html + error_html,
-            scene_review + revision,
+            scene_review + revision, explicit_copy=bool(generation),
+            copy_rate=(generation_rates or {}).get('planning_per_request'),
+        )
+        options_html = '' if direct else production_options_section(
+            job, assets, presets, production_options, csrf_token, expanded=production_options_open, brand_profiles=brand_profiles,
         )
         content = f'''
         {publishing if ready else ''}
@@ -373,8 +521,9 @@ def workspace_page(
           </div>
           <h3>Production prompt</h3>
           <p class="prompt">{_text(job['prompt'])}</p>
+          {generation_details}
           {error_html if not ready else ''}
-          {production_options_section(job, assets, presets, production_options, csrf_token, expanded=production_options_open, brand_profiles=brand_profiles)}
+          {options_html}
           {'<h3 id="scene-plan">Scene plan</h3><ol>' + scenes_html + '</ol>' if scenes_html else ''}
           {'<h3>Keyframes</h3><div class="keyframes">' + frames + '</div>' if frames else ''}
           {'<ul class="notice">' + errors + '</ul>' if errors else ''}
@@ -424,7 +573,8 @@ def workspace_page(
     )
 
 
-def new_video_page(csrf_token, *, values=None, notice='', brand_profiles=None) -> str:
+def new_video_page(csrf_token, *, values=None, notice='', brand_profiles=None, generation=None,
+                   generation_assets=(), generation_rates=None) -> str:
     values = values or {}
     brand_select = ''
     if brand_profiles:
@@ -446,6 +596,7 @@ def new_video_page(csrf_token, *, values=None, notice='', brand_profiles=None) -
         {brand_select}
         <label>Title <span class="muted">(optional)</span><input name="title" value="{title}" maxlength="100" placeholder="e.g. Tavi and the Garden Seed"></label>
         <label>Production prompt<textarea name="prompt" rows="5" required placeholder="Describe the scene, actions, characters, and mood...">{prompt}</textarea></label>
+        {generation_fields(generation, generation_assets, generation_rates, values)}
         <div class="actions">
           <button type="submit" class="primary">Start Production</button>
           <a href="/workspace">Cancel</a>

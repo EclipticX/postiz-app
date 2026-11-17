@@ -1,6 +1,12 @@
 services:
   postiz:
-    image: ghcr.io/gitroomhq/postiz-app:latest
+    image: postiz-app-local:dev
+    pull_policy: build
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+      args:
+        NEXT_PUBLIC_VERSION: '${NEXT_PUBLIC_VERSION:-local}'
     container_name: postiz
     restart: always
     environment:
@@ -8,6 +14,7 @@ services:
       MAIN_URL: 'http://localhost:4007'
       FRONTEND_URL: 'http://localhost:4007'
       NEXT_PUBLIC_BACKEND_URL: 'http://localhost:4007/api'
+      VIDEO_STUDIO_URL: 'http://127.0.0.1:${STUDIO_PORT:-8090}'
       JWT_SECRET: 'random string that is unique to every install - just type random characters here!'
       DATABASE_URL: 'postgresql://postiz-user:postiz-password@postiz-postgres:5432/postiz-db-local'
       REDIS_URL: 'redis://postiz-redis:6379'
@@ -133,6 +140,19 @@ services:
       postiz-redis:
         condition: service_healthy
 
+  studio:
+    build: ./video-studio
+    restart: always
+    ports:
+      - '127.0.0.1:${STUDIO_PORT:-8090}:8090'
+    environment:
+      STUDIO_POSTIZ_URL: '${STUDIO_POSTIZ_URL:-http://postiz:5000}'
+      STUDIO_POSTIZ_CALENDAR_URL: 'http://localhost:4007/launches'
+    volumes:
+      - studio-data:/studio/data
+    networks:
+      - postiz-network
+
   postiz-postgres:
     image: postgres:17-alpine
     container_name: postiz-postgres
@@ -180,6 +200,7 @@ services:
   temporal-elasticsearch:
     container_name: temporal-elasticsearch
     image: elasticsearch:7.17.27
+    restart: always
     environment:
       - cluster.routing.allocation.disk.threshold_enabled=true
       - cluster.routing.allocation.disk.watermark.low=512mb
@@ -198,6 +219,7 @@ services:
   temporal-postgresql:
     container_name: temporal-postgresql
     image: postgres:16
+    restart: always
     environment:
       POSTGRES_PASSWORD: temporal
       POSTGRES_USER: temporal
@@ -210,6 +232,7 @@ services:
 
   temporal:
     container_name: temporal
+    restart: always
     ports:
       - '7233:7233'
     image: temporalio/auto-setup:1.28.1
@@ -259,6 +282,9 @@ services:
       - '8080:8080'
 
 volumes:
+  studio-data:
+    name: '${STUDIO_DATA_VOLUME:-video-studio_studio-data}'
+
   postgres-volume:
     external: false
 

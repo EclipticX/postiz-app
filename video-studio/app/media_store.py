@@ -2,11 +2,14 @@
 
 import hashlib
 import json
+from datetime import time
+from zoneinfo import ZoneInfo
 
 from app.scenes import spoken_lines
 
 
 MAX_MEDIA_ATTEMPTS = 3
+DIRECT_SCENE_ID = "direct"
 ACTIVE_JOB_STATUSES = ("making_keyframes", "making_media")
 SCENE_EDIT_STATUSES = ("review_keyframes", "preview_ready", "needs_review")
 _AUTO_KEYFRAME_JOBS = """
@@ -19,6 +22,49 @@ _AUTO_KEYFRAME_JOBS = """
         AND schedule_generation_options.auto_approve_keyframes = 1
         AND (? IS NULL OR jobs.id = ?) ORDER BY jobs.id
 """
+
+
+def job_generation(job):
+    raw = job["production_options_json"] if "production_options_json" in job.keys() else None
+    return json.loads(raw or "{}").get("generation", {})
+
+
+def selected_elements(profile, generation):
+    elements = {asset["id"]: asset for asset in profile["assets"] if asset["kind"] in ("place", "item")}
+    chosen = generation.get("elements", ())
+    if any(asset_id not in elements for asset_id in chosen):
+        raise ValueError("Choose saved props or locations with a usable reference image.")
+    return [elements[asset_id] for asset_id in chosen]
+
+
+def queued_job_candidates(db, job_id, *, direct):
+    return db.execute(
+        """SELECT jobs.*, prompt_schedules.id AS batch_id, prompt_schedules.status AS batch_status,
+            prompt_schedules.timezone AS batch_timezone, prompt_schedules.run_at AS batch_time,
+            prompt_schedules.daily_limit AS batch_limit
+            FROM jobs LEFT JOIN schedule_entries ON schedule_entries.id = jobs.schedule_entry_id
+            LEFT JOIN prompt_schedules ON prompt_schedules.id = schedule_entries.schedule_id
+            WHERE jobs.status = 'queued' AND (? IS NULL OR jobs.id = ?)
+                AND (json_extract(jobs.production_options_json, '$.generation.scene_plan') IS 0) = ?
+            ORDER BY jobs.stage_error IS NOT NULL, jobs.id""",
+        (job_id, job_id, direct),
+    ).fetchall()
+
+
+def production_slot(db, job, now):
+    started_for = job["planning_started_for"]
+    if not job["batch_id"] or started_for is not None:
+        return True, started_for
+    local = now.astimezone(ZoneInfo(job["batch_timezone"]))
+    if job["batch_status"] != "active" or local.time() < time.fromisoformat(job["batch_time"]):
+        return False, None
+    started_for = local.date().isoformat()
+    started_today = db.execute(
+        """SELECT COUNT(*) FROM jobs JOIN schedule_entries ON schedule_entries.id = jobs.schedule_entry_id
+            WHERE schedule_entries.schedule_id = ? AND jobs.planning_started_for = ?""",
+        (job["batch_id"], started_for),
+    ).fetchone()[0]
+    return started_today < job["batch_limit"], started_for
 
 
 def can_edit_scene(job, tasks):
@@ -34,14 +80,15 @@ def scene_revision(job, tasks):
     return hashlib.sha256(json.dumps(snapshot).encode("utf-8")).hexdigest()
 
 
-def queue_scene_media(db, job_id, scenes):
+def queue_scene_media(db, job_id, scenes, *, separate_voice=True):
     tasks = []
     for scene in scenes:
         tasks.append((job_id, scene["scene_id"], "video", 0))
-        tasks.extend(
-            (job_id, scene["scene_id"], "voice", index)
-            for index, _ in enumerate(spoken_lines(scene))
-        )
+        if separate_voice:
+            tasks.extend(
+                (job_id, scene["scene_id"], "voice", index)
+                for index, _ in enumerate(spoken_lines(scene))
+            )
     db.executemany(
         """INSERT INTO media_tasks (job_id, scene_id, kind, line_index) VALUES (?, ?, ?, ?)
         ON CONFLICT (job_id, scene_id, kind, line_index) DO NOTHING""",
@@ -84,11 +131,45 @@ class MediaStore:
     def __init__(self, store):
         self.store = store
 
+    def queue_direct(self, now, *, job_id=None, preflight):
+        with self.store._connection() as db:
+            candidates = [job for job in queued_job_candidates(db, job_id, direct=True)
+                          if production_slot(db, job, now)[0]]
+        for job in candidates:
+            issue = None
+            try:
+                profile = preflight(job)
+            except (OSError, ValueError, LookupError) as error:
+                issue = str(error)
+            with self.store._connection(write=True) as db:
+                current = next(iter(queued_job_candidates(db, job["id"], direct=True)), None)
+                if current is None or any(current[field] != job[field] for field in (
+                    "prompt", "production_options_json", "revision_feedback",
+                )):
+                    continue
+                allowed, started_for = production_slot(db, current, now)
+                if not allowed:
+                    continue
+                if issue is not None:
+                    db.execute("UPDATE jobs SET stage_error = ? WHERE id = ?", (issue, job["id"]))
+                    continue
+                generation = job_generation(job)
+                queue_scene_media(
+                    db, job["id"], [{"scene_id": DIRECT_SCENE_ID, "dialogue": generation.get("narration", "")}],
+                    separate_voice=generation.get("separate_voice", False),
+                )
+                db.execute(
+                    """UPDATE jobs SET status = 'making_media', stage_error = NULL,
+                        production_context_json = ?, planning_started_for = ? WHERE id = ?""",
+                    (json.dumps(profile), started_for, job["id"]),
+                )
+                return
+
     def queue_keyframes(self, *, job_id=None, preflight=None):
         queued = 0
         with self.store._connection(write=True) as db:
             jobs = db.execute(
-                "SELECT id, plan_json FROM jobs WHERE status = 'planned' AND (? IS NULL OR id = ?) ORDER BY id",
+                "SELECT * FROM jobs WHERE status = 'planned' AND (? IS NULL OR id = ?) ORDER BY id",
                 (job_id, job_id),
             ).fetchall()
             for job in jobs:
@@ -102,7 +183,7 @@ class MediaStore:
                     continue
                 if preflight:
                     try:
-                        preflight(job["id"], scenes)
+                        preflight(job, scenes)
                     except ValueError as error:
                         db.execute("UPDATE jobs SET stage_error = ? WHERE id = ?", (str(error), job["id"]))
                         continue
@@ -151,7 +232,7 @@ class MediaStore:
 
     def approve_keyframes(self, job_id, *, expected_revision=None, automatic=False):
         with self.store._connection(write=True) as db:
-            job = db.execute("SELECT id, status, plan_json, qa_json FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            job = db.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
             if job is None:
                 raise LookupError("Video job not found.")
             if job["status"] != "review_keyframes":
@@ -165,7 +246,7 @@ class MediaStore:
             scenes = _load_scenes(job["plan_json"])
             ready_keyframes(scenes, tasks)
 
-            queue_scene_media(db, job_id, scenes)
+            queue_scene_media(db, job_id, scenes, separate_voice=job_generation(job).get("separate_voice", True))
             self._finish_keyframe_review(db, job, None)
             db.execute("UPDATE jobs SET status = 'making_media' WHERE id = ?", (job_id,))
 
@@ -175,7 +256,7 @@ class MediaStore:
                 dict(row) for row in db.execute(
                     """
                     SELECT media_tasks.*, jobs.plan_json, jobs.niche_id, jobs.production_context_json,
-                        jobs.status AS job_status
+                        jobs.production_options_json, jobs.prompt, jobs.revision_feedback, jobs.status AS job_status
                     FROM media_tasks JOIN jobs ON jobs.id = media_tasks.job_id
                     WHERE (media_tasks.status = 'pending'
                         OR (media_tasks.status = 'queued' AND jobs.status IN (?, ?)))
@@ -186,7 +267,10 @@ class MediaStore:
                 )
             ]
 
-    def begin(self, task_id, provider_name, reservation_id):
+    def begin(self, task_id, provider_name, reservation_id, *, expected_job=None):
+        expected = (None, None, None) if expected_job is None else (
+            expected_job["prompt"], expected_job["production_options_json"], expected_job["revision_feedback"],
+        )
         with self.store._connection(write=True) as db:
             updated = db.execute(
                 """
@@ -196,6 +280,8 @@ class MediaStore:
                 WHERE id = ? AND status = 'queued' AND attempts < ?
                     AND EXISTS (
                         SELECT 1 FROM jobs WHERE jobs.id = media_tasks.job_id AND jobs.status IN (?, ?)
+                            AND (? OR (jobs.prompt IS ? AND jobs.production_options_json IS ?
+                                AND jobs.revision_feedback IS ?))
                     )
                     AND EXISTS (
                         SELECT 1 FROM spend_reservations
@@ -205,6 +291,7 @@ class MediaStore:
                 """,
                 (
                     provider_name, reservation_id, task_id, MAX_MEDIA_ATTEMPTS, *ACTIVE_JOB_STATUSES,
+                    expected_job is None, *expected,
                     reservation_id, provider_name,
                 ),
             )

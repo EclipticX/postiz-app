@@ -19,6 +19,8 @@ class ProviderRequest:
     aspect_ratio: str = '9:16'
     voice_speed: Optional[float] = None
     voice_expressiveness: Optional[float] = None
+    generate_audio: bool = False
+    audio_references: tuple[str, ...] = field(default=(), repr=False)
 
 
 @dataclass(frozen=True)

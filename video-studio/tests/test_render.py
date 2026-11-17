@@ -9,11 +9,47 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from app.render import RenderError, render_video, sample_frames
+from app.render import RenderError, render_direct_video, render_video, sample_frames
 
 
 @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "Requires FFmpeg and ffprobe")
 class RenderFixtureTests(unittest.TestCase):
+    def test_direct_render_keeps_picture_and_native_audio_or_replaces_audio(self):
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            clip = self.clip(work / "source.mp4", "blue", "160x90", 6)
+            native = render_direct_video(clip, None, work / "native.mp4", 6)
+            voice = self.tone(work / "voice.wav", 2, 660)
+            voiced = render_direct_video(clip, voice, work / "voiced.mp4", 6)
+
+            native_video, native_audio = self.probe(native)["streams"]
+            self.assertEqual((native_video["width"], native_video["height"]), (160, 90))
+            self.assertEqual(native_audio["codec_name"], "aac")
+            self.assertGreater(self.tone_power(self.audio_samples(native, 0.5), 900), 500)
+            self.assertGreater(self.tone_power(self.audio_samples(voiced, 0.5), 660), 500)
+            self.assertLess(self.tone_power(self.audio_samples(voiced, 0.5), 900), 30)
+            self.assertFalse(any(self.audio_samples(voiced, 4)))
+
+            with self.assertRaisesRegex(RenderError, "requested 4-second duration"):
+                render_direct_video(clip, None, native, 4)
+            self.assertAlmostEqual(float(self.probe(native)["format"]["duration"]), 6.0, places=1)
+
+    def test_native_scene_audio_joins_audio_tracks_and_silent_clips(self):
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            clip = self.clip(work / "source.mp4", "blue", "90x160", 4)
+            silent = work / "silent.mp4"
+            self.ffmpeg("-i", str(clip), "-c:v", "copy", "-an", str(silent))
+            scenes = [
+                {"scene_id": "one", "duration": 4, "dialogue": "Generated speech"},
+                {"scene_id": "two", "duration": 4, "dialogue": ""},
+            ]
+            result = render_video(scenes, {"one": clip, "two": silent}, {}, work / "preview.mp4", native_audio=True)
+
+            self.assertGreater(self.tone_power(self.audio_samples(result, 0.5), 900), 500)
+            self.assertFalse(any(self.audio_samples(result, 5)))
+            self.assertFalse(result.with_suffix(".srt").exists())
+
     def test_render_burns_approved_subtitles_and_samples_each_scene(self):
         with tempfile.TemporaryDirectory() as directory:
             work = Path(directory)
@@ -214,7 +250,7 @@ class NarrationValidationTests(unittest.TestCase):
             clip, first, second = (work / name for name in ("clip.mp4", "first.wav", "second.wav"))
             for path in (clip, first, second):
                 path.touch()
-            with patch("app.render._audio_duration", side_effect=(2.2, 2.2)):
+            with patch("app.render.audio_duration", side_effect=(2.2, 2.2)):
                 with self.assertRaisesRegex(RenderError, "exceeds its 4-second scene"):
                     render_video(
                         [scene], {"one": clip}, {"one": [first, second]}, work / "preview.mp4",

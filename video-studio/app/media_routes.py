@@ -12,11 +12,16 @@ from time import monotonic
 from urllib.parse import urlsplit
 
 from .providers import ClaudeAdapter, EvoLinkAdapter, FalAdapter, ProviderError
+from .providers.fal import SEEDANCE_FLASH_MAX_AUDIO_BYTES, SEEDANCE_FLASH_ROUTE, supports_seedance_flash
+from .render import RenderError, audio_duration
 from .settings import provider_blockers, provider_order
 
 
-_KINDS = {'keyframe': ('image', 'image'), 'video': ('video', 'second'), 'voice': ('tts', '1000_characters')}
-_FAL_ROUTES = {'fal-nano-banana-pro', 'fal-veo', 'fal-kling', 'fal-elevenlabs'}
+_KINDS = {
+    'keyframe': ('image', 'image'), 'video': ('video', 'second'),
+    'voice': ('tts', '1000_characters'), 'direct': ('video', 'second'),
+}
+_FAL_ROUTES = {'fal-nano-banana-pro', 'fal-veo', 'fal-kling', 'fal-elevenlabs', SEEDANCE_FLASH_ROUTE}
 _VIDEO_REFERENCE_LIMITS = {'fal-veo': 1, 'evolink-seedance': 1, 'fal-kling': 10}
 _LIMITS = {'keyframe': 12 * 1024**2, 'video': 80 * 1024**2, 'voice': 16 * 1024**2}
 _EVOLINK_CDN_HOSTS = {'cdn.evolink.ai', 'files.evolink.ai'}
@@ -38,6 +43,8 @@ def eligible_routes(settings, kind, request, preferred=None):
 def _supports(provider, kind, request):
     name = provider['name']
     capabilities = provider['capabilities']
+    if kind == 'direct':
+        return name == SEEDANCE_FLASH_ROUTE and supports_seedance_flash(request)
     reference_count = int(bool(request.reference_image)) + len(request.reference_images)
     if kind == 'keyframe':
         return (
@@ -53,6 +60,7 @@ def _supports(provider, kind, request):
         bool(request.reference_image) and capabilities.get('image_to_video')
         and capabilities.get('reference_image')
         and reference_count <= _VIDEO_REFERENCE_LIMITS.get(name, 0)
+        and (not request.generate_audio or capabilities.get('audio'))
         and type(duration) is int and duration in capabilities.get('durations', ())
         and request.aspect_ratio in capabilities.get('aspect_ratios', ())
         and request.resolution in capabilities.get('resolutions', ())
@@ -107,6 +115,33 @@ def local_image(path):
     return f'data:{mime};base64,{base64.b64encode(data).decode("ascii")}'
 
 
+def local_audio(path):
+    """Encode a saved MP3 or WAV voice reference within the provider limits."""
+    try:
+        with Path(path).open('rb') as source:
+            data = source.read(SEEDANCE_FLASH_MAX_AUDIO_BYTES + 1)
+    except OSError:
+        raise ProviderError('The local voice reference could not be read.') from None
+    if len(data) > SEEDANCE_FLASH_MAX_AUDIO_BYTES:
+        raise ProviderError('Voice references must be at most 15 MB.')
+    if data.startswith(b'RIFF') and data[8:12] == b'WAVE':
+        mime, input_format = 'audio/wav', 'wav'
+    elif _matches_artifact('voice', data):
+        mime, input_format = 'audio/mpeg', 'mp3'
+    else:
+        raise ProviderError('The voice reference needs to be a readable MP3 or WAV file.')
+    try:
+        with NamedTemporaryFile() as sample:
+            sample.write(data)
+            sample.flush()
+            duration = audio_duration(sample.name, input_format=input_format)
+    except (OSError, RenderError, ValueError):
+        raise ProviderError('The voice reference needs to be a readable MP3 or WAV file.') from None
+    if not 1.8 <= duration <= 30.2:
+        raise ProviderError('Voice references must be between 1.8 and 30.2 seconds.')
+    return f'data:{mime};base64,{base64.b64encode(data).decode("ascii")}'
+
+
 def _rasterize_svg(data):
     try:
         # Use stdin, which gives librsvg no source directory for resolving external files.
@@ -144,7 +179,8 @@ def _artifact_source(url):
     try:
         parts = urlsplit(url)
         host = parts.hostname or ''
-        allowed_host = host == 'fal.media' or host.endswith('.fal.media') or host in _EVOLINK_CDN_HOSTS
+        fal_storage = host == 'storage.googleapis.com' and parts.path.startswith('/falserverless/')
+        allowed_host = host == 'fal.media' or host.endswith('.fal.media') or host in _EVOLINK_CDN_HOSTS or fal_storage
         if (
             parts.scheme != 'https' or not allowed_host or parts.port not in (443, None)
             or parts.username is not None or parts.fragment or not parts.path.startswith('/')

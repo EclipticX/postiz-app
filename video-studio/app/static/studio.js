@@ -1,6 +1,50 @@
 // studio.js - Shared UI interactions for Video Studio
 
 document.addEventListener('DOMContentLoaded', () => {
+  document.querySelectorAll('[data-generation-estimate]').forEach((form) => {
+    const duration = form.querySelector('[name="duration"]');
+    const narration = form.querySelector('[name="narration"]');
+    const cost = form.querySelector('[data-estimated-cost]');
+    const videoRate = Number(form.dataset.videoRate);
+    const voiceRate = Number(form.dataset.voiceRate);
+    const currency = new Intl.NumberFormat('en-US', {
+      style: 'currency', currency: 'USD', maximumFractionDigits: 6,
+    });
+    const updateEstimate = () => {
+      const seconds = Number(duration.value);
+      if (!Number.isInteger(seconds) || seconds < 4 || seconds > 30) {
+        cost.textContent = 'Enter a duration from 4 to 30 seconds to estimate cost.';
+        return;
+      }
+      if (!videoRate) {
+        cost.textContent = 'Set the video rate in Providers to estimate cost.';
+        return;
+      }
+      const characters = narration ? Array.from(narration.value.trim()).length : 0;
+      const total = seconds * videoRate + Math.ceil(characters * voiceRate / 1000);
+      const amount = currency.format(total / 1_000_000);
+      cost.textContent = narration && !voiceRate
+        ? `Estimated video cost · ${amount}. Set the voice rate in Providers to estimate the total.`
+        : `Estimated cost · ${amount} per video`;
+    };
+    duration.addEventListener('input', updateEstimate);
+    if (narration) narration.addEventListener('input', updateEstimate);
+
+    const voice = form.querySelector('[name="voice_reference"]');
+    if (voice) {
+      const cast = form.querySelectorAll('[name="character"]');
+      const updateVoice = () => {
+        const selected = new Set(Array.from(cast).filter((character) => character.checked).map((character) => character.value));
+        Array.from(voice.options).forEach((option) => {
+          option.disabled = Boolean(option.value) && !selected.has(option.value);
+        });
+        if (voice.value && !selected.has(voice.value)) voice.value = '';
+      };
+      cast.forEach((character) => character.addEventListener('change', updateVoice));
+      updateVoice();
+    }
+  });
+
   const postReview = document.querySelector('[data-post-review]');
   if (postReview) {
     const channels = postReview.querySelectorAll('input[name="channel"]');

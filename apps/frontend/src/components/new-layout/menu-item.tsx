@@ -4,12 +4,13 @@ import { usePathname } from 'next/navigation';
 import clsx from 'clsx';
 import Link from 'next/link';
 
-export const MenuItem: FC<{ label: string; icon: ReactNode; path: string; onClick?: () => void }> = ({
-  label,
-  icon,
-  path,
-  onClick,
-}) => {
+export const MenuItem: FC<{
+  label: string;
+  icon: ReactNode;
+  path: string;
+  onClick?: () => void;
+  sameTab?: boolean;
+}> = ({ label, icon, path, onClick, sameTab }) => {
   const currentPath = usePathname();
   const isActive = currentPath.indexOf(path) === 0;
 
@@ -32,6 +33,14 @@ export const MenuItem: FC<{ label: string; icon: ReactNode; path: string; onClic
       <button onClick={onClick} title={label} className={className}>
         {inner}
       </button>
+    );
+  }
+
+  if (sameTab) {
+    return (
+      <a href={path} title={label} className={className}>
+        {inner}
+      </a>
     );
   }
 

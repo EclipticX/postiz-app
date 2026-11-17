@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -78,3 +79,19 @@ class StudioPostDraftTests(unittest.TestCase):
         self.assertEqual(self.provider.submit.call_count, 1)
         self.drafts.save(self.job_id, self.first, {"title": "Manual fallback"})
         self.assertEqual(self.draft()["status"], "ready")
+
+    def test_new_generation_profile_requires_an_explicit_copy_request(self):
+        with self.store._connection(write=True) as db:
+            db.execute("UPDATE jobs SET production_options_json = ? WHERE id = ?",
+                       (json.dumps({"generation": {"scene_plan": False}}), self.job_id))
+        self.drafts.prepare(NOW)
+        self.provider.submit.assert_not_called()
+        self.assertEqual(self.draft()["status"], "manual")
+
+        self.drafts.save(self.job_id, self.first, {"title": "My title", "channels": ["yt"]})
+        self.drafts.request(self.job_id, self.first)
+        self.drafts.prepare(NOW)
+        self.assertEqual(self.draft()["caption"], "Tavi finds a seed.")
+        self.assertEqual(self.draft()["channels"], ["yt"])
+        self.drafts.prepare(NOW)
+        self.assertEqual(self.provider.submit.call_count, 1)

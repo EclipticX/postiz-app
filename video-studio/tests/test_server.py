@@ -553,6 +553,44 @@ class StudioHTTPTest(unittest.TestCase):
         self.assertIsNone(self.store.get_job(other)["stage_error"])
         self.assertIn("Claude", self.store.get_job(selected)["stage_error"])
 
+    def test_generation_settings_are_saved_with_new_jobs_and_scheduled_batches(self):
+        _, settings_page = self.request("GET", "/settings")
+        self.assertIn('action="/settings/generation"', settings_page)
+        _, form = self.request("GET", "/workspace/create")
+        self.assertIn('name="expected_scene_plan" value="0"', form)
+        self.assertEqual(self.post("/workspace/create", prompt="An old form", expected_scene_plan="1"), 400)
+        self.assertEqual(self.store.list_jobs(), [])
+
+        inputs = {
+            "model": "fal-seedance-25-flash", "duration": "18", "aspect_ratio": "16:9", "resolution": "720p",
+            "character": ["tavi_seed_sprite"], "expected_scene_plan": "0", "expected_separate_voice": "0",
+        }
+        self.assertEqual(self.post("/workspace/create", prompt="Tavi visits a garden", **inputs), 303)
+        self.assertEqual(self.post(
+            "/schedules", title="Direct batch", prompts="Tavi finds a seed", start_date="2026-11-09",
+            run_at="09:00", timezone="Asia/Dhaka", daily_limit="1", **inputs,
+        ), 303)
+        self.assertEqual(self.post("/schedules/1/status", status="active"), 303)
+        self.assertEqual(self.post("/settings/generation", scene_plan="1", separate_voice="1"), 303)
+        self.assertEqual(self.store.dispatch_due(datetime(2026, 11, 9, 3, tzinfo=timezone.utc)), 1)
+
+        for record in self.store.list_jobs():
+            options = json.loads(record["production_options_json"])
+            self.assertEqual(options["characters"], ["tavi_seed_sprite"])
+            self.assertEqual(options["generation"]["duration"], 18)
+            self.assertFalse(options["generation"]["scene_plan"])
+            self.assertFalse(options["generation"]["separate_voice"])
+        self.assertEqual(self.post("/workspace/create", prompt="New storyboard job"), 303)
+        self.assertTrue(json.loads(self.store.list_jobs()[0]["production_options_json"])["generation"]["scene_plan"])
+
+    def test_direct_with_separate_voice_requires_user_narration(self):
+        self.assertEqual(self.post("/settings/generation", separate_voice="1"), 303)
+        self.assertEqual(self.post("/workspace/create", prompt="A garden"), 400)
+        self.assertEqual(self.store.list_jobs(), [])
+        self.assertEqual(self.post("/workspace/create", prompt="A garden", narration="The garden is colorful."), 303)
+        options = json.loads(self.store.list_jobs()[0]["production_options_json"])
+        self.assertEqual(options["generation"]["narration"], "The garden is colorful.")
+
     @REQUIRES_FFMPEG
     def test_character_profile_upload_and_per_video_options_through_http(self):
         self.assertEqual(self.request("GET", "/characters/new/profile")[0], 200)

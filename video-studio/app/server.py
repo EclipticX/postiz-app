@@ -21,6 +21,7 @@ from app.asset_view import asset_page, assets_page
 from app.brand_view import brand_rules_page
 from app.character_view import character_page, characters_page
 from app.db import StudioStore
+from app.generation import generation_options, generation_rates, generation_view
 from app.inbox_view import create_page, edit_idea_page, edit_schedule_page, inbox_page, record_page
 from app.media_store import can_edit_scene, scene_revision
 from app.niche import load_profile
@@ -293,6 +294,7 @@ class StudioHandler(BaseHTTPRequestHandler):
         self._reply(status, settings_page(
             self.server.settings.get_budgets(),
             self.server.planning.idea_schedule(), self.server.csrf_token, notice,
+            generation=self.server.settings.get_generation(),
         ))
 
     def _show_providers(self, status=HTTPStatus.OK, notice="", tab=""):
@@ -360,6 +362,7 @@ class StudioHandler(BaseHTTPRequestHandler):
             brand_profiles=self.server.store.list_brand_profiles(),
             status_filter=status_filter,
             post_draft=post_draft_override if post_draft_override is not None else self.server.post_drafts.get(job),
+            generation_rates=generation_rates(self.server.settings) if job and job.get("preview_path") else None,
         ))
 
     def _show_scene_editor(self, job_id, scene_id, status=HTTPStatus.OK, notice="", *, values=None):
@@ -518,6 +521,7 @@ class StudioHandler(BaseHTTPRequestHandler):
             self._reply(HTTPStatus.OK, create_page(
                 self.server.csrf_token, kind=kind,
                 brand_profiles=self.server.store.list_brand_profiles(),
+                **(generation_view(self.server.settings, self.server.library) if kind == "schedule" else {}),
             ))
         elif edit_record := INBOX_RECORD_EDIT.fullmatch(url.path):
             self._show_inbox_edit(edit_record[1], int(edit_record[2]))
@@ -604,6 +608,7 @@ class StudioHandler(BaseHTTPRequestHandler):
             self._reply(HTTPStatus.OK, new_video_page(
                 self.server.csrf_token,
                 brand_profiles=self.server.store.list_brand_profiles(),
+                **generation_view(self.server.settings, self.server.library),
             ))
         elif scene := WORKSPACE_SCENE.fullmatch(url.path):
             self._show_scene_editor(int(scene[1]), scene[2])
@@ -779,7 +784,7 @@ class StudioHandler(BaseHTTPRequestHandler):
         brand_default = BRAND_DEFAULT.fullmatch(path)
         brand_delete = BRAND_DELETE.fullmatch(path)
         workspace_route = re.fullmatch(
-            r"/workspace/(\d{1,18})/(generate|approve-keyframes|retry-render|revise|save-post-draft|publish|options|pause|resume|edit|delete)",
+            r"/workspace/(\d{1,18})/(generate|approve-keyframes|retry-render|revise|save-post-draft|generate-post-details|publish|options|pause|resume|edit|delete)",
             path,
         )
         scene_route = WORKSPACE_SCENE.fullmatch(path)
@@ -791,15 +796,30 @@ class StudioHandler(BaseHTTPRequestHandler):
         in_settings = path.startswith("/settings/")
         options = None
         post_draft = None
+
+        def selected_generation():
+            policy = settings.get_generation()
+            for name, enabled in policy.items():
+                expected = field(f"expected_{name}")
+                if expected and expected != str(int(enabled)):
+                    raise ValueError("Video generation settings changed. Review the current settings before saving.")
+            return generation_options(form, policy, library)
+
         try:
             if path == "/ideas":
                 if field("action") == "generate":
-                    job_id = store.create_direct_job(field("prompt"), field("title") or None, brand_id=field("brand_id") or None, source="manual")
+                    job_id = store.create_direct_job(
+                        field("prompt"), field("title") or None, brand_id=field("brand_id") or None,
+                        source="manual", production_options=selected_generation(),
+                    )
                     self._redirect(f"/workspace?job={job_id}")
                     return
                 store.add_idea(field("prompt"), field("title") or None, brand_id=field("brand_id") or None)
             elif path == "/workspace/create":
-                job_id = store.create_direct_job(field("prompt"), field("title") or None, brand_id=field("brand_id") or None, source="direct")
+                job_id = store.create_direct_job(
+                    field("prompt"), field("title") or None, brand_id=field("brand_id") or None,
+                    production_options=selected_generation(),
+                )
                 self._redirect(f"/workspace?job={job_id}")
                 return
             elif path == "/ideas/generate":
@@ -819,7 +839,8 @@ class StudioHandler(BaseHTTPRequestHandler):
                 brand_id = field("brand_id") or None
                 action = field("action")
                 if action == "produce":
-                    job_id = store.create_direct_job(prompt, title, brand_id=brand_id, source="claude")
+                    job_id = store.create_direct_job(prompt, title, brand_id=brand_id, source="claude",
+                                                     production_options=selected_generation())
                     self._redirect(f"/workspace?job={job_id}")
                     return
                 else:
@@ -827,7 +848,10 @@ class StudioHandler(BaseHTTPRequestHandler):
                     self._redirect("/?notice=" + quote("Idea saved to inbox."))
                     return
             elif idea_decision:
-                store.decide_idea(int(idea_decision[1]), field("decision"))
+                idea_id = int(idea_decision[1])
+                idea = store.get_idea(idea_id)
+                production_options = selected_generation() if field("decision") == "accept" and idea and not idea.get("job_id") else None
+                store.decide_idea(idea_id, field("decision"), production_options=production_options)
                 if field("decision") == "accept":
                     idea_row = store.get_idea(int(idea_decision[1]))
                     if idea_row and idea_row.get("job_id"):
@@ -853,11 +877,14 @@ class StudioHandler(BaseHTTPRequestHandler):
                 if "title" in form and not title:
                     raise ValueError("Enter a schedule title.")
                 prompts = [line for line in field("prompts").splitlines() if line.strip()]
+                production_options = selected_generation()
                 store.create_schedule(
                     prompts, field("start_date"), field("run_at"),
                     field("timezone"), int(daily_limit), title=title or None,
                     brand_id=field("brand_id") or None,
-                    auto_approve_keyframes=field("auto_approve_keyframes") == "1",
+                    auto_approve_keyframes=(production_options["generation"]["scene_plan"]
+                                            and field("auto_approve_keyframes") == "1"),
+                    production_options=production_options,
                 )
             elif schedule_status:
                 store.set_schedule_status(int(schedule_status[1]), field("status"))
@@ -922,6 +949,8 @@ class StudioHandler(BaseHTTPRequestHandler):
                 settings.update_provider(
                     provider_route[1], field("enabled") == "yes", int(field("priority")), usd_micros(field("rate")),
                 )
+            elif path == "/settings/generation":
+                settings.set_generation(field("scene_plan") == "1", field("separate_voice") == "1")
             elif path == "/settings/budgets":
                 settings.set_budgets(usd_micros(field("daily")), usd_micros(field("video")))
             elif path == "/settings/idea-schedule":
@@ -1018,6 +1047,10 @@ class StudioHandler(BaseHTTPRequestHandler):
                                for group, prefix in (("presets", "preset."), ("variants", "variant."), ("voices", "voice."))}
                     options["characters"] = sorted(set(form.get("characters", [])))
                     self.server.production.configure(job_id, options)
+                elif action == "generate-post-details":
+                    self.server.post_drafts.request(job_id, field("preview_path"))
+                    self._redirect(f"/workspace?job={job_id}#post-review")
+                    return
                 elif action in ("save-post-draft", "publish"):
                     post_draft = {
                         "title": field("title").strip(), "caption": field("caption").strip(),
@@ -1072,16 +1105,23 @@ class StudioHandler(BaseHTTPRequestHandler):
             elif path == "/workspace/create":
                 self._reply(HTTPStatus.BAD_REQUEST, new_video_page(
                     self.server.csrf_token,
-                    values={name: field(name) for name in ("title", "prompt", "brand_id")},
+                    values={**{name: field(name) for name in ("title", "prompt", "brand_id", "model", "duration",
+                                                             "aspect_ratio", "resolution", "voice_reference", "narration")},
+                            "character": form.get("character", []), "element": form.get("element", [])},
                     notice=str(error),
                     brand_profiles=self.server.store.list_brand_profiles(),
+                    **generation_view(settings, library),
                 ))
             elif create_kind:
                 fields = ("title", "prompt", "trends", "prompts", "start_date", "run_at", "timezone", "daily_limit",
-                          "brand_id", "auto_approve_keyframes")
+                          "brand_id", "auto_approve_keyframes", "model", "duration", "aspect_ratio", "resolution",
+                          "voice_reference", "narration")
                 self._reply(HTTPStatus.BAD_REQUEST, create_page(
-                    self.server.csrf_token, kind=create_kind, values={name: field(name) for name in fields},
+                    self.server.csrf_token, kind=create_kind,
+                    values={**{name: field(name) for name in fields}, "character": form.get("character", []),
+                            "element": form.get("element", [])},
                     notice=str(error), brand_profiles=self.server.store.list_brand_profiles(),
+                    **(generation_view(settings, library) if create_kind == "schedule" else {}),
                 ))
             elif path == "/brand-rules" or brand_default or brand_delete:
                 self._reply(HTTPStatus.BAD_REQUEST, brand_rules_page(

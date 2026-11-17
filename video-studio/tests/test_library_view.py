@@ -5,7 +5,7 @@ from html.parser import HTMLParser
 from app.inbox_view import create_page, edit_schedule_page
 from app.library_view import asset_library_section, production_presets_section
 from app.settings_view import settings_page
-from app.web import workspace_page
+from app.web import new_video_page, workspace_page
 
 
 class Forms(HTMLParser):
@@ -60,6 +60,50 @@ _JOB = {'id': 12, 'title': 'First video', 'status': 'review_keyframes', 'source'
 
 
 class LibraryViewTests(unittest.TestCase):
+    def test_generation_toggles_live_only_in_settings_for_new_jobs(self):
+        settings = Forms(settings_page(_BUDGET, _SCHEDULE, 'token', generation={
+            'scene_plan': True, 'separate_voice': False,
+        })).forms['/settings/generation']['fields']
+        self.assertIn('checked', settings['scene_plan'])
+        self.assertNotIn('checked', settings['separate_voice'])
+        self.assertEqual(settings['separate_voice']['value'], '1')
+
+        assets = [{**_ASSETS[0], 'audio': {'source': 'local'}}, _ASSETS[1]]
+        direct = {'scene_plan': False, 'separate_voice': False}
+        html = new_video_page('token', generation=direct, generation_assets=assets, generation_rates={'direct_per_second': 25_000})
+        fields = Forms(html).forms['/workspace/create']['fields']
+        self.assertNotIn('scene_plan', fields)
+        self.assertNotIn('separate_voice', fields)
+        self.assertEqual(fields['expected_scene_plan']['value'], '0')
+        self.assertEqual(fields['duration']['value'], '30')
+        self.assertEqual(fields['character']['value'], 'pip')
+        self.assertEqual(fields['element']['value'], 'forest')
+        self.assertIn('voice_reference', fields)
+        self.assertNotIn('narration', fields)
+        self.assertIn('$0.75 per video', html)
+
+        batch = Forms(create_page('token', kind='schedule', generation={**direct, 'separate_voice': True},
+                                  generation_assets=assets)).forms['/schedules']['fields']
+        self.assertIn('required', batch['narration'])
+        self.assertNotIn('voice_reference', batch)
+        self.assertNotIn('auto_approve_keyframes', batch)
+        self.assertEqual(batch['expected_separate_voice']['value'], '1')
+
+    def test_direct_review_has_explicit_post_copy_and_no_scene_controls(self):
+        job = {**_JOB, 'status': 'preview_ready', 'preview_path': '12/direct.mp4',
+               'plan_json': '[{"scene_id": "direct", "duration": 30}]'}
+        html = workspace_page([], job, csrf_token='token', assets=_ASSETS, production_options={
+            'generation': {'scene_plan': False, 'separate_voice': False, 'voice_reference': 'pip'},
+            'characters': ['pip'],
+        }, generation_rates={'planning_per_request': 3000})
+        forms = Forms(html).forms
+        self.assertEqual(forms['/workspace/12/generate-post-details']['fields']['preview_path']['value'], '12/direct.mp4')
+        self.assertIn('/workspace/12/revise', forms)
+        self.assertNotIn('/workspace/12/options', forms)
+        self.assertNotIn('id="scene-plan"', html)
+        self.assertIn('Voice sample · Pip &lt;b&gt;Fox&lt;/b&gt;', html)
+        self.assertIn('$0.003 per request', html)
+
     def test_asset_forms_use_expected_fields_and_same_origin_thumbnails(self):
         place_and_item_assets = [asset for asset in _ASSETS if asset['kind'] in ('place', 'item')]
         html = asset_library_section(place_and_item_assets, 'token')

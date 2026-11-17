@@ -119,6 +119,108 @@ class ProductionTests(unittest.TestCase):
             provider.assert_not_called()
         self.assertEqual(self.production.media.job_tasks(self.job), [])
 
+    def configure_generation(self, job, *, scene_plan=False, separate_voice=False, **fields):
+        generation = {
+            "model": "fal-seedance-25-flash", "scene_plan": scene_plan, "separate_voice": separate_voice,
+            "duration": 30, "resolution": "720p", "aspect_ratio": "9:16", "elements": [],
+            **fields,
+        }
+        options = {"generation": generation, "characters": ["tavi_seed_sprite"]}
+        with self.store._connection(write=True) as db:
+            db.execute("UPDATE jobs SET production_options_json = ? WHERE id = ?", (json.dumps(options), job))
+
+    def test_direct_native_uses_saved_images_and_voice_and_resumes_the_accepted_task(self):
+        job = self.store.create_direct_job("Tavi speaks in the garden")
+        self.configure_generation(job, voice_reference="tavi_seed_sprite", elements=["pebble_garden"])
+        self.production.library.assets.save_character_audio(
+            "kids_3d", "tavi_seed_sprite", url="https://audio.example.com/tavi.wav",
+        )
+        self.settings.set_key("ANTHROPIC_API_KEY", None)
+        self.settings.update_provider("fal-elevenlabs", False, 10, 100)
+        self.settings.update_provider("fal-seedance-25-flash", True, 40, 100)
+        self.settings.set_budgets(3000, 3000)
+        video = Mock()
+        video.submit.return_value = ProviderResult("pending", task_id="direct-task")
+        video.poll.return_value = ProviderResult("completed", url="https://fixture.example/video.mp4")
+
+        with patch("app.production.adapter_for", return_value=video) as adapter, \
+                patch("app.production.local_image", return_value=FRAME), \
+                patch("app.production.download_artifact", side_effect=lambda url, path, kind: self.write_fixture(path)), \
+                patch("app.production.render_direct_video", side_effect=lambda clip, voice, path, duration: self.write_fixture(path)) as render:
+            self.production.planner.process_plan(NOW, job_id=job)
+            self.assertEqual(self.store.get_job(job)["status"], "queued")
+            self.production.advance(NOW, job_id=job)
+            self.assertEqual(self.production.media.job_tasks(job)[0]["provider_task_id"], "direct-task")
+            self.production.recover_interrupted()
+            self.production.advance(NOW, job_id=job)
+
+        self.assertTrue(all(call.args[0]["name"] == "fal-seedance-25-flash" for call in adapter.call_args_list))
+        video.submit.assert_called_once()
+        request = video.submit.call_args.args[0]
+        self.assertIn("@Audio1", request.prompt)
+        self.assertIn("@Image2", request.prompt)
+        self.assertEqual(request.reference_images, (FRAME, FRAME))
+        self.assertEqual(request.audio_references, ("https://audio.example.com/tavi.wav",))
+        self.assertTrue(request.generate_audio)
+        video.poll.assert_called_once_with("direct-task")
+        self.assertIsNone(render.call_args.args[1])
+        result = self.store.get_job(job)
+        self.assertEqual(result["status"], "preview_ready")
+        self.assertIsNone(result["plan_json"])
+        self.assertTrue((self.production.root / result["preview_path"]).is_file())
+
+    def test_direct_separate_voice_is_explicit_and_preflights_total_cost(self):
+        job = self.store.create_direct_job("Animate Tavi")
+        self.configure_generation(job, separate_voice=True, narration="Look at that seed!")
+        self.settings.update_provider("fal-seedance-25-flash", True, 40, 100)
+        self.settings.set_budgets(3000, 3000)
+        video = Mock()
+        audio = Mock()
+        video.submit.return_value = ProviderResult("completed", url="https://fixture.example/video.mp4")
+        audio.submit.return_value = ProviderResult("completed", url="https://fixture.example/audio.mp3")
+
+        with patch("app.production.adapter_for", side_effect=lambda route, key: {
+            "fal-seedance-25-flash": video, "fal-elevenlabs": audio,
+        }[route["name"]]) as adapter, patch("app.production.local_image", return_value=FRAME), \
+                patch("app.production.download_artifact", side_effect=lambda url, path, kind: self.write_fixture(path)), \
+                patch("app.production.render_direct_video", side_effect=lambda clip, voice, path, duration: self.write_fixture(path)) as render:
+            self.production.advance(NOW, job_id=job)
+            self.assertIn("Daily budget", self.store.get_job(job)["stage_error"])
+            adapter.assert_not_called()
+            self.settings.set_budgets(3100, 3100)
+            self.production.advance(NOW, job_id=job)
+
+        video.submit.assert_called_once()
+        self.assertFalse(video.submit.call_args.args[0].generate_audio)
+        audio.submit.assert_called_once()
+        self.assertEqual(audio.submit.call_args.args[0].prompt, "Look at that seed!")
+        self.assertEqual(render.call_args.args[1].name, "direct-voice.mp3")
+        self.assertEqual(self.store.get_job(job)["status"], "preview_ready")
+
+    def test_storyboard_can_request_native_dialogue_without_any_voice_task(self):
+        self.configure_generation(self.job, scene_plan=True)
+        self.settings.update_provider("fal-elevenlabs", False, 10, 100)
+        self.settings.update_provider("fal-veo", False, 10, 100)
+        scenes = json.loads(self.store.get_job(self.job)["plan_json"])
+        scenes[0]["dialogue"] = "Look, a seed!"
+        with self.store._connection(write=True) as db:
+            db.execute("UPDATE jobs SET plan_json = ? WHERE id = ?", (json.dumps(scenes), self.job))
+        with patch("app.production.adapter_for", self.adapter), \
+                patch("app.production.local_image", return_value=FRAME), \
+                patch("app.production.download_artifact", side_effect=lambda url, path, kind: self.write_fixture(path)), \
+                patch("app.production.sample_frames", return_value=[Path("fixture.jpg")]), \
+                patch("app.production.render_video", side_effect=lambda scenes, clips, voices, path, **kw: self.write_fixture(path)) as render:
+            self.production.advance(NOW, job_id=self.job)
+            self.production.media.approve_keyframes(self.job)
+            self.production.advance(NOW, job_id=self.job)
+            self.production.advance(NOW, job_id=self.job)
+        self.assertEqual([name for name, _ in self.requests], ["fal-nano-banana-pro", "evolink-seedance"])
+        request = self.requests[-1][1]
+        self.assertTrue(request.generate_audio)
+        self.assertIn("Look, a seed!", request.prompt)
+        self.assertTrue(render.call_args.kwargs["native_audio"])
+        self.assertEqual(self.store.get_job(self.job)["status"], "preview_ready")
+
     def test_opted_in_schedule_uses_visual_qa_before_creating_clip_tasks(self):
         job, _ = self.prepare_scheduled_job(auto_approve_keyframes=True)
         with patch("app.production.adapter_for", self.adapter), \

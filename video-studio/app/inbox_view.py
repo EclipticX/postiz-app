@@ -6,7 +6,8 @@ from zoneinfo import ZoneInfo
 from app.library_view import _choices
 from app.web import (
     _action_menu, _csrf, _label, _menu_button, _menu_divider, _menu_link, _page, _text,
-    _ICON_DELETE, _ICON_EDIT, _ICON_PAUSE, _ICON_RESTORE, _ICON_RESUME,
+    _generation_summary, _ICON_DELETE, _ICON_EDIT, _ICON_PAUSE, _ICON_RESTORE, _ICON_RESUME,
+    generation_fields,
 )
 
 
@@ -89,7 +90,8 @@ def inbox_page(records, *, query='', kind='', status='', notice='', idea_request
     )
 
 
-def create_page(csrf_token, *, kind='manual', values=None, notice='', brand_profiles=None, generated_ideas=None):
+def create_page(csrf_token, *, kind='manual', values=None, notice='', brand_profiles=None, generated_ideas=None,
+                generation=None, generation_assets=(), generation_rates=None):
     values = values or {}
     labels = (('manual', 'Manual idea'), ('claude', 'Generate with Claude'), ('schedule', 'Prompt schedule'))
     links = []
@@ -160,6 +162,9 @@ def create_page(csrf_token, *, kind='manual', values=None, notice='', brand_prof
     title = _text(values.get('title', ''))
     if kind == 'schedule':
         route, button = '/schedules', 'Save schedule draft'
+        approval_control = ''
+        if generation is None or generation.get('scene_plan'):
+            approval_control = _keyframe_approval_control(values.get('auto_approve_keyframes'))
         fields = f'''
         {brand_select}
         <label>Title<input name="title" value="{title}" maxlength="100" required></label>
@@ -171,7 +176,8 @@ def create_page(csrf_token, *, kind='manual', values=None, notice='', brand_prof
           <label>Time zone<input name="timezone" value="{_text(values.get('timezone', 'Asia/Dhaka'))}" required></label>
           <label>Videos per day<input name="daily_limit" type="number" min="1" max="100" value="{_text(values.get('daily_limit', '1'))}" required></label>
         </div>
-        {_keyframe_approval_control(values.get('auto_approve_keyframes'))}'''
+        {generation_fields(generation, generation_assets, generation_rates, values)}
+        {approval_control}'''
     elif kind == 'claude':
         route, button = '/ideas/generate', 'Generate with Claude'
         fields = f'''
@@ -274,10 +280,13 @@ def record_page(record, csrf_token, *, notice=''):
     ]
     if is_schedule:
         start = f'{_text(record["start_date"])} · {_text(record["run_at"])} {_text(record["timezone"])}'
-        approval = 'Automatic after visual QA' if record.get('auto_approve_keyframes') else 'Manual'
-        metadata.extend((
-            ('Production start', start), ('Videos per day', int(record['daily_limit'])), ('Keyframe approval', approval),
-        ))
+        metadata.extend((('Production start', start), ('Videos per day', int(record['daily_limit']))))
+        generation = record.get('generation')
+        if generation:
+            metadata.append(('Video generation', _generation_summary(generation)))
+        if not generation or generation.get('scene_plan'):
+            approval = 'Automatic after visual QA' if record.get('auto_approve_keyframes') else 'Manual'
+            metadata.append(('Keyframe approval', approval))
         if record['status'] == 'approved':
             metadata.append(('Schedule state', _label(record['schedule_status'])))
         details = _schedule_details(record)
@@ -365,6 +374,11 @@ def edit_schedule_page(record, csrf_token, *, notice='', brand_profiles=None, va
     timezone = _text(values.get('timezone', record.get('timezone', 'Asia/Dhaka')))
     daily_limit = _text(values.get('daily_limit', str(record.get('daily_limit', '1'))))
     auto_approve = values.get('auto_approve_keyframes', record.get('auto_approve_keyframes'))
+    generation = record.get('generation')
+    generation_details = f'<p>{_generation_summary(generation)}</p>' if generation else ''
+    approval_control = ''
+    if not generation or generation.get('scene_plan'):
+        approval_control = _keyframe_approval_control(auto_approve)
     brand_select = ''
     if brand_profiles:
         selected_brand = values.get('brand_id', record.get('brand_id') or '')
@@ -388,7 +402,8 @@ def edit_schedule_page(record, csrf_token, *, notice='', brand_profiles=None, va
           <label>Time zone<input name="timezone" value="{timezone}" required></label>
           <label>Videos per day<input name="daily_limit" type="number" min="1" max="100" value="{daily_limit}" required></label>
         </div>
-        {_keyframe_approval_control(auto_approve)}
+        {generation_details}
+        {approval_control}
         <div class="actions">
           <button type="submit" class="primary">Save changes</button>
           <a class="button-link" href="/schedules/{int(record['id'])}">Cancel</a>

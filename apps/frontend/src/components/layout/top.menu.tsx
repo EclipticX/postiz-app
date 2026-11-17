@@ -14,9 +14,10 @@ interface MenuItemInterface {
   hide?: boolean;
   requireBilling?: boolean;
   onClick?: () => void;
+  sameTab?: boolean;
 }
 
-export const useMenuItem = () => {
+export const useMenuItem = (videoStudioUrl?: string) => {
   const { isGeneral } = useVariables();
   const t = useT();
 
@@ -103,6 +104,31 @@ export const useMenuItem = () => {
       path: '/media',
     },
   ] satisfies MenuItemInterface[] as MenuItemInterface[];
+
+  if (videoStudioUrl) {
+    firstMenu.push({
+      name: t('video_studio', 'Video Studio'),
+      icon: (
+        <svg
+          xmlns="http://www.w3.org/2000/svg"
+          width="22"
+          height="22"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.8"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          aria-hidden="true"
+        >
+          <rect x="3" y="6" width="13" height="12" rx="2" />
+          <path d="m16 10 5-3v10l-5-3" />
+        </svg>
+      ),
+      path: videoStudioUrl,
+      sameTab: true,
+    });
+  }
 
   const secondMenu = [
     {
@@ -224,9 +250,9 @@ export const useMenuItem = () => {
   };
 };
 
-export const TopMenu: FC = () => {
+export const TopMenu: FC<{ videoStudioUrl?: string }> = ({ videoStudioUrl }) => {
   const user = useUser();
-  const { firstMenu, secondMenu } = useMenuItem();
+  const { firstMenu, secondMenu } = useMenuItem(videoStudioUrl);
   const { isGeneral, billingEnabled } = useVariables();
   return (
     <>
@@ -259,6 +285,7 @@ export const TopMenu: FC = () => {
                   icon={item.icon}
                   key={item.name}
                   onClick={item.onClick}
+                  sameTab={item.sameTab}
                 />
               ))
         }

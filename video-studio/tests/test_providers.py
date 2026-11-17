@@ -152,6 +152,58 @@ class ProviderTests(unittest.TestCase):
             veo.poll('../other-task')
         self.connection_type.assert_not_called()
 
+    def test_seedance_flash_submits_text_and_reference_video_and_resumes_by_id(self):
+        voice = 'data:audio/wav;base64,UklGRg=='
+        self.connection.getresponse.side_effect = [
+            response({'request_id': 'text-1'}), response({'request_id': 'reference-1'}),
+            response({'status': 'COMPLETED'}), response({'video': {'url': _VIDEO}}),
+        ]
+        adapter = FalAdapter(_KEY, 'fal-seedance-25-flash')
+        text = adapter.submit(ProviderRequest('Create a film', duration=30, generate_audio=True))
+        reference = adapter.submit(ProviderRequest(
+            'Use @Image1 and @Audio1', duration=6, resolution='480p', aspect_ratio='16:9',
+            reference_images=(_FRAME,), audio_references=(voice,), generate_audio=True,
+        ))
+        resumed = FalAdapter(_KEY, 'fal-seedance-25-flash').poll(reference.task_id)
+
+        self.assertEqual((text.task_id, resumed.task_id, resumed.url), ('text-1', 'reference-1', _VIDEO))
+        self.assertEqual([call.args for call in self.connection.request.call_args_list], [
+            ('POST', '/bytedance/seedance-2.5/flash/text-to-video'),
+            ('POST', '/bytedance/seedance-2.5/flash/reference-to-video'),
+            ('GET', '/bytedance/seedance-2.5/requests/reference-1/status'),
+            ('GET', '/bytedance/seedance-2.5/requests/reference-1'),
+        ])
+        self.assertEqual(self.payload(), {
+            'prompt': 'Create a film', 'duration': 30, 'resolution': '720p', 'aspect_ratio': '9:16',
+            'generate_audio': True, 'codec': 'H264',
+        })
+        self.assertEqual(self.payload(1)['image_urls'], [_FRAME])
+        self.assertEqual(self.payload(1)['audio_urls'], [voice])
+
+    def test_seedance_flash_rejects_invalid_audio_references_before_submission(self):
+        adapter = FalAdapter(_KEY, 'fal-seedance-25-flash')
+        voice = 'https://assets.example.test/sample.mp3'
+        for request in (
+            ProviderRequest('Create a film', duration=31),
+            ProviderRequest('Voice', duration=8, audio_references=(voice,), generate_audio=True),
+            ProviderRequest('Voice', duration=8, reference_images=(_FRAME,), audio_references=(voice,)),
+            ProviderRequest('Voice', duration=8, reference_images=(_FRAME,), generate_audio=True,
+                            audio_references=('data:audio/wav;base64,invalid data',)),
+        ):
+            with self.subTest(request=request), self.assertRaises(ProviderError):
+                adapter.submit(request)
+        self.connection_type.assert_not_called()
+
+    def test_image_to_video_can_request_native_audio(self):
+        self.connection.getresponse.side_effect = [
+            response({'request_id': 'video-1'}), response({'id': 'video-2'}),
+        ]
+        request = ProviderRequest('Speak', reference_image=_FRAME, duration=4, generate_audio=True)
+        FalAdapter(_KEY, 'fal-veo').submit(request)
+        EvoLinkAdapter(_KEY).submit(request)
+        self.assertTrue(self.payload()['generate_audio'])
+        self.assertTrue(self.payload(1)['generate_audio'])
+
     def test_fal_elevenlabs_sends_supported_voice_controls_only_when_set(self):
         self.connection.getresponse.return_value = response({'request_id': 'queued-voice'})
         adapter = FalAdapter(_KEY, 'fal-elevenlabs')

@@ -1,13 +1,15 @@
 import base64
 import io
+import shutil
 import socket
 import unittest
+import wave
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
 
 from app.media_routes import (
-    _CDNConnection, adapter_for, download_artifact, eligible_routes, estimated_micros, local_image,
+    _CDNConnection, adapter_for, download_artifact, eligible_routes, estimated_micros, local_audio, local_image,
 )
 from app.providers import ClaudeAdapter, EvoLinkAdapter, FalAdapter, ProviderError, ProviderRequest
 from app.settings import DEFAULT_PROVIDERS
@@ -72,6 +74,18 @@ class RoutingTests(unittest.TestCase):
         routes = eligible_routes(settings, 'video', request)
         self.assertEqual([route['name'] for route in routes], ['evolink-seedance'])
 
+    def test_direct_routes_and_native_scene_routes_stay_distinct(self):
+        settings, providers = _settings()
+        request = ProviderRequest('Create a video', duration=30, generate_audio=True)
+        seedance = providers['fal-seedance-25-flash']
+        self.assertEqual(eligible_routes(settings, 'direct', request), [seedance])
+        self.assertEqual(eligible_routes(settings, 'video', request), [])
+        request = ProviderRequest('Animate', reference_image='first frame', duration=4, generate_audio=True)
+        self.assertEqual([route['name'] for route in eligible_routes(settings, 'video', request)],
+                         ['fal-veo', 'evolink-seedance'])
+        seedance['category_enabled'] = False
+        self.assertEqual(eligible_routes(settings, 'direct', ProviderRequest('Video', duration=30)), [])
+
     def test_keyframe_and_voice_require_configured_rate_and_capability(self):
         settings, providers = _settings()
         keyframe = providers['fal-nano-banana-pro']
@@ -126,10 +140,24 @@ class ArtifactTests(unittest.TestCase):
             with self.assertRaisesRegex(ProviderError, 'Install rsvg-convert'):
                 local_image(svg)
 
+    @unittest.skipUnless(shutil.which('ffprobe'), 'Requires ffprobe')
+    def test_local_voice_reference_checks_duration_and_encodes_wav(self):
+        path = self.path.with_suffix('.wav')
+        for seconds in (2, 1):
+            with wave.open(str(path), 'wb') as audio:
+                audio.setparams((1, 2, 8000, 0, 'NONE', 'not compressed'))
+                audio.writeframes(b'\x00\x00' * 8000 * seconds)
+            if seconds == 2:
+                self.assertEqual(local_audio(path), 'data:audio/wav;base64,' + base64.b64encode(path.read_bytes()).decode())
+            else:
+                with self.assertRaisesRegex(ProviderError, 'between 1.8 and 30.2 seconds'):
+                    local_audio(path)
+
     def test_download_uses_cdn_get_without_auth_and_replaces_artifact(self):
         for url, host, body, kind in (
             (_CDN_URL, 'v3b.fal.media', _JPEG, 'keyframe'),
             ('https://cdn.evolink.ai/output.jpg?signature=test-signature', 'cdn.evolink.ai', _MP4, 'video'),
+            ('https://storage.googleapis.com/falserverless/output.mp4', 'storage.googleapis.com', _MP4, 'video'),
         ):
             with self.subTest(host=host):
                 self.path.write_bytes(b'previous file')
@@ -139,7 +167,7 @@ class ArtifactTests(unittest.TestCase):
                     self.assertEqual(download_artifact(url, self.path, kind), self.path)
                     self.assertEqual(self.path.read_bytes(), body)
                     connection_type.assert_called_once_with(host, timeout=20)
-                    connection.request.assert_called_once_with('GET', '/output.jpg?signature=test-signature')
+                    connection.request.assert_called_once_with('GET', url.removeprefix(f'https://{host}'))
                     connection.close.assert_called_once()
                     self.assertEqual(list(self.path.parent.iterdir()), [self.path])
 
@@ -149,6 +177,7 @@ class ArtifactTests(unittest.TestCase):
                 'https://fal.media.evil.test/file.png', 'https://127.0.0.1/file.png',
                 'https://user:password@v3b.fal.media/file.png', 'http://v3b.fal.media/file.png',
                 'https://v3b.fal.media:8443/file.png', 'https://v3b.fal.media/path\r\nAuthorization:x',
+                'https://storage.googleapis.com/unrelated-bucket/file.png',
             ):
                 with self.subTest(url=url), self.assertRaises(ProviderError):
                     download_artifact(url, self.path, 'keyframe')

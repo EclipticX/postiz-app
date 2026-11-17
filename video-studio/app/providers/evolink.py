@@ -27,7 +27,7 @@ class EvoLinkAdapter:
             'model': 'seedance-2.0-image-to-video', 'prompt': request.prompt,
             'image_urls': [self._image_url(images[0])], 'duration': duration,
             'quality': request.resolution, 'aspect_ratio': request.aspect_ratio,
-            'generate_audio': False, 'content_filter': True,
+            'generate_audio': request.generate_audio, 'content_filter': True,
         }, paid_submission=True)
         return ProviderResult('pending', task_id=task_identifier(result.get('id'), submitted=True))
 

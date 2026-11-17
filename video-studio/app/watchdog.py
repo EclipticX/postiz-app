@@ -49,12 +49,15 @@ _ISSUE_QUERIES = {
 _BLOCK_REASONS = {
     "Configure an eligible provider and budget in Settings.",
     "Daily budget is unset or has insufficient funds.",
+    "Enable a compatible direct video route, API key and estimated rate in Providers.",
     "Enable a Scripting provider with vision for visual QA.",
     "Enable Claude and add an API key in Settings.",
     "Enable Postiz and add its API key in Settings.",
     "Per-video budget is unset or has insufficient funds.",
     "Restore the key for the submitted provider to resume polling.",
     "Set Claude's estimated cost per request in Settings.",
+    "Enter dialogue or narration for separate voice clips.",
+    "Add a voice sample to the selected character or use the model's native voice.",
     PROVIDER_WARNING_MESSAGES["access_denied"],
     PROVIDER_WARNING_MESSAGES["invalid_credential"],
 }

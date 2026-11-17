@@ -4,6 +4,7 @@ import json
 from datetime import date, datetime, time, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from app.media_store import job_generation, production_slot, queued_job_candidates, selected_elements
 from app.providers import ClaudeAdapter, ProviderError, ProviderRequest
 from app.scenes import SCENE_SCHEMA, SceneValidationError, idea_prompt, planner_prompt, validate_scene_plan
 from app.settings import provider_blockers
@@ -242,6 +243,12 @@ class StudioPlanner:
             )
             feedback = json.loads(job["plan_feedback"] or "[]")
             prompt_text = job["prompt"]
+            generation = job_generation(job)
+            elements = selected_elements(profile, generation)
+            if elements:
+                prompt_text += "\nUse these saved locations or props where appropriate: " + ", ".join(
+                    asset["id"] for asset in elements
+                )
             if job["revision_feedback"]:
                 prompt_text += "\nRequested revision:\n" + job["revision_feedback"]
             prompt = planner_prompt(profile, prompt_text, TOTAL_DURATION, feedback)
@@ -288,30 +295,10 @@ class StudioPlanner:
 
     @staticmethod
     def _claim_plan(db, now, *, job_id=None):
-        candidates = db.execute(
-            """SELECT jobs.*, prompt_schedules.id AS batch_id, prompt_schedules.status AS batch_status,
-                prompt_schedules.timezone AS batch_timezone, prompt_schedules.run_at AS batch_time,
-                prompt_schedules.daily_limit AS batch_limit
-                FROM jobs LEFT JOIN schedule_entries ON schedule_entries.id = jobs.schedule_entry_id
-                LEFT JOIN prompt_schedules ON prompt_schedules.id = schedule_entries.schedule_id
-                WHERE jobs.status = 'queued' AND (? IS NULL OR jobs.id = ?)
-                ORDER BY jobs.stage_error IS NOT NULL, jobs.id""",
-            (job_id, job_id),
-        ).fetchall()
-        for job in candidates:
-            started_for = job["planning_started_for"]
-            if job["batch_id"] and started_for is None:
-                local = now.astimezone(ZoneInfo(job["batch_timezone"]))
-                if job["batch_status"] != "active" or local.time() < time.fromisoformat(job["batch_time"]):
-                    continue
-                started_for = local.date().isoformat()
-                started_today = db.execute(
-                    """SELECT COUNT(*) FROM jobs JOIN schedule_entries ON schedule_entries.id = jobs.schedule_entry_id
-                        WHERE schedule_entries.schedule_id = ? AND jobs.planning_started_for = ?""",
-                    (job["batch_id"], started_for),
-                ).fetchone()[0]
-                if started_today >= job["batch_limit"]:
-                    continue
+        for job in queued_job_candidates(db, job_id, direct=False):
+            allowed, started_for = production_slot(db, job, now)
+            if not allowed:
+                continue
             db.execute(
                 "UPDATE jobs SET status = 'planning', planning_started_for = ? WHERE id = ?",
                 (started_for, job["id"]),

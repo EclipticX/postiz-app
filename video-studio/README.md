@@ -2,9 +2,25 @@
 
 Studio runs alongside Postiz. Use the sidebar to open Idea Inbox, Video Workspace, Published Posts, Characters, Providers, or Settings. Studio plans 30-second vertical shorts at 720 × 1280 using 4- and 5-second scenes. SQLite stores approval decisions, prompt schedules, jobs, and their progress. Media files stay in the local Studio data directory.
 
-## Start locally
+## Run both apps with Docker
 
-From this folder, run `docker compose up --build`, then open [http://localhost:8090](http://localhost:8090). Copy `.env.example` to `.env` to change the published port or Postiz URL. Compose keeps Studio data in the `studio-data` volume.
+If you already run Postiz with Compose, use the same Postiz project name to reuse its database and uploads. The combined stack builds Postiz from this checkout and runs its normal Prisma schema sync at startup. If your existing Postiz image is newer than this checkout, check version compatibility and back up the Postiz database before switching images. While the existing container is running, `docker exec postiz printenv NEXT_PUBLIC_VERSION` shows its release version.
+
+If you run Studio as a separate Compose project, stop the old service from the repository root with `docker compose -f video-studio/docker-compose.yml stop studio`. Use its project name with `-p` if you set one. The combined stack reuses the default standalone volume `video-studio_studio-data`. For a different volume, set `STUDIO_DATA_VOLUME` to its exact name in the root `.env` before starting. If Studio is running natively, stop it before using the same port. Native runs store their data in a separate directory.
+
+From the repository root, run:
+
+```sh
+docker compose up -d --build
+```
+
+Open [Postiz](http://localhost:4007) and choose **Video Studio** in the sidebar. Studio opens in the same tab at [http://127.0.0.1:8090](http://127.0.0.1:8090). Use **Postiz Calendar** in Studio’s menu to return to Postiz. Set `STUDIO_PORT` in the root `.env` if you need a different local Studio port.
+
+After the first startup, Docker restarts both apps and their required services when Docker Desktop starts again. Run `docker compose ps` from the repository root to check their status.
+
+## Run Studio by itself
+
+From this folder, run `docker compose up --build`, then open [http://127.0.0.1:8090](http://127.0.0.1:8090). Copy `.env.example` to `.env` to change the published port or Postiz API URL. Compose keeps Studio data in the `studio-data` volume.
 
 For a native development run, use Python 3.9 or later and run `python3 -m app.server` from this folder. The server binds to `127.0.0.1` by default and saves data in `data/`. Set `STUDIO_DATA_DIR` to use a different directory. Stop Studio before copying its data directory for backup.
 
@@ -16,7 +32,7 @@ For a native development run, use Python 3.9 or later and run `python3 -m app.se
 - Enable Seedance or Kling with its credential and rate to render 5-second scenes. The configured Veo route handles 4-second scenes.
 - For native media generation, install FFmpeg with `ffprobe` and subtitle support, `rsvg-convert`, and the Python dependencies from `requirements.txt`. The Dockerfile installs these tools.
 - Provide a local CTranslate2 Whisper model for spoken captions. Set `STUDIO_WHISPER_MODEL_PATH` to that directory for a native run. In Compose, copy the model into `/studio/data/whisper-model` inside the Studio container. Studio reads that directory offline. Optionally place a licensed `music.mp3` in the Studio data directory.
-- Run Postiz and connect channels there first. The native default is `http://127.0.0.1:4007`. The Compose default reaches the host Postiz port from the Studio container.
+- Connect channels in Postiz first. In the combined stack, Studio reaches the Postiz API at `http://postiz:5000` over the Docker network. If you run Studio by itself, its Docker default reaches the host Postiz port and its native default is `http://127.0.0.1:4007`.
 
 ## Set up assets and presets
 

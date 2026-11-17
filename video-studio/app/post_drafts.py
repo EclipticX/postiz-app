@@ -49,7 +49,8 @@ class StudioPostDrafts:
                 (job["id"], job["preview_path"]),
             ).fetchone()
         if row is None:
-            return {"title": job["title"], "status": "pending"}
+            has_generation = bool(json.loads(job["production_options_json"]).get("generation"))
+            return {"title": job["title"], "status": "manual" if has_generation else "pending"}
         return {**json.loads(row["content_json"]), "status": row["status"], "error": row["error"]}
 
     def save(self, job_id, preview_path, draft, *, preserve_destinations=False):
@@ -72,19 +73,44 @@ class StudioPostDrafts:
                 """INSERT INTO post_drafts (job_id, preview_path, status, content_json)
                 VALUES (?, ?, 'ready', ?)
                 ON CONFLICT (job_id) DO UPDATE SET preview_path = excluded.preview_path,
-                    status = excluded.status, content_json = excluded.content_json, error = NULL""",
+                    status = excluded.status, content_json = excluded.content_json, error = NULL, requested = 0""",
                 (job_id, preview_path, json.dumps(draft)),
+            )
+
+    def request(self, job_id, preview_path):
+        with self.store._connection(write=True) as db:
+            job = db.execute("SELECT title, status, preview_path FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            if job is None:
+                raise LookupError("Video job not found.")
+            if job["status"] not in PUBLISHABLE or not preview_path or preview_path != job["preview_path"]:
+                raise ValueError("The video preview changed. Open the latest preview before generating post details.")
+            draft = db.execute(
+                "SELECT status, content_json FROM post_drafts WHERE job_id = ? AND preview_path = ?",
+                (job_id, preview_path),
+            ).fetchone()
+            if draft and draft["status"] == "generating":
+                return
+            if draft and draft["status"] == "needs_review":
+                raise ValueError("Review and save the draft before requesting new AI post details.")
+            contents = draft["content_json"] if draft else json.dumps({"title": job["title"]})
+            db.execute(
+                """INSERT INTO post_drafts (job_id, preview_path, status, content_json, requested)
+                VALUES (?, ?, 'pending', ?, 1) ON CONFLICT (job_id) DO UPDATE SET
+                    preview_path = excluded.preview_path, status = excluded.status,
+                    content_json = excluded.content_json, requested = 1, error = NULL""",
+                (job_id, preview_path, contents),
             )
 
     def _claim(self):
         with self.store._connection(write=True) as db:
             job = db.execute(
-                """SELECT j.id, j.title, j.prompt, j.plan_json, j.preview_path FROM jobs AS j
+                """SELECT j.id, j.title, j.prompt, j.plan_json, j.preview_path, d.content_json FROM jobs AS j
                 LEFT JOIN post_drafts AS d ON d.job_id = j.id AND d.preview_path = j.preview_path
                 WHERE j.preview_path IS NOT NULL AND j.status IN (?, ?)
                     AND (d.job_id IS NULL OR d.status = 'pending')
-                    AND NOT EXISTS (SELECT 1 FROM publishing_requests AS r
-                        WHERE r.job_id = j.id AND r.preview_path = j.preview_path)
+                    AND (d.requested = 1 OR (json_extract(j.production_options_json, '$.generation') IS NULL
+                        AND NOT EXISTS (SELECT 1 FROM publishing_requests AS r
+                            WHERE r.job_id = j.id AND r.preview_path = j.preview_path)))
                 ORDER BY d.error IS NOT NULL, j.id LIMIT 1""", PUBLISHABLE,
             ).fetchone()
             if job:
@@ -93,17 +119,20 @@ class StudioPostDrafts:
                     VALUES (?, ?, 'generating', ?)
                     ON CONFLICT (job_id) DO UPDATE SET preview_path = excluded.preview_path,
                         status = excluded.status, content_json = excluded.content_json, error = NULL""",
-                    (job["id"], job["preview_path"], json.dumps({"title": job["title"]})),
+                    (job["id"], job["preview_path"], job["content_json"] or json.dumps({"title": job["title"]})),
                 )
         return job
 
     def _finish(self, job, status, *, copy=None, error=None):
+        contents = json.loads(job["content_json"] or "{}") or {"title": job["title"]}
+        contents.update(copy or {})
         with self.store._connection(write=True) as db:
             db.execute(
-                """UPDATE post_drafts SET status = ?, content_json = ?, error = ?
+                """UPDATE post_drafts SET status = ?, content_json = ?, error = ?,
+                        requested = CASE WHEN ? = 'pending' THEN requested ELSE 0 END
                 WHERE job_id = ? AND preview_path = ? AND status = 'generating'
                     AND EXISTS (SELECT 1 FROM jobs WHERE id = ? AND preview_path = ?)""",
-                (status, json.dumps(copy or {"title": job["title"]}), error,
+                (status, json.dumps(contents), error, status,
                  job["id"], job["preview_path"], job["id"], job["preview_path"]),
             )
 

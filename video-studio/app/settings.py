@@ -51,6 +51,12 @@ DEFAULT_PROVIDERS = (
             "max_resolution": "720p",
         },
     ),
+    (
+        "fal-seedance-25-flash", "video", "FAL_KEY", 40, "second",
+        {"direct": True, "audio": True, "reference_audio": True, "reference_image": True,
+         "durations": list(range(4, 31)), "resolutions": ["480p", "720p"],
+         "aspect_ratios": ["9:16", "16:9", "1:1", "4:3", "3:4", "21:9"]},
+    ),
     ("fal-elevenlabs", "tts", "FAL_KEY", 10, "1000_characters", {"audio": True}),
     ("postiz", "publishing", "POSTIZ_API_KEY", 10, "request", {}),
 )
@@ -323,7 +329,7 @@ class StudioSettings:
         db.execute(
             """
             UPDATE providers
-            SET enabled = CASE WHEN name = 'fal-kling' THEN 0 ELSE 1 END,
+            SET enabled = CASE WHEN name IN ('fal-kling', 'fal-seedance-25-flash') THEN 0 ELSE 1 END,
                 auto_enable_pending = 0
             WHERE key_env = ? AND auto_enable_pending = 1
             """,
@@ -526,6 +532,18 @@ class StudioSettings:
     def get_budgets(self):
         with self.store._connection() as db:
             return dict(db.execute("SELECT daily_micros, video_micros FROM budget_settings").fetchone())
+
+    def get_generation(self):
+        with self.store._connection() as db:
+            row = db.execute("SELECT scene_plan, separate_voice FROM video_generation_settings WHERE id = 1").fetchone()
+        return {name: bool(row[name]) for name in row.keys()}
+
+    def set_generation(self, scene_plan, separate_voice):
+        if type(scene_plan) is not bool or type(separate_voice) is not bool:
+            raise ValueError("Choose valid video generation settings.")
+        with self.store._connection(write=True) as db:
+            db.execute("UPDATE video_generation_settings SET scene_plan = ?, separate_voice = ? WHERE id = 1",
+                       (scene_plan, separate_voice))
 
     def set_budgets(self, daily_micros, video_micros):
         _check_whole_number(daily_micros, "Daily budget")

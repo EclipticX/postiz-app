@@ -132,6 +132,8 @@
 
 To have the project up and running, please follow the [Quick Start Guide](https://docs.postiz.com/quickstart)
 
+To run Postiz and Video Studio together locally, follow the [combined Docker setup](video-studio/README.md#run-both-apps-with-docker).
+
 ## Sponsor Postiz
 
 We now offer a few options to sponsor Postiz:

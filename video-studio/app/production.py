@@ -10,12 +10,14 @@ from itertools import zip_longest
 from pathlib import Path
 from uuid import uuid4
 
-from app.media_routes import adapter_for, download_artifact, eligible_routes, estimated_micros, local_image
-from app.media_store import MediaStore, can_edit_scene, queue_scene_media, ready_keyframes, scene_revision
+from app.media_routes import adapter_for, download_artifact, eligible_routes, estimated_micros, local_audio, local_image
+from app.media_store import (
+    MediaStore, can_edit_scene, job_generation, queue_scene_media, ready_keyframes, scene_revision, selected_elements,
+)
 from app.niche import load_profile
 from app.providers import ProviderError, ProviderRequest
 from app.publishing_store import PublishingStore
-from app.render import render_video, sample_frames
+from app.render import render_direct_video, render_video, sample_frames
 from app.scenes import qa_prompt, spoken_lines
 from app.studio_library import select_references
 
@@ -59,7 +61,8 @@ class StudioProduction:
             )
 
     def advance(self, now, *, job_id=None):
-        self.media.queue_keyframes(job_id=job_id, preflight=lambda target, scenes: self._preflight(target, scenes, now))
+        self.media.queue_direct(now, job_id=job_id, preflight=lambda job: self._prepare_direct(job, now))
+        self.media.queue_keyframes(job_id=job_id, preflight=lambda job, scenes: self._preflight(job, scenes, now))
         tasks = self.media.tasks(job_id=job_id)[:4]
         if tasks:
             with ThreadPoolExecutor(max_workers=4) as pool:
@@ -68,7 +71,7 @@ class StudioProduction:
         self._render(job_id=job_id)
         self._review(now, job_id=job_id)
 
-    def _preflight(self, job_id, scenes, now):
+    def _preflight(self, job, scenes, now):
         def estimate(kind, request, message):
             routes = eligible_routes(self.settings, kind, request)
             if not routes:
@@ -76,6 +79,7 @@ class StudioProduction:
             return min(estimated_micros(route, request) for route in routes)
 
         durations = [scene.get("duration") for scene in scenes]
+        native_audio = not job_generation(job).get("separate_voice", True)
         if any(type(duration) is not int or duration <= 0 for duration in durations):
             raise ValueError("The saved scene plan has an invalid scene duration. Edit the prompt to rebuild it.")
         keyframe_cost = estimate(
@@ -85,18 +89,100 @@ class StudioProduction:
         total = len(scenes) * keyframe_cost
         for duration in sorted(set(durations)):
             total += durations.count(duration) * estimate(
-                "video", ProviderRequest(prompt="Animate", reference_image="keyframe", duration=duration),
+                "video", ProviderRequest(prompt="Animate", reference_image="keyframe", duration=duration,
+                                         generate_audio=native_audio),
                 f"Configure an enabled animation route with a key and rate that supports {duration}-second scenes at 720p.",
             )
-        for scene in scenes:
-            for line in spoken_lines(scene):
-                total += estimate(
-                    "voice", ProviderRequest(prompt=line["text"]),
-                    "Configure an eligible voice route and rate in Settings.",
-                )
+        if not native_audio:
+            for scene in scenes:
+                for line in spoken_lines(scene):
+                    total += estimate(
+                        "voice", ProviderRequest(prompt=line["text"]),
+                        "Configure an eligible voice route and rate in Settings.",
+                    )
         qa_provider, _ = self.planner._claude_configuration(vision=True)
         total += qa_provider["rate_micros"]
-        self.settings.check_budget(job_id, total, now, daily_amount_micros=keyframe_cost)
+        self.settings.check_budget(job["id"], total, now, daily_amount_micros=keyframe_cost)
+
+    def _prepare_direct(self, job, now):
+        generation = job_generation(job)
+        options = json.loads(job["production_options_json"])
+        niche = job["niche_id"] or "kids_3d"
+        profile = self.library.profile(niche, options)
+        native_audio = not generation.get("separate_voice", False)
+        speaker = generation.get("voice_reference")
+        if native_audio and speaker:
+            if speaker not in options.get("characters", ()):
+                raise ValueError("Select the character who owns the voice sample.")
+            asset = self.library.assets.get_character(niche, speaker)
+            sample = asset.get("audio")
+            if not sample:
+                raise ValueError("Add a voice sample to the selected character or use the model's native voice.")
+            if sample["source"] == "upload":
+                profile["direct_audio"] = {"path": str(self.library.assets.character_audio_path(niche, speaker))}
+            else:
+                profile["direct_audio"] = {"url": sample["url"]}
+
+        request, references = self._direct_video_request(job, profile, generation, estimate=True)
+        routes = self._direct_routes(generation, request)
+        if not routes:
+            raise ValueError("Enable a compatible direct video route, API key and estimated rate in Providers.")
+        for reference in references:
+            self.library.assets.reference_path(reference)
+        cost = estimated_micros(routes[0], request)
+        if not native_audio:
+            voice_request = self._direct_voice_request(job, profile, generation)
+            voice_routes = eligible_routes(self.settings, "voice", voice_request)
+            if not voice_routes:
+                raise ValueError("Configure an eligible voice route and rate in Settings.")
+            cost += estimated_micros(voice_routes[0], voice_request)
+        self.settings.check_budget(job["id"], cost, now, daily_amount_micros=cost)
+        return profile
+
+    def _direct_routes(self, generation, request):
+        return [route for route in eligible_routes(self.settings, "direct", request)
+                if route["name"] == generation["model"]]
+
+    def _direct_video_request(self, job, profile, generation, *, estimate=False):
+        options = json.loads(job["production_options_json"])
+        characters = {asset["id"]: asset for asset in profile["assets"] if asset["kind"] == "character"}
+        assets = [characters[asset_id] for asset_id in options.get("characters", ())]
+        assets.extend(selected_elements(profile, generation))
+        references = [select_references(asset, "front")[0] for asset in assets]
+        prompt = job["prompt"]
+        if job["revision_feedback"]:
+            prompt += "\nRequested revision: " + job["revision_feedback"]
+        if options.get("presets", {}).get("brand"):
+            prompt += "\nVisual style: " + profile["style_guide"]
+        if assets:
+            prompt += "\nSaved visual references:\n" + "\n".join(
+                f"@Image{index} shows {asset['name']}. {asset['description']}"
+                for index, asset in enumerate(assets, start=1)
+            )
+        audio_references = ()
+        if sample := profile.get("direct_audio"):
+            source = sample.get("url") or ("audio" if estimate else local_audio(Path(sample["path"])))
+            audio_references = (source,)
+            speaker = characters[generation["voice_reference"]]["name"]
+            prompt += f"\nUse @Audio1 as the voice reference for {speaker}."
+        return ProviderRequest(
+            prompt=prompt, duration=generation["duration"], resolution=generation["resolution"],
+            aspect_ratio=generation["aspect_ratio"], generate_audio=not generation.get("separate_voice", False),
+            reference_images=("image",) * len(references), audio_references=audio_references,
+        ), references
+
+    @staticmethod
+    def _direct_voice_request(job, profile, generation):
+        text = generation.get("narration", "").strip()
+        if not text:
+            raise ValueError("Enter dialogue or narration for separate voice clips.")
+        cast = json.loads(job["production_options_json"]).get("characters", ())
+        narrator = next((asset for asset in profile["assets"] if len(cast) == 1 and asset["id"] == cast[0]), {})
+        voice = narrator.get("selected_voice") or {}
+        return ProviderRequest(
+            prompt=text, voice=voice.get("voice") or profile.get("voice", DEFAULT_VOICE),
+            voice_speed=voice.get("speed"), voice_expressiveness=voice.get("expressiveness"),
+        )
 
     def _automatic_keyframe_review(self, now, *, job_id=None):
         claim = self.media.claim_automatic_keyframe_review(job_id=job_id)
@@ -189,7 +275,12 @@ class StudioProduction:
                 db.execute("INSERT INTO media_tasks (job_id, scene_id, kind) VALUES (?, ?, 'keyframe')", (job_id, scene_id))
                 status = "making_keyframes"
             elif status != "review_keyframes":
-                queue_scene_media(db, job_id, [edited])
+                separate_voice = job_generation(job).get("separate_voice", True)
+                if not separate_voice:
+                    db.execute(
+                        "DELETE FROM media_tasks WHERE job_id = ? AND scene_id = ? AND kind = 'video'", (job_id, scene_id),
+                    )
+                queue_scene_media(db, job_id, [edited], separate_voice=separate_voice)
                 pending = db.execute("SELECT 1 FROM media_tasks WHERE job_id = ? AND status = 'queued'", (job_id,))
                 status = "making_media" if pending.fetchone() else "render_ready"
 
@@ -216,6 +307,8 @@ class StudioProduction:
                 defaults = {"characters": []}
                 if all(previous.get(group, defaults.get(group, {})) == value for group, value in options.items()):
                     return
+                if "generation" in previous:
+                    options = {**options, "generation": previous["generation"]}
             allowed = {"review_keyframes", "preview_ready", "needs_review"}
             if options is not None:
                 allowed.add("queued")
@@ -254,8 +347,13 @@ class StudioProduction:
             db.execute("UPDATE jobs SET status = 'render_ready', stage_error = NULL WHERE id = ?", (job_id,))
 
     def _request(self, task):
-        scene = next(scene for scene in json.loads(task["plan_json"]) if scene["scene_id"] == task["scene_id"])
         profile = self._job_profile(task)
+        generation = job_generation(task)
+        if generation.get("scene_plan") is False:
+            if task["kind"] == "voice":
+                return self._direct_voice_request(task, profile, generation), []
+            return self._direct_video_request(task, profile, generation)
+        scene = next(scene for scene in json.loads(task["plan_json"]) if scene["scene_id"] == task["scene_id"])
         if task["kind"] == "voice":
             line = spoken_lines(scene)[task["line_index"]]
             speaker = next((asset for asset in profile["assets"] if asset["id"] == line.get("speaker_id")), {})
@@ -271,10 +369,18 @@ class StudioProduction:
         if task["kind"] == "video":
             keyframe = next(row for row in self.media.job_tasks(task["job_id"])
                             if row["kind"] == "keyframe" and row["scene_id"] == task["scene_id"])
+            prompt = shot + "\nAnimate the approved first frame and keep the character design fixed."
+            native_audio = not generation.get("separate_voice", True)
+            lines = spoken_lines(scene) if native_audio else []
+            if lines:
+                speakers = {asset["id"]: asset["name"] for asset in profile["assets"]}
+                prompt += "\nSpoken dialogue in order, synchronized with the speaker:\n" + "\n".join(
+                    f"{speakers.get(line.get('speaker_id'), 'Narrator')}: {line['text']}" for line in lines
+                )
             return ProviderRequest(
-                prompt=shot + "\nAnimate the approved first frame and keep the character design fixed.",
+                prompt=prompt,
                 reference_image=local_image(self.root / keyframe["local_path"]),
-                duration=scene["duration"],
+                duration=scene["duration"], generate_audio=native_audio,
             ), []
 
         asset_ids = set(scene["characters"] + [scene["place"]] + scene.get("items", []))
@@ -301,7 +407,11 @@ class StudioProduction:
                 self._poll(task, now)
                 return
             request, references = self._request(task)
-            routes = eligible_routes(self.settings, task["kind"], request)
+            generation = job_generation(task)
+            if generation.get("scene_plan") is False and task["kind"] == "video":
+                routes = self._direct_routes(generation, request)
+            else:
+                routes = eligible_routes(self.settings, task["kind"], request)
             if task["provider_name"] and len(routes) > 1:
                 routes.sort(key=lambda route: route["name"] == task["provider_name"])
             if not routes:
@@ -336,7 +446,8 @@ class StudioProduction:
                     self._record_provider_warning(name, key, error, now)
                 wait_reason = str(error)
                 continue
-            if not self.media.begin(task["id"], name, reservation):
+            expected_job = task if job_generation(task).get("scene_plan") is False else None
+            if not self.media.begin(task["id"], name, reservation, expected_job=expected_job):
                 self.settings.release(reservation)
                 return
 
@@ -427,35 +538,26 @@ class StudioProduction:
         if job is None:
             return
         tasks = self.media.job_tasks(job["id"])
-        scenes = json.loads(job["plan_json"])
-        clips = {task["scene_id"]: self.root / task["local_path"] for task in tasks if task["kind"] == "video"}
-        voices = {}
-        for scene in scenes:
-            lines = sorted((task for task in tasks if task["kind"] == "voice" and task["scene_id"] == scene["scene_id"]),
-                           key=lambda task: task["line_index"])
-            if lines:
-                paths = [self.root / line["local_path"] for line in lines]
-                voices[scene["scene_id"]] = paths if scene.get("dialogue_lines") else paths[0]
+        generation = job_generation(job)
+        direct = generation.get("scene_plan") is False
         preview = Path(str(job["id"])) / f"preview.{uuid4().hex}.mp4"
-        music = self.store.path.parent / "music.mp3"
         try:
-            presets = self._job_profile(job).get("render_presets", {})
-            kwargs = {"music_path": music if music.is_file() else None}
-            if "audio" in presets:
-                niche = job["niche_id"] or "kids_3d"
-                audio = presets["audio"]
-                kwargs = {f"{kind}_path": self.library.audio_path(niche, audio[kind]) if kind in audio else None
-                          for kind in ("music", "sfx")}
-            if "subtitle" in presets:
-                kwargs["subtitle_style"] = presets["subtitle"]
-            render_video(scenes, clips, voices, self.root / preview, **kwargs)
+            if direct:
+                video = next(task for task in tasks if task["kind"] == "video")
+                voice = next((task for task in tasks if task["kind"] == "voice"), None)
+                render_direct_video(
+                    self.root / video["local_path"], self.root / voice["local_path"] if voice else None,
+                    self.root / preview, generation["duration"],
+                )
+            else:
+                self._render_storyboard(job, tasks, preview, generation)
         except (OSError, RuntimeError, ValueError) as error:
             self._update_job(job["id"], "needs_review", str(error))
             return
         with self.store._connection(write=True) as db:
             db.execute(
-                "UPDATE jobs SET status = 'qa_pending', preview_path = ?, stage_error = NULL WHERE id = ?",
-                (preview.as_posix(), job["id"]),
+                "UPDATE jobs SET status = ?, preview_path = ?, stage_error = NULL WHERE id = ?",
+                ("preview_ready" if direct else "qa_pending", preview.as_posix(), job["id"]),
             )
         delivered = self.posts.delivered_preview_paths(job["id"])
         for previous in (self.root / preview.parent).glob("preview.*"):
@@ -466,6 +568,30 @@ class StudioProduction:
                     previous.unlink(missing_ok=True)
                 except OSError:
                     logging.warning("Could not remove superseded preview file %s", previous)
+
+    def _render_storyboard(self, job, tasks, preview, generation):
+        scenes = json.loads(job["plan_json"])
+        clips = {task["scene_id"]: self.root / task["local_path"] for task in tasks if task["kind"] == "video"}
+        voices = {}
+        for scene in scenes:
+            lines = sorted((task for task in tasks if task["kind"] == "voice" and task["scene_id"] == scene["scene_id"]),
+                           key=lambda task: task["line_index"])
+            if lines:
+                paths = [self.root / line["local_path"] for line in lines]
+                voices[scene["scene_id"]] = paths if scene.get("dialogue_lines") else paths[0]
+        music = self.store.path.parent / "music.mp3"
+        presets = self._job_profile(job).get("render_presets", {})
+        kwargs = {"music_path": music if music.is_file() else None}
+        if "audio" in presets:
+            niche = job["niche_id"] or "kids_3d"
+            audio = presets["audio"]
+            kwargs = {f"{kind}_path": self.library.audio_path(niche, audio[kind]) if kind in audio else None
+                      for kind in ("music", "sfx")}
+        if "subtitle" in presets:
+            kwargs["subtitle_style"] = presets["subtitle"]
+        if not generation.get("separate_voice", True):
+            kwargs["native_audio"] = True
+        render_video(scenes, clips, voices, self.root / preview, **kwargs)
 
     def _review(self, now, *, job_id=None):
         if job_id is None:

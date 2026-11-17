@@ -348,6 +348,12 @@ CREATE TABLE IF NOT EXISTS schedule_generation_options (
     schedule_id INTEGER PRIMARY KEY REFERENCES prompt_schedules(id) ON DELETE CASCADE,
     auto_approve_keyframes INTEGER NOT NULL CHECK (auto_approve_keyframes IN (0, 1))
 );
+CREATE TABLE IF NOT EXISTS video_generation_settings (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    scene_plan INTEGER NOT NULL CHECK (scene_plan IN (0, 1)),
+    separate_voice INTEGER NOT NULL CHECK (separate_voice IN (0, 1))
+);
+INSERT OR IGNORE INTO video_generation_settings VALUES (1, 0, 0);
 """
 
 
@@ -360,7 +366,8 @@ SELECT prompt_schedules.*, (
     WHERE schedule_entries.schedule_id = prompt_schedules.id
         AND publishing_requests.draft = 0
         AND publishing_requests.status IN ('scheduled', 'published')
-) AS publish_at, COALESCE(schedule_generation_options.auto_approve_keyframes, 0) AS auto_approve_keyframes
+) AS publish_at, COALESCE(schedule_generation_options.auto_approve_keyframes, 0) AS auto_approve_keyframes,
+    schedule_generation_options.production_options_json
 FROM prompt_schedules LEFT JOIN schedule_generation_options
     ON schedule_generation_options.schedule_id = prompt_schedules.id
 """
@@ -433,6 +440,10 @@ class StudioStore:
             # Older Studio builds can still open this database and ignore these warnings.
             _apply_schema(db, PROVIDER_WARNINGS_SCHEMA)
             _apply_schema(db, POST_DRAFTS_SCHEMA)
+            if "production_options_json" not in {row["name"] for row in db.execute("PRAGMA table_info(schedule_generation_options)")}:
+                db.execute("ALTER TABLE schedule_generation_options ADD COLUMN production_options_json TEXT")
+            if "requested" not in {row["name"] for row in db.execute("PRAGMA table_info(post_drafts)")}:
+                db.execute("ALTER TABLE post_drafts ADD COLUMN requested INTEGER NOT NULL DEFAULT 0 CHECK (requested IN (0, 1))")
             if "release_url" not in {row["name"] for row in db.execute("PRAGMA table_info(publishing_requests)")}:
                 db.execute("ALTER TABLE publishing_requests ADD COLUMN release_url TEXT")
 
@@ -494,7 +505,7 @@ class StudioStore:
                 (title, prompt, source, brand_id),
             ).lastrowid
 
-    def create_direct_job(self, prompt, title=None, brand_id=None, source="direct"):
+    def create_direct_job(self, prompt, title=None, brand_id=None, source="direct", *, production_options=None):
         prompt = _clean_prompt(prompt)
         title = (title or "").strip() or _prompt_title(prompt)
         if brand_id is not None:
@@ -507,9 +518,9 @@ class StudioStore:
                 """,
                 (title, prompt, source, brand_id),
             ).lastrowid
-            production_options = {}
+            production_options = dict(production_options or {})
             if brand_id:
-                production_options = {"presets": {"brand": brand_id}}
+                production_options["presets"] = {**production_options.get("presets", {}), "brand": brand_id}
             job_id = db.execute(
                 """
                 INSERT INTO jobs (niche_id, title, prompt, source, idea_id, production_options_json)
@@ -519,7 +530,7 @@ class StudioStore:
             ).lastrowid
             return job_id
 
-    def decide_idea(self, idea_id, decision):
+    def decide_idea(self, idea_id, decision, *, production_options=None):
         statuses = {"accept": "accepted", "reject": "rejected", "later": "later"}
         if decision not in statuses:
             raise ValueError("Choose Accept, Reject, or Later.")
@@ -538,9 +549,9 @@ class StudioStore:
 
             db.execute("UPDATE ideas SET status = ? WHERE id = ?", (status, idea_id))
             if status == "accepted":
-                production_options = {}
+                production_options = dict(production_options or {})
                 if idea["brand_id"]:
-                    production_options = {"presets": {"brand": idea["brand_id"]}}
+                    production_options["presets"] = {**production_options.get("presets", {}), "brand": idea["brand_id"]}
                 db.execute(
                     """
                     INSERT INTO jobs (niche_id, title, prompt, source, idea_id, production_options_json)
@@ -817,7 +828,7 @@ class StudioStore:
             db.execute("DELETE FROM brand_profiles WHERE niche_id = ? AND id = ?", (niche_id, brand_id))
 
     def create_schedule(self, prompts, start_date, run_at, timezone, daily_limit, *, title=None, brand_id=None,
-                        auto_approve_keyframes=False):
+                        auto_approve_keyframes=False, production_options=None):
         if not isinstance(prompts, (list, tuple)) or not prompts:
             raise ValueError("Enter at least one prompt.")
         if len(prompts) > 100:
@@ -861,17 +872,19 @@ class StudioStore:
                 "INSERT INTO schedule_entries (schedule_id, prompt) VALUES (?, ?)",
                 [(schedule_id, prompt) for prompt in prompts],
             )
-            self._save_schedule_generation(db, schedule_id, auto_approve_keyframes)
+            self._save_schedule_generation(db, schedule_id, auto_approve_keyframes, production_options)
             return schedule_id
 
     @staticmethod
-    def _save_schedule_generation(db, schedule_id, auto_approve_keyframes):
+    def _save_schedule_generation(db, schedule_id, auto_approve_keyframes, production_options=None):
         if type(auto_approve_keyframes) is not bool:
             raise ValueError("Choose whether to automatically approve keyframes after visual QA.")
         db.execute(
-            """INSERT INTO schedule_generation_options (schedule_id, auto_approve_keyframes) VALUES (?, ?)
-            ON CONFLICT (schedule_id) DO UPDATE SET auto_approve_keyframes = excluded.auto_approve_keyframes""",
-            (schedule_id, auto_approve_keyframes),
+            """INSERT INTO schedule_generation_options (schedule_id, auto_approve_keyframes, production_options_json)
+            VALUES (?, ?, ?) ON CONFLICT (schedule_id) DO UPDATE SET
+                auto_approve_keyframes = excluded.auto_approve_keyframes,
+                production_options_json = COALESCE(excluded.production_options_json, production_options_json)""",
+            (schedule_id, auto_approve_keyframes, json.dumps(production_options) if production_options is not None else None),
         )
 
     def list_schedules(self, *, include_deleted=False):
@@ -890,6 +903,9 @@ class StudioStore:
             schedules = [dict(row) for row in db.execute(query, parameters)]
             for schedule in schedules:
                 schedule["auto_approve_keyframes"] = bool(schedule["auto_approve_keyframes"])
+                options = json.loads(schedule.pop("production_options_json") or "{}")
+                schedule["generation"] = options.get("generation")
+                schedule["characters"] = options.get("characters", [])
                 schedule["entries"] = [
                     dict(row)
                     for row in db.execute(
@@ -1028,7 +1044,9 @@ class StudioStore:
         with self._connection(write=True) as db:
             schedules = db.execute(
                 """
-                SELECT * FROM prompt_schedules
+                SELECT prompt_schedules.*, schedule_generation_options.production_options_json
+                FROM prompt_schedules LEFT JOIN schedule_generation_options
+                    ON schedule_generation_options.schedule_id = prompt_schedules.id
                 WHERE status = 'active' AND rejected_at IS NULL AND deleted_at IS NULL
                 """
             ).fetchall()
@@ -1060,6 +1078,9 @@ class StudioStore:
                     """,
                     (schedule["id"], available),
                 ).fetchall()
+                production_options = json.loads(schedule["production_options_json"] or "{}")
+                if schedule["brand_id"]:
+                    production_options["presets"] = {**production_options.get("presets", {}), "brand": schedule["brand_id"]}
                 db.executemany(
                     """
                     INSERT INTO jobs
@@ -1070,7 +1091,7 @@ class StudioStore:
                         (
                             schedule["niche_id"], _prompt_title(entry["prompt"]),
                             entry["prompt"], entry["id"], today,
-                            json.dumps({"presets": {"brand": schedule["brand_id"]}}) if schedule["brand_id"] else "{}",
+                            json.dumps(production_options),
                         )
                         for entry in entries
                     ],

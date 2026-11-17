@@ -374,6 +374,8 @@ video { max-width: 22rem; }
 .asset-references img { aspect-ratio: 1; object-fit: contain; }
 .asset-references figcaption { overflow-wrap: anywhere; }
 .production-options fieldset { min-width: 0; margin: 0; border: 1px solid var(--border); border-radius: .5rem; }
+.generation-fields fieldset { min-width: 0; margin: 0; border: 1px solid var(--border); border-radius: .5rem; }
+#video-generation { margin-bottom: 1rem; }
 .dialogue-lines { padding-left: 1.25rem; }
 
 .character-toolbar, .character-search {
