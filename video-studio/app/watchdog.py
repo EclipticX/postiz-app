@@ -2,6 +2,8 @@
 
 import re
 
+from app.settings import PROVIDER_WARNING_MESSAGES, provider_blockers
+
 
 _LIMIT_PER_SOURCE = 25
 _ISSUE_QUERIES = {
@@ -35,35 +37,37 @@ _ISSUE_QUERIES = {
 
 # Stored errors can include provider output, local paths, or subprocess stderr.
 # Only known application messages and constrained HTTP codes are safe to repeat here.
-_SAFE_REASONS = {
+_BLOCK_REASONS = {
+    "Configure an eligible provider and budget in Settings.",
+    "Daily budget is unset or has insufficient funds.",
+    "Enable a Scripting provider with vision for visual QA.",
+    "Enable Claude and add an API key in Settings.",
+    "Enable Postiz and add its API key in Settings.",
+    "Per-video budget is unset or has insufficient funds.",
+    "Restore the key for the submitted provider to resume polling.",
+    "Set Claude's estimated cost per request in Settings.",
+    PROVIDER_WARNING_MESSAGES["access_denied"],
+    PROVIDER_WARNING_MESSAGES["invalid_credential"],
+}
+_SAFE_REASONS = _BLOCK_REASONS | set(PROVIDER_WARNING_MESSAGES.values()) | {
     "Claude returned invalid visual QA results.",
     "Claude returned an idea without a title or prompt.",
     "Claude must return between one and ten ideas.",
-    "Configure a valid API key for this provider.",
-    "Configure an eligible provider and budget in Settings.",
-    "Daily budget is unset or has insufficient funds.",
-    "Enable Claude and add an API key in Settings.",
     "Install ffmpeg and make it available on PATH",
     "Install ffprobe and make it available on PATH",
     "Install faster-whisper to generate local narration subtitles",
     "Local Whisper could not align the narration. Check the model and audio file",
-    "Per-video budget is unset or has insufficient funds.",
     "Postiz analytics are temporarily unavailable.",
     "Postiz denied access. Check the API key and channel permissions.",
     "Postiz did not confirm creation. Check Postiz before retrying.",
     "Postiz did not confirm the post ID. Check Postiz before retrying.",
     "Postiz did not return a usable response.",
     "Postiz rate limit reached. Try again later.",
-    "Provider account has insufficient credit.",
     "Provider connection failed.",
-    "Provider denied access. Check the API key and model permissions.",
-    "Provider rate limit reached.",
     "Provider returned an unexpected response.",
     "Provider returned invalid JSON.",
     "Provider submission was interrupted. Check its status before starting a new attempt.",
     "Publishing was interrupted. Check Postiz for the post before trying again.",
-    "Restore the key for the submitted provider to resume polling.",
-    "Set Claude's estimated cost per request in Settings.",
     "Set STUDIO_WHISPER_MODEL_PATH to an existing local faster-whisper model directory",
     "Studio restarted during a provider call. Review its status before resubmitting.",
     "Studio restarted during visual QA. Review the saved preview.",
@@ -75,7 +79,11 @@ _HTTP_REASON = re.compile(
     r"(?:Provider service unavailable|Provider rejected the request|Postiz rejected the request|"
     r"Provider media download returned) (?:\(HTTP [1-5][0-9]{2}\)|HTTP [1-5][0-9]{2})\."
 )
-_ROUTE_REASON = re.compile(r"Configure an eligible (?:keyframe|video|voice) route and rate in Settings\.")
+_ROUTE_REASON = re.compile(
+    r"(?:Configure an eligible (?:keyframe|video|voice) route and rate in Settings\.|"
+    r"No provider accepted this (?:keyframe|video|voice) request\. "
+    r"Check provider access, account credit, or rate limits in Providers\.)"
+)
 _FALLBACK_REASONS = {
     "Idea generation": "The idea generation request recorded an error.",
     "Scene planning": "The scene planner recorded an error. Review the video job.",
@@ -103,12 +111,16 @@ def _issue_from_row(prefix, row):
     item = row["item"]
     if prefix == "media" and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", row["scene_id"]):
         item += f" · scene {row['scene_id']}"
+    reason = _reason(row["error"], row["source"])
+    status = row["status"]
+    if status != "needs_review" and (reason in _BLOCK_REASONS or _ROUTE_REASON.fullmatch(reason)):
+        status = "blocked"
     return {
         "id": f"{prefix}-{row['id']}",
         "source": row["source"],
         "item": item,
-        "status": row["status"],
-        "reason": _reason(row["error"], row["source"]),
+        "status": status,
+        "reason": reason,
         "attempts": row["attempts"],
         "occurred_at": None,
         "origin_url": f"/workspace?job={job_id}" if job_id is not None else "/",
@@ -118,22 +130,26 @@ def _issue_from_row(prefix, row):
 
 def _provider_issues(settings):
     for provider in settings.list_providers():
-        if not provider["enabled"]:
+        blockers = provider_blockers(provider)
+        if "disabled" in blockers:
             continue
         reasons = []
-        if not provider["configured"]:
+        if "needs_key" in blockers:
             reasons.append("An API key is required.")
-        if provider["type"] != "publishing" and provider["rate_micros"] <= 0:
+        if "needs_rate" in blockers:
             reasons.append("An estimated rate greater than zero is required.")
+        warning = PROVIDER_WARNING_MESSAGES.get(provider.get("warning_code"))
+        if warning:
+            reasons.append(warning)
         if reasons:
             yield {
                 "id": f"provider-{provider['name']}",
-                "source": "Provider configuration",
+                "source": "Provider runtime" if warning else "Provider configuration",
                 "item": provider["name"],
-                "status": "blocked",
+                "status": "warning",
                 "reason": " ".join(reasons),
                 "attempts": None,
-                "occurred_at": None,
+                "occurred_at": provider.get("warning_at") if warning else None,
                 "origin_url": "/providers",
                 "origin_label": "Open Providers",
             }

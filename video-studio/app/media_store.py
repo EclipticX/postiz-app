@@ -192,13 +192,14 @@ class MediaStore:
                 (ready, task["job_id"], active),
             )
 
-    def problem(self, task_id, message, status):
+    def problem(self, task_id, message, status, *, release_reservation=False):
         if status not in ("queued", "failed", "needs_review"):
             raise ValueError("Unknown media failure status.")
         with self.store._connection(write=True) as db:
             task = db.execute(
                 """
-                SELECT media_tasks.job_id, media_tasks.attempts, jobs.status AS job_status
+                SELECT media_tasks.job_id, media_tasks.attempts, media_tasks.reservation_id,
+                    media_tasks.status, jobs.status AS job_status
                 FROM media_tasks JOIN jobs ON jobs.id = media_tasks.job_id
                 WHERE media_tasks.id = ? AND media_tasks.status IN ('submitting', 'pending')
                 """,
@@ -206,6 +207,14 @@ class MediaStore:
             ).fetchone()
             if task is None:
                 raise ValueError("This task is not in progress.")
+            if release_reservation:
+                released = db.execute(
+                    """UPDATE spend_reservations SET status = 'released'
+                        WHERE id = ? AND status = 'reserved' AND ? = 'submitting'""",
+                    (task["reservation_id"], task["status"]),
+                )
+                if not released.rowcount:
+                    raise ValueError("This submission has no pending reservation to release.")
             if status == "queued" and (
                 task["attempts"] >= MAX_MEDIA_ATTEMPTS or task["job_status"] not in ACTIVE_JOB_STATUSES
             ):
@@ -225,6 +234,7 @@ class MediaStore:
                     "UPDATE jobs SET status = ?, stage_error = ? WHERE id = ? AND status IN (?, ?)",
                     (status, message, task["job_id"], *ACTIVE_JOB_STATUSES),
                 )
+            return status
 
     def blocked(self, task_id, message):
         with self.store._connection(write=True) as db:

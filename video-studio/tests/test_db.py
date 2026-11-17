@@ -15,6 +15,9 @@ from app.db import (
     StudioStore,
     _apply_schema,
 )
+from app.media_store import MediaStore
+from app.publishing_store import PublishingStore
+from app.settings import StudioSettings
 
 
 class StudioStoreTests(unittest.TestCase):
@@ -344,6 +347,124 @@ class StudioStoreTests(unittest.TestCase):
         job = self.store.get_job(job["id"])
         self.assertEqual(job["title"], "Newer Title")
         self.assertEqual(job["prompt"], "Even newer prompt")
+
+    def test_renaming_preserves_pending_provider_task_and_blocks_prompt_changes(self):
+        prompt = "Original prompt\nSecond line"
+        submitted_prompt = "Original prompt\r\nSecond line"
+        job_id = self.store.create_direct_job(prompt, brand_id="original")
+        idea_id = self.store.get_job(job_id)["idea_id"]
+        settings = StudioSettings(self.store, self.path.with_name(".env"))
+        settings.seed()
+        settings.set_budgets(100, 100)
+        now = datetime(2026, 11, 9, 3, tzinfo=timezone.utc)
+        reservation = settings.reserve(job_id, "fal-veo", 10, now)
+        media = MediaStore(self.store)
+        with self.store._connection(write=True) as db:
+            db.execute(
+                """UPDATE jobs SET status = 'making_media', plan_json = '[]',
+                    production_options_json = ? WHERE id = ?""",
+                (json.dumps({"presets": {"brand": "workspace_override"}}), job_id),
+            )
+            db.execute(
+                """INSERT INTO media_tasks (job_id, scene_id, kind, status, attempts, provider_name,
+                    provider_task_id, reservation_id) VALUES (?, 'scene-1', 'video', 'pending', 1,
+                    'fal-veo', 'provider-task', ?)""",
+                (job_id, reservation),
+            )
+
+        task, = media.job_tasks(job_id)
+        original_job = self.store.get_job(job_id)
+        self.store.update_idea(idea_id, submitted_prompt, title="Inbox title", brand_id="original")
+        self.assertEqual(self.store.get_job(job_id), dict(original_job, title="Inbox title"))
+        self.store.update_job_content(job_id, submitted_prompt, title="Workspace title")
+        self.assertEqual(self.store.get_job(job_id), dict(original_job, title="Workspace title"))
+        original_idea = self.store.get_idea(idea_id)
+        self.assertEqual(original_idea["title"], "Workspace title")
+        self.assertEqual(original_idea["prompt"], prompt)
+
+        with self.assertRaises(ValueError):
+            self.store.update_idea(idea_id, submitted_prompt, brand_id="another")
+        with self.assertRaises(ValueError):
+            self.store.update_job_content(job_id, "Refined prompt")
+        self.assertEqual(self.store.get_idea(idea_id), original_idea)
+        self.assertEqual(self.store.get_job(job_id), dict(original_job, title="Workspace title"))
+        self.assertEqual(media.job_tasks(job_id), [task])
+        with self.store._connection() as db:
+            status = db.execute("SELECT status FROM spend_reservations WHERE id = ?", (reservation,)).fetchone()
+            self.assertEqual(status["status"], "reserved")
+
+    def test_renaming_preserves_ready_preview_and_handoff(self):
+        job_id = self.store.create_direct_job("Original prompt")
+        idea_id = self.store.get_job(job_id)["idea_id"]
+        with self.store._connection(write=True) as db:
+            db.execute(
+                """UPDATE jobs SET status = 'preview_ready', plan_json = '[]',
+                    preview_path = 'preview.mp4', qa_json = '{"score": 95}' WHERE id = ?""",
+                (job_id,),
+            )
+        posts = PublishingStore(self.store)
+        posts.queue(job_id, {"id": "channel", "identifier": "youtube"}, "Approved title", "", [], None, draft=True)
+        original_handoff, = posts.job_posts(job_id)
+        original_job = self.store.get_job(job_id)
+
+        self.store.update_idea(idea_id, "Original prompt", title="Inbox title")
+        self.assertEqual(self.store.get_job(job_id), dict(original_job, title="Inbox title"))
+        self.store.update_job_content(job_id, "Original prompt", title="Workspace title")
+        self.assertEqual(self.store.get_job(job_id), dict(original_job, title="Workspace title"))
+
+        with self.assertRaises(ValueError):
+            self.store.update_idea(idea_id, "Refined prompt")
+        with self.assertRaises(ValueError):
+            self.store.update_job_content(job_id, "Refined prompt")
+        self.assertEqual(self.store.get_job(job_id), dict(original_job, title="Workspace title"))
+        self.assertEqual(self.store.get_idea(idea_id)["prompt"], "Original prompt")
+        self.assertEqual(posts.job_posts(job_id), [original_handoff])
+
+    def test_content_edits_wait_for_claimed_production_steps(self):
+        job_id = self.store.create_direct_job("Original prompt", brand_id="original")
+        idea_id = self.store.get_job(job_id)["idea_id"]
+        for status in ("planning", "rendering", "qa_running"):
+            with self.subTest(status=status):
+                with self.store._connection(write=True) as db:
+                    db.execute("UPDATE jobs SET status = ? WHERE id = ?", (status, job_id))
+                original_job = self.store.get_job(job_id)
+                original_idea = self.store.get_idea(idea_id)
+                with self.assertRaises(ValueError):
+                    self.store.update_idea(idea_id, "Original prompt", brand_id="refined")
+                with self.assertRaises(ValueError):
+                    self.store.update_job_content(job_id, "Refined prompt")
+                self.assertEqual(self.store.get_job(job_id), original_job)
+                self.assertEqual(self.store.get_idea(idea_id), original_idea)
+
+    def test_brand_and_prompt_changes_replan_ready_job(self):
+        for field in ("brand", "prompt"):
+            with self.subTest(field=field):
+                job_id = self.store.create_direct_job("Original prompt", brand_id="original")
+                idea_id = self.store.get_job(job_id)["idea_id"]
+                with self.store._connection(write=True) as db:
+                    db.execute(
+                        """UPDATE jobs SET status = 'preview_ready', plan_json = '[]',
+                            preview_path = 'preview.mp4' WHERE id = ?""",
+                        (job_id,),
+                    )
+
+                expected_prompt, expected_brand = "Original prompt", "original"
+                if field == "brand":
+                    expected_brand = "refined"
+                    self.store.update_idea(idea_id, expected_prompt, brand_id=expected_brand)
+                else:
+                    expected_prompt = "Refined prompt"
+                    self.store.update_job_content(job_id, expected_prompt)
+
+                job = self.store.get_job(job_id)
+                idea = self.store.get_idea(idea_id)
+                self.assertEqual(job["status"], "queued")
+                self.assertIsNone(job["plan_json"])
+                self.assertIsNone(job["preview_path"])
+                self.assertEqual(job["prompt"], expected_prompt)
+                self.assertEqual(idea["prompt"], expected_prompt)
+                self.assertEqual(json.loads(job["production_options_json"])["presets"]["brand"], expected_brand)
+                self.assertEqual(idea["brand_id"], expected_brand)
 
     def test_idea_pause_and_resume_job(self):
         idea_id = self.store.add_idea("Job pause prompt", title="Pause Test")

@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from app.db import StudioStore
 from app.media_store import scene_revision
@@ -119,6 +119,14 @@ class ProductionTests(unittest.TestCase):
         media.complete(frame["id"], path)
         self.assertEqual(self.store.get_job(self.job)["status"], "review_keyframes")
         self.assertEqual(media.tasks(), [])
+
+    def prepare_animation_task(self):
+        media = self.production.media
+        media.queue_keyframes()
+        frame, = media.tasks()
+        self.complete_scene_keyframe(frame["scene_id"])
+        media.approve_keyframes(self.job)
+        return next(task for task in media.tasks() if task["kind"] == "video")
 
     def test_scene_visual_edit_preserves_other_media_and_requires_fresh_keyframe_approval(self):
         scene, second_scene = self.prepare_scene_edit()
@@ -264,6 +272,83 @@ class ProductionTests(unittest.TestCase):
         self.assertEqual(updated["status"], "queued")
         self.assertEqual(updated["revision_feedback"], "Use a slower camera.")
         self.assertIsNone(updated["preview_path"])
+
+    def test_access_rejection_releases_spend_and_falls_back_without_losing_warning(self):
+        task = self.prepare_animation_task()
+        self.settings.set_budgets(500, 500)
+        primary = Mock()
+        primary.submit.side_effect = ProviderError("Access denied", retryable=True, warning_code="access_denied")
+        fallback = Mock()
+        fallback.submit.return_value = ProviderResult("pending", task_id="fallback-task")
+        fallback.poll.return_value = ProviderResult("completed", url="https://fixture.example/file")
+        adapters = {"fal-veo": primary, "evolink-seedance": fallback}
+
+        with patch("app.production.adapter_for", side_effect=lambda route, key: adapters[route["name"]]) as adapter_for, \
+                patch("app.production.local_image", return_value=FRAME), \
+                patch("app.production.download_artifact", side_effect=lambda url, path, kind: self.write_fixture(path)):
+            self.production._process(task, NOW)
+            pending = next(row for row in self.production.media.tasks() if row["id"] == task["id"])
+            self.assertEqual((pending["status"], pending["provider_name"], pending["attempts"]),
+                             ("pending", "evolink-seedance", 2))
+            self.settings.update_platform_categories("EVOLINK_API_KEY", [])
+            self.production._process(pending, NOW)
+
+        self.assertEqual([call.args[0]["name"] for call in adapter_for.call_args_list],
+                         ["fal-veo", "evolink-seedance", "evolink-seedance"])
+        fallback.poll.assert_called_once_with("fallback-task")
+        self.assertEqual(
+            next(route for route in self.settings.list_providers() if route["name"] == "fal-veo")["warning_code"],
+            "access_denied",
+        )
+        with self.store._connection() as db:
+            reservations = db.execute(
+                "SELECT provider_name, status FROM spend_reservations WHERE job_id = ? ORDER BY id", (self.job,),
+            ).fetchall()
+        self.assertEqual([tuple(row) for row in reservations], [
+            ("fal-nano-banana-pro", "settled"), ("fal-veo", "released"), ("evolink-seedance", "settled"),
+        ])
+
+    def test_uncertain_video_submission_does_not_fall_back(self):
+        task = self.prepare_animation_task()
+        primary = Mock()
+        primary.submit.side_effect = ProviderError("Provider connection failed.", uncertain=True)
+        with patch("app.production.adapter_for", return_value=primary) as adapter_for, \
+                patch("app.production.local_image", return_value=FRAME):
+            self.production._process(task, NOW)
+
+        adapter_for.assert_called_once()
+        self.assertEqual(adapter_for.call_args.args[0]["name"], "fal-veo")
+        failed = next(row for row in self.production.media.job_tasks(self.job) if row["id"] == task["id"])
+        self.assertEqual((failed["status"], failed["attempts"]), ("needs_review", 1))
+        self.assertEqual(self.store.get_job(self.job)["status"], "needs_review")
+
+    def test_rejected_animation_routes_report_blocking_reason_at_attempt_limit(self):
+        task = self.prepare_animation_task()
+        adapter = Mock()
+        adapter.submit.side_effect = ProviderError("Access denied", retryable=True, warning_code="access_denied")
+        reason = "No provider accepted this video request. Check provider access, account credit, or rate limits in Providers."
+        with patch("app.production.adapter_for", return_value=adapter), patch("app.production.local_image", return_value=FRAME):
+            self.production._process(task, NOW)
+            queued = next(row for row in self.production.media.tasks() if row["id"] == task["id"])
+            self.assertEqual((queued["attempts"], queued["error"]), (2, reason))
+            self.production._process(queued, NOW)
+
+        self.assertEqual(adapter.submit.call_count, 3)
+        failed = next(row for row in self.production.media.job_tasks(self.job) if row["id"] == task["id"])
+        self.assertEqual((failed["status"], failed["attempts"], failed["error"]), ("failed", 3, reason))
+        self.assertEqual(self.store.get_job(self.job)["stage_error"], reason)
+
+    def test_missing_animation_routes_block_without_using_a_submission_attempt(self):
+        task = self.prepare_animation_task()
+        self.settings.update_platform_categories("FAL_KEY", ["character", "audio"])
+        self.settings.set_key("EVOLINK_API_KEY", None)
+        with patch("app.production.adapter_for") as adapter_for, patch("app.production.local_image", return_value=FRAME):
+            self.production._process(task, NOW)
+
+        adapter_for.assert_not_called()
+        blocked = next(row for row in self.production.media.tasks() if row["id"] == task["id"])
+        self.assertEqual(blocked["attempts"], 0)
+        self.assertEqual(blocked["error"], "Configure an eligible video route and rate in Settings.")
 
     def test_qa_rotates_past_budget_blocked_jobs_and_retries_them(self):
         for prompt in ("Another garden scene", "A garden scene with room in its budget"):

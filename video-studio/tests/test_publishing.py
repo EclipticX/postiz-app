@@ -71,6 +71,29 @@ class PublishingFlowTests(unittest.TestCase):
             self.assertEqual(client.upload.call_count, 4)
             self.assertTrue(all(post["status"] == "draft" for post in self.publishing.posts.job_posts(self.job)))
 
+    def test_disabled_publishing_category_holds_approved_post_until_reenabled(self):
+        self.set_preview()
+        settings = self.publishing.settings
+        with patch("app.publishing.PostizClient") as cls:
+            client = cls.return_value
+            client.channels.return_value = [{"id": "youtube", "identifier": "youtube", "name": "YouTube"}]
+            self.approve("youtube", True)
+            settings.update_platform_categories("POSTIZ_API_KEY", [])
+
+            self.publishing.process(NOW)
+
+            client.upload.assert_not_called()
+            client.create_post.assert_not_called()
+
+            settings.update_platform_categories("POSTIZ_API_KEY", ["publishing"])
+            client.upload.return_value = {"id": "uploaded", "path": "http://localhost/media.mp4"}
+            client.create_post.return_value = "test-post"
+            self.publishing.process(NOW)
+
+            client.create_post.assert_called_once()
+            post, = self.publishing.posts.job_posts(self.job)
+            self.assertEqual(post["status"], "draft")
+
     def test_uncertain_scheduled_handoff_is_never_resubmitted(self):
         self.set_preview()
         with patch("app.publishing.PostizClient") as cls:

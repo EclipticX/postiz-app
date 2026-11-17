@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.providers import ClaudeAdapter, ProviderError, ProviderRequest
 from app.scenes import SCENE_SCHEMA, SceneValidationError, idea_prompt, planner_prompt, validate_scene_plan
+from app.settings import provider_blockers
 from app.studio_library import StudioLibrary
 
 
@@ -63,9 +64,10 @@ class StudioPlanner:
         profile = self.library.profile(options=options)
         prompt = idea_prompt(profile, trends, memory)
 
-        adapter, reservation = self._claude(None, now)
+        adapter, reservation, key = self._claude(None, now)
         try:
-            result = adapter.submit(ProviderRequest(prompt=prompt, output_schema=IDEA_SCHEMA))
+            request = ProviderRequest(prompt=prompt, output_schema=IDEA_SCHEMA)
+            result = self._submit_claude(adapter, key, request, now)
             ideas = self._validated_ideas(result.data)
         except ProviderError as error:
             raise ValueError(str(error)) from None
@@ -129,19 +131,34 @@ class StudioPlanner:
             db.execute("UPDATE jobs SET status = 'needs_review', stage_error = ? WHERE status = 'planning'", (reason,))
             db.execute("UPDATE idea_generation_requests SET status = 'needs_review', error = ? WHERE status = 'generating'", (reason,))
 
-    def _claude(self, job_id, now):
+    def _claude(self, job_id, now, *, vision=False):
         provider = next((row for row in self.settings.list_providers() if row["name"] == CLAUDE_ROUTE), None)
-        key = self.settings.key("ANTHROPIC_API_KEY")
-        if not key or not provider or not provider["enabled"]:
+        blockers = provider_blockers(provider) if provider else ("disabled",)
+        key = self.settings.key(provider["key_env"]) if provider else None
+        if not key or "disabled" in blockers or "needs_key" in blockers:
             raise ValueError("Enable Claude and add an API key in Settings.")
-        if not provider["rate_micros"]:
+        if "needs_rate" in blockers:
             raise ValueError("Set Claude's estimated cost per request in Settings.")
+        if vision and not provider["capabilities"].get("vision"):
+            raise ValueError("Enable a Scripting provider with vision for visual QA.")
         try:
             adapter = self.adapter_factory(key)
         except ProviderError as error:
+            if error.warning_code:
+                self.settings.record_provider_warning(CLAUDE_ROUTE, key, error.warning_code, now)
             raise ValueError(str(error)) from None
         reservation = self.settings.reserve(job_id, CLAUDE_ROUTE, provider["rate_micros"], now)
-        return adapter, reservation
+        return adapter, reservation, key
+
+    def _submit_claude(self, adapter, key, request, now):
+        try:
+            result = adapter.submit(request)
+        except ProviderError as error:
+            if error.warning_code:
+                self.settings.record_provider_warning(CLAUDE_ROUTE, key, error.warning_code, now)
+            raise
+        self.settings.clear_provider_warning(CLAUDE_ROUTE, key)
+        return result
 
     def process_ideas(self, now):
         with self.store._connection(write=True) as db:
@@ -160,13 +177,14 @@ class StudioPlanner:
         profile = self.library.profile(options=options)
         prompt = idea_prompt(profile, request["trends"], memory)
         try:
-            adapter, reservation = self._claude(None, now)
+            adapter, reservation, key = self._claude(None, now)
         except ValueError as error:
             self._update_idea_request(request["id"], "queued", str(error))
             return
 
         try:
-            result = adapter.submit(ProviderRequest(prompt=prompt, output_schema=IDEA_SCHEMA))
+            provider_request = ProviderRequest(prompt=prompt, output_schema=IDEA_SCHEMA)
+            result = self._submit_claude(adapter, key, provider_request, now)
             ideas = self._validated_ideas(result.data)
         except ProviderError as error:
             self._update_idea_request(request["id"], "needs_review" if error.uncertain else "failed", str(error))
@@ -223,7 +241,7 @@ class StudioPlanner:
             if job["revision_feedback"]:
                 prompt_text += "\nRequested revision:\n" + job["revision_feedback"]
             prompt = planner_prompt(profile, prompt_text, TOTAL_DURATION, feedback)
-            adapter, reservation = self._claude(job["id"], now)
+            adapter, reservation, key = self._claude(job["id"], now)
         except ValueError as error:
             with self.store._connection(write=True) as db:
                 db.execute(
@@ -241,7 +259,8 @@ class StudioPlanner:
                 (attempt, json.dumps(profile), job["id"]),
             )
         try:
-            result = adapter.submit(ProviderRequest(prompt=prompt, output_schema=SCENE_SCHEMA))
+            request = ProviderRequest(prompt=prompt, output_schema=SCENE_SCHEMA)
+            result = self._submit_claude(adapter, key, request, now)
             scenes = validate_scene_plan(result.data, profile, TOTAL_DURATION)
         except SceneValidationError as error:
             self._update_plan(

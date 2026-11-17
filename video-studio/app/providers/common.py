@@ -32,11 +32,12 @@ class ProviderResult:
 
 
 class ProviderError(RuntimeError):
-    def __init__(self, message, *, retryable=False, uncertain=False, terminal=False):
+    def __init__(self, message, *, retryable=False, uncertain=False, terminal=False, warning_code=None):
         super().__init__(message)
         self.retryable = retryable
         self.uncertain = uncertain
         self.terminal = terminal
+        self.warning_code = warning_code
 
 
 class ProviderAdapter(Protocol):
@@ -47,7 +48,7 @@ class ProviderAdapter(Protocol):
 
 def credential(api_key):
     if not isinstance(api_key, str) or not api_key or not all(33 <= ord(char) <= 126 for char in api_key):
-        raise ProviderError('Configure a valid API key for this provider.')
+        raise ProviderError('Configure a valid API key for this provider.', warning_code='invalid_credential')
     return api_key
 
 
@@ -127,11 +128,14 @@ def request_json(host, path, headers, payload=None, *, paid_submission=False, ti
 
 def _http_error(status, paid_submission):
     if status in (401, 403):
-        raise ProviderError('Provider denied access. Check the API key and model permissions.', retryable=True)
+        raise ProviderError(
+            'Provider denied access. Check the API key and model permissions.',
+            retryable=True, warning_code='access_denied',
+        )
     if status == 402:
-        raise ProviderError('Provider account has insufficient credit.', retryable=True)
+        raise ProviderError('Provider account has insufficient credit.', retryable=True, warning_code='insufficient_credit')
     if status == 429:
-        raise ProviderError('Provider rate limit reached.', retryable=True)
+        raise ProviderError('Provider rate limit reached.', retryable=True, warning_code='rate_limited')
     if status == 408 or status >= 500:
         raise ProviderError(
             f'Provider service unavailable (HTTP {status}).',

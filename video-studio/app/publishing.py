@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from app.insights import normalize_metrics, update_memory
 from app.postiz_client import PostizClient, PostizError
 from app.publishing_store import PublishingStore
+from app.settings import provider_blockers
 
 
 SCHEDULABLE_CHANNELS = {"youtube"}
@@ -22,9 +23,9 @@ class StudioPublishing:
         self.postiz_url = postiz_url
 
     def _client(self):
-        key = self.settings.key("POSTIZ_API_KEY")
-        enabled = any(route["name"] == "postiz" and route["enabled"] for route in self.settings.list_providers())
-        if not key or not enabled:
+        route = next((route for route in self.settings.list_providers() if route["name"] == "postiz"), None)
+        key = self.settings.key(route["key_env"]) if route and not provider_blockers(route) else None
+        if not key:
             raise ValueError("Enable Postiz and add its API key in Settings.")
         return PostizClient(self.postiz_url, key)
 

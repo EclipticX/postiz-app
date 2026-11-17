@@ -321,7 +321,8 @@ def edit_idea_page(record, csrf_token, *, notice='', brand_profiles=None, values
 
     job_warning = ''
     if record.get('job_id'):
-        job_warning = '<p class="muted"><small>Note: Updating this idea will keep the active video job in sync (or replan if scenes were already generated).</small></p>'
+        job_warning = ('<p class="muted"><small>Title changes preserve video progress. If you change the prompt or brand '
+                       'after planning, Studio starts a new plan and clears the generated media and preview.</small></p>')
 
     content = f'''
     <p class="intro"><a href="/ideas/{int(record['id'])}">Back to idea</a></p>

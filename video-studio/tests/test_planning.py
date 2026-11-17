@@ -77,6 +77,39 @@ class PlanningTests(unittest.TestCase):
         self.assertEqual(ideas[1]["title"], "Idea 2")
         self.assertEqual(ideas[2]["title"], "Idea 3")
 
+    def test_disabled_scripting_category_holds_scene_planning_until_reenabled(self):
+        job_id = self.queue_job()
+        self.settings.update_platform_categories("ANTHROPIC_API_KEY", [])
+
+        self.planner.process_plan(NOW)
+
+        self.assertEqual(self.requests, [])
+        self.assertEqual(self.store.get_job(job_id)["status"], "queued")
+        self.assertEqual(self.store.get_job(job_id)["plan_attempts"], 0)
+
+        self.settings.update_platform_categories("ANTHROPIC_API_KEY", ["scripting"])
+        self.responses = [self.valid_plan()]
+        self.planner.process_plan(NOW)
+
+        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(self.store.get_job(job_id)["status"], "planned")
+
+    def test_claude_rejection_leaves_a_provider_warning_until_access_succeeds(self):
+        self.responses = [
+            ProviderError("Provider denied access.", warning_code="access_denied"),
+            {"ideas": [{"title": "A garden tale", "prompt": "Tavi finds a seed."}]},
+        ]
+
+        with self.assertRaisesRegex(ValueError, "Provider denied access"):
+            self.planner.generate_three_ideas("Garden", now=NOW)
+        provider = next(row for row in self.settings.list_providers() if row["name"] == "claude-sonnet")
+        self.assertEqual(provider["warning_code"], "access_denied")
+
+        self.planner.generate_three_ideas("Garden", now=NOW)
+
+        provider = next(row for row in self.settings.list_providers() if row["name"] == "claude-sonnet")
+        self.assertIsNone(provider["warning_code"])
+
     def test_weekly_schedule_dispatches_only_once_in_local_time(self):
         self.planner.set_idea_schedule(True, "weekly", "09:00", "Asia/Dhaka", 0, "Garden", NOW)
         self.planner.dispatch_idea_schedule(NOW)

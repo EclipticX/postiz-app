@@ -242,7 +242,7 @@ class StudioProduction:
     def _process(self, task, now):
         try:
             if task["status"] == "pending":
-                self._poll(task)
+                self._poll(task, now)
                 return
             request, references = self._request(task)
             routes = eligible_routes(self.settings, task["kind"], request)
@@ -261,33 +261,46 @@ class StudioProduction:
 
     def _submit(self, task, request, routes, now):
         wait_reason = "Configure an eligible provider and budget in Settings."
+        rejected_reason = (
+            f"No provider accepted this {task['kind']} request. "
+            "Check provider access, account credit, or rate limits in Providers."
+        )
         for route in routes:
+            name = route["name"]
             key = self.settings.key(route["key_env"])
             if not key:
                 continue
             try:
                 adapter = adapter_for(route, key)
                 reservation = self.settings.reserve(
-                    task["job_id"], route["name"], estimated_micros(route, request), now,
+                    task["job_id"], name, estimated_micros(route, request), now,
                 )
             except (ValueError, ProviderError) as error:
+                if isinstance(error, ProviderError):
+                    self._record_provider_warning(name, key, error, now)
                 wait_reason = str(error)
                 continue
-            if not self.media.begin(task["id"], route["name"], reservation):
+            if not self.media.begin(task["id"], name, reservation):
                 self.settings.release(reservation)
                 return
 
-            task = dict(task, provider_name=route["name"], reservation_id=reservation, attempts=task["attempts"] + 1)
+            task = dict(task, provider_name=name, reservation_id=reservation, attempts=task["attempts"] + 1)
             try:
                 result = adapter.submit(request)
             except ProviderError as error:
-                self._provider_failure(task, error)
+                rejected = error.warning_code is not None and error.retryable and not error.uncertain and not error.terminal
+                status = self._provider_failure(task, error, rejection_reason=rejected_reason if rejected else None)
+                self._record_provider_warning(name, key, error, now)
+                if rejected and status == "queued":
+                    wait_reason = rejected_reason
+                    continue
                 return
             self._result(task, result)
+            self.settings.clear_provider_warning(name, key)
             return
         self.media.blocked(task["id"], wait_reason)
 
-    def _poll(self, task):
+    def _poll(self, task, now):
         route = next((row for row in self.settings.list_providers() if row["name"] == task["provider_name"]), None)
         key = self.settings.key(route["key_env"]) if route else None
         if not key:
@@ -296,22 +309,31 @@ class StudioProduction:
         try:
             result = adapter_for(route, key).poll(task["provider_task_id"])
         except ProviderError as error:
+            self._record_provider_warning(route["name"], key, error, now)
             if error.terminal:
                 self._provider_failure(task, error)
             else:
                 self.media.blocked(task["id"], str(error))
             return
         self._result(task, result)
+        self.settings.clear_provider_warning(route["name"], key)
 
-    def _provider_failure(self, task, error):
-        self.settings.settle(task["reservation_id"])
+    def _record_provider_warning(self, name, key, error, now):
+        if error.warning_code:
+            self.settings.record_provider_warning(name, key, error.warning_code, now)
+
+    def _provider_failure(self, task, error, *, rejection_reason=None):
+        if rejection_reason is None:
+            self.settings.settle(task["reservation_id"])
         if error.uncertain:
             status = "needs_review"
         elif error.retryable and task["attempts"] < MAX_ATTEMPTS:
             status = "queued"
         else:
             status = "failed"
-        self.media.problem(task["id"], str(error), status)
+        return self.media.problem(
+            task["id"], rejection_reason or str(error), status, release_reservation=rejection_reason is not None,
+        )
 
     def _result(self, task, result):
         if result.task_id and not task["provider_task_id"]:
@@ -403,7 +425,7 @@ class StudioProduction:
         if job is None:
             return
         try:
-            adapter, reservation = self.planner._claude(job["id"], now)
+            adapter, reservation, key = self.planner._claude(job["id"], now, vision=True)
         except ValueError as error:
             self._update_job(job["id"], "qa_pending", str(error))
             return
@@ -424,7 +446,7 @@ class StudioProduction:
                 + tuple(local_image(frame) for frame in frames), output_schema=QA_SCHEMA,
             )
             submitted = True
-            result = adapter.submit(request)
+            result = self.planner._submit_claude(adapter, key, request, now)
             qa = result.data
             if (not isinstance(qa, dict) or qa.get("decision") not in {"pass", "review", "retry"}
                     or type(qa.get("score")) is not int or not 0 <= qa["score"] <= 100

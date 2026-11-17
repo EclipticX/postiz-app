@@ -218,18 +218,28 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
-  // Shortcut from missing key banner to specific API key input
+  const platformDropdown = document.querySelector('[data-platform-dropdown]');
+  const openAddPlatformBtn = document.getElementById('open-add-platform-dialog');
+
+  // Shortcut from a missing key to its input or the Add platform dialog.
   const addKeyButtons = document.querySelectorAll('[data-switch-to-key]');
   addKeyButtons.forEach(btn => {
     btn.addEventListener('click', (e) => {
       e.preventDefault();
       const keyName = btn.getAttribute('data-switch-to-key');
-      switchTab('api-keys', 'key-input-' + keyName);
+      const inputId = 'key-input-' + keyName;
+      if (document.getElementById(inputId)) {
+        switchTab('api-keys', inputId);
+      } else if (openAddPlatformBtn && platformDropdown) {
+        switchTab('api-keys');
+        platformDropdown.value = keyName;
+        platformDropdown.dispatchEvent(new Event('change'));
+        openAddPlatformBtn.click();
+      }
     });
   });
 
   // Custom platform fields toggle in Add Platform form
-  const platformDropdown = document.querySelector('[data-platform-dropdown]');
   if (platformDropdown) {
     platformDropdown.addEventListener('change', () => {
       const customFields = document.getElementById('custom-platform-inputs');
@@ -245,6 +255,7 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
+  let savingCategories = false;
   // Delegated click handler for remove platform, remove key, disable provider, and close dialog
   document.addEventListener('click', (e) => {
     // 1. Remove platform trigger
@@ -297,24 +308,22 @@ document.addEventListener('DOMContentLoaded', () => {
     const catPill = e.target.closest('[data-toggle-cat]');
     if (catPill) {
       e.preventDefault();
+      if (savingCategories) return;
       const platform = catPill.getAttribute('data-platform');
       const catId = catPill.getAttribute('data-toggle-cat');
-      const catTitle = catPill.getAttribute('data-cat-title') || catId;
       const pillsRow = catPill.closest('[data-platform-pills]');
-
-      const wasActive = catPill.classList.contains('active');
-      const nowActive = !wasActive;
-      catPill.classList.toggle('active', nowActive);
-      catPill.setAttribute('aria-pressed', nowActive ? 'true' : 'false');
-      catPill.textContent = (nowActive ? '✓ ' : '') + catTitle;
-
       if (pillsRow && platform) {
-        const activeButtons = pillsRow.querySelectorAll('.category-pill.active');
-        const activeCats = Array.from(activeButtons).map(b => b.getAttribute('data-toggle-cat'));
-
+        const activeCats = Array.from(pillsRow.querySelectorAll('.category-pill.active'))
+          .filter(button => button !== catPill)
+          .map(button => button.getAttribute('data-toggle-cat'));
+        if (!catPill.classList.contains('active')) activeCats.push(catId);
+        const error = pillsRow.parentElement.querySelector('[data-category-error]');
         const csrfInput = document.querySelector('input[name="csrf_token"]');
         const csrfToken = csrfInput ? csrfInput.value : '';
 
+        savingCategories = true;
+        catPill.disabled = true;
+        if (error) error.hidden = true;
         fetch('/settings/platforms/categories', {
           method: 'POST',
           headers: {
@@ -327,8 +336,13 @@ document.addEventListener('DOMContentLoaded', () => {
             categories: activeCats.join(','),
             tab: 'api-keys'
           })
-        }).catch(err => {
-          console.error('Failed to save category preference', err);
+        }).then(response => {
+          if (!response.ok) throw new Error('Could not save categories');
+          window.location.reload();
+        }).catch(() => {
+          savingCategories = false;
+          catPill.disabled = false;
+          if (error) error.hidden = false;
         });
       }
       return;
@@ -387,7 +401,6 @@ document.addEventListener('DOMContentLoaded', () => {
   setTimeout(blurActiveElement, 50);
 
   // Open Add Platform Dialog
-  const openAddPlatformBtn = document.getElementById('open-add-platform-dialog');
   const addPlatformDialog = document.getElementById('add-platform-dialog');
   if (openAddPlatformBtn && addPlatformDialog) {
     openAddPlatformBtn.addEventListener('click', () => {

@@ -314,6 +314,15 @@ PRAGMA user_version = 8;
 """
 
 
+PROVIDER_WARNINGS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS provider_warnings (
+    provider_name TEXT PRIMARY KEY REFERENCES providers(name),
+    code TEXT NOT NULL,
+    occurred_at TEXT NOT NULL
+);
+"""
+
+
 IDEA_RECORDS = """
 SELECT ideas.*, jobs.id AS job_id, jobs.status AS job_status, (
     SELECT MIN(scheduled_at) FROM publishing_requests
@@ -359,6 +368,11 @@ def _clean_prompt(prompt):
     return prompt.strip()
 
 
+def _same_prompt(first, second):
+    # Browser textarea submissions use CRLF, including for prompts stored with LF.
+    return first.replace("\r\n", "\n").replace("\r", "\n") == second.replace("\r\n", "\n").replace("\r", "\n")
+
+
 class StudioStore:
     def __init__(self, path):
         self.path = Path(path)
@@ -395,6 +409,8 @@ class StudioStore:
                 _apply_schema(db, BRAND_SCHEMA)
             if version < 8:
                 _apply_schema(db, LIFECYCLE_SCHEMA)
+            # Older Studio builds can still open this database and ignore these warnings.
+            _apply_schema(db, PROVIDER_WARNINGS_SCHEMA)
 
     def seed_niche(self, profile):
         with self._connection(write=True) as db:
@@ -520,37 +536,23 @@ class StudioStore:
                 raise LookupError("Idea not found.")
             if idea["deleted_at"]:
                 raise ValueError("Restore this idea before editing it.")
-            db.execute(
-                "UPDATE ideas SET title = ?, prompt = ?, brand_id = ? WHERE id = ?",
-                (title, prompt, brand_id, idea_id),
-            )
             job = db.execute("SELECT * FROM jobs WHERE idea_id = ?", (idea_id,)).fetchone()
             if job:
-                opts = json.loads(job["production_options_json"] or "{}")
-                if brand_id:
-                    opts.setdefault("presets", {})["brand"] = brand_id
-                elif "presets" in opts and "brand" in opts["presets"]:
-                    del opts["presets"]["brand"]
-
-                if job["status"] in ("queued", "paused"):
-                    db.execute(
-                        "UPDATE jobs SET title = ?, prompt = ?, production_options_json = ? WHERE id = ?",
-                        (title, prompt, json.dumps(opts), job["id"]),
-                    )
-                else:
-                    db.execute(
-                        "UPDATE spend_reservations SET status = 'released' WHERE job_id = ? AND status = 'reserved'",
-                        (job["id"],),
-                    )
-                    db.execute("DELETE FROM media_tasks WHERE job_id = ?", (job["id"],))
-                    db.execute(
-                        """UPDATE jobs SET title = ?, prompt = ?, status = 'queued', plan_json = NULL,
-                           plan_attempts = 0, plan_feedback = NULL, stage_error = NULL,
-                           preview_path = NULL, qa_json = NULL, revision_feedback = 'Prompt updated',
-                           production_context_json = NULL, production_options_json = ?
-                           WHERE id = ?""",
-                        (title, prompt, json.dumps(opts), job["id"]),
-                    )
+                options_json = None
+                if brand_id != idea["brand_id"]:
+                    options = json.loads(job["production_options_json"])
+                    presets = options.setdefault("presets", {})
+                    if brand_id != presets.get("brand"):
+                        if brand_id:
+                            presets["brand"] = brand_id
+                        else:
+                            presets.pop("brand", None)
+                        options_json = json.dumps(options)
+                self._save_job_edit(db, job, title, prompt, options_json)
+            db.execute(
+                "UPDATE ideas SET title = ?, prompt = ?, brand_id = ? WHERE id = ?",
+                (title, idea["prompt"] if _same_prompt(idea["prompt"], prompt) else prompt, brand_id, idea_id),
+            )
 
     def pause_idea_job(self, idea_id):
         with self._connection(write=True) as db:
@@ -604,32 +606,40 @@ class StudioStore:
             job = db.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
             if not job:
                 raise LookupError("Video job not found.")
-            if db.execute(
-                "SELECT 1 FROM media_tasks WHERE job_id = ? AND status IN ('submitting', 'pending')", (job_id,),
-            ).fetchone():
-                raise ValueError("Wait for the submitted provider tasks to finish before updating.")
-            if db.execute(
-                "SELECT 1 FROM publishing_requests WHERE job_id = ? AND status IN ('queued', 'sending')", (job_id,),
-            ).fetchone():
-                raise ValueError("Wait for the approved Postiz handoff to finish before updating.")
-
-            if job["status"] in ("queued", "paused"):
-                db.execute("UPDATE jobs SET title = ?, prompt = ? WHERE id = ?", (title, prompt, job_id))
-            else:
-                db.execute(
-                    "UPDATE spend_reservations SET status = 'released' WHERE job_id = ? AND status = 'reserved'",
-                    (job_id,),
-                )
-                db.execute("DELETE FROM media_tasks WHERE job_id = ?", (job_id,))
-                db.execute(
-                    """UPDATE jobs SET title = ?, prompt = ?, status = 'queued', plan_json = NULL,
-                        plan_attempts = 0, plan_feedback = NULL, stage_error = NULL,
-                        preview_path = NULL, qa_json = NULL, revision_feedback = 'Prompt updated',
-                        production_context_json = NULL WHERE id = ?""",
-                    (title, prompt, job_id),
-                )
+            saved_prompt = self._save_job_edit(db, job, title, prompt)
             if job["idea_id"]:
-                db.execute("UPDATE ideas SET title = ?, prompt = ? WHERE id = ?", (title, prompt, job["idea_id"]))
+                db.execute(
+                    "UPDATE ideas SET title = ?, prompt = ? WHERE id = ?", (title, saved_prompt, job["idea_id"]),
+                )
+
+    @staticmethod
+    def _save_job_edit(db, job, title, prompt, options_json=None):
+        job_id = job["id"]
+        if _same_prompt(job["prompt"], prompt) and options_json is None:
+            db.execute("UPDATE jobs SET title = ? WHERE id = ?", (title, job_id))
+            return job["prompt"]
+
+        if job["status"] in ("planning", "rendering", "qa_running"):
+            raise ValueError("Wait for the current production step to finish before changing the prompt or brand.")
+        if db.execute(
+            "SELECT 1 FROM media_tasks WHERE job_id = ? AND status IN ('submitting', 'pending')", (job_id,),
+        ).fetchone():
+            raise ValueError("Wait for the submitted provider tasks to finish before changing the prompt or brand.")
+        if db.execute(
+            "SELECT 1 FROM publishing_requests WHERE job_id = ? AND status IN ('queued', 'sending')", (job_id,),
+        ).fetchone():
+            raise ValueError("Wait for the approved Postiz handoff to finish before changing the prompt or brand.")
+
+        db.execute("DELETE FROM media_tasks WHERE job_id = ?", (job_id,))
+        db.execute(
+            """UPDATE jobs SET title = ?, prompt = ?, status = ?, plan_json = NULL,
+                plan_attempts = 0, plan_feedback = NULL, stage_error = NULL,
+                preview_path = NULL, qa_json = NULL, revision_feedback = NULL,
+                production_context_json = NULL, production_options_json = COALESCE(?, production_options_json)
+                WHERE id = ?""",
+            (title, prompt, "paused" if job["status"] == "paused" else "queued", options_json, job_id),
+        )
+        return prompt
 
     def delete_job(self, job_id):
         with self._connection(write=True) as db:

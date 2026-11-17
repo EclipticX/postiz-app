@@ -13,6 +13,8 @@ from app.db import StudioStore
 from app.niche import load_profile
 from app.publishing_store import PublishingStore
 from app.server import StudioServer, run_schedule_clock
+from app.settings import StudioSettings
+from app.settings_view import providers_page
 from test_asset_library import REQUIRES_FFMPEG, png, wav
 
 
@@ -48,6 +50,54 @@ class StudioScheduleClockTests(unittest.TestCase):
             run_schedule_clock(server, stopped)
 
         server.publishing.process.assert_called_once_with(after)
+
+
+class StudioProvidersViewTests(unittest.TestCase):
+    def test_rendered_animation_run_order_and_cards_follow_shared_checks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = StudioStore(root / "studio.sqlite3")
+            store.initialize()
+            settings = StudioSettings(store, root / ".env")
+            settings.seed()
+            settings.set_key("FAL_KEY", "fal-fixture-key")
+            settings.set_key("EVOLINK_API_KEY", "evolink-fixture-key")
+            settings.update_provider("evolink-seedance", True, 20, 10)
+
+            def render():
+                return providers_page(
+                    settings.list_providers(), "csrf", active_tab="animation",
+                    platforms_info=settings.list_platforms(), configured_keys=settings.configured_keys(),
+                )
+
+            html = render()
+            self.assertIn('Animation <span class="providers-tab-badge badge-active">1</span>', html)
+            self.assertIn("<li>1. evolink-seedance</li>", html)
+            self.assertNotIn("<li>1. fal-veo</li>", html)
+            self.assertIn("Needs rate", html)
+
+            settings.update_provider("fal-veo", True, 10, 10)
+            html = render()
+            self.assertIn("<li>1. fal-veo</li><li>2. evolink-seedance</li>", html)
+            settings.record_provider_warning(
+                "fal-veo", "fal-fixture-key", "access_denied", datetime.now(timezone.utc),
+            )
+            html = render()
+            self.assertIn("<li>1. evolink-seedance</li><li>2. fal-veo</li>", html)
+            self.assertIn("Provider denied access.", html)
+            self.assertNotIn("fal-fixture-key", html)
+
+            settings.update_platform_categories("FAL_KEY", [])
+            html = render()
+            self.assertNotIn("<li>2. fal-veo</li>", html)
+            self.assertNotIn("Provider denied access.", html)
+            self.assertIn('data-platform="FAL_KEY" aria-pressed="false"', html)
+            self.assertNotIn('data-platform="FAL_KEY" aria-pressed="true"', html)
+
+            settings.remove_platform("EVOLINK_API_KEY")
+            html = render()
+            self.assertIn('data-switch-to-key="EVOLINK_API_KEY">Add platform', html)
+            self.assertNotIn('id="key-input-EVOLINK_API_KEY"', html)
 
 
 class StudioHTTPTest(unittest.TestCase):

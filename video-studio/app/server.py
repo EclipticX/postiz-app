@@ -295,13 +295,10 @@ class StudioHandler(BaseHTTPRequestHandler):
 
     def _show_providers(self, status=HTTPStatus.OK, notice="", tab=""):
         platforms_info = self.server.settings.list_platforms()
-        active_platforms = platforms_info[0]
-        raw_keys = {name: (self.server.settings.key(name) or "") for name in active_platforms}
         self._reply(status, providers_page(
             self.server.settings.list_providers(), self.server.csrf_token, notice, active_tab=tab,
             platforms_info=platforms_info,
             configured_keys=self.server.settings.configured_keys(),
-            raw_keys=raw_keys,
         ))
 
     def _show_character(self, asset_id=None, *, edit=False, status=HTTPStatus.OK, notice="", values=None):

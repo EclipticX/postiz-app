@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from app.db import SCHEMA, StudioStore
-from app.settings import StudioSettings
+from app.settings import StudioSettings, provider_blockers, provider_order
 
 
 class StudioSettingsTests(unittest.TestCase):
@@ -65,6 +65,48 @@ class StudioSettingsTests(unittest.TestCase):
             second.result()
         self.assertEqual(self.settings.key("FAL_KEY"), "first-test-key")
         self.assertEqual(self.settings.key("EVOLINK_API_KEY"), "second-test-key")
+
+    def test_platform_category_overrides_apply_per_route_and_survive_reopen(self):
+        self.settings.set_key("FAL_KEY", "fal-fixture")
+        self.settings.set_key("EVOLINK_API_KEY", "evolink-fixture")
+        self.settings.update_provider("fal-veo", True, 10, 100)
+        self.settings.update_provider("evolink-seedance", True, 20, 100)
+        self.assertEqual(provider_blockers(self.provider("fal-nano-banana-pro")), ("needs_rate",))
+        self.assertEqual(provider_blockers(self.provider("fal-veo")), ())
+
+        self.settings.update_platform_categories("FAL_KEY", ["character"])
+        self.assertEqual(provider_blockers(self.provider("fal-veo")), ("disabled",))
+        self.assertEqual(provider_blockers(self.provider("fal-nano-banana-pro")), ("needs_rate",))
+        self.assertEqual(provider_blockers(self.provider("evolink-seedance")), ())
+
+        self.settings.update_platform_categories("EVOLINK_API_KEY", [])
+        self.settings = StudioSettings(StudioStore(self.path), self.env_path)
+        self.assertEqual(self.settings.list_platforms()[2]["EVOLINK_API_KEY"], [])
+        self.assertEqual(provider_blockers(self.provider("evolink-seedance")), ("disabled",))
+
+    def test_provider_warning_lifecycle_is_route_specific_and_ignores_replaced_keys(self):
+        first_key = "first-fal-fixture"
+        now = datetime(2026, 11, 9, 3, tzinfo=timezone.utc)
+        self.settings.set_key("FAL_KEY", first_key)
+        self.settings.set_key("EVOLINK_API_KEY", "evolink-fixture")
+        self.settings.record_provider_warning("fal-veo", first_key, "access_denied", now)
+        self.settings.record_provider_warning("fal-veo", first_key, "access_denied", now + timedelta(minutes=1))
+
+        self.store.initialize()
+        self.assertEqual(self.provider("fal-veo")["warning_code"], "access_denied")
+        self.assertEqual(self.provider("fal-veo")["warning_at"], (now + timedelta(minutes=1)).isoformat())
+        self.assertIsNone(self.provider("fal-kling")["warning_code"])
+        self.assertLess(provider_order(self.provider("evolink-seedance")), provider_order(self.provider("fal-veo")))
+        self.assertNotIn(first_key.encode(), self.path.read_bytes())
+
+        self.settings.set_key("FAL_KEY", "replacement-fal-fixture")
+        self.settings.record_provider_warning("fal-veo", first_key, "access_denied", now)
+        self.assertIsNone(self.provider("fal-veo")["warning_code"])
+        self.settings.record_provider_warning("fal-veo", "replacement-fal-fixture", "rate_limited", now)
+        self.settings.clear_provider_warning("fal-veo", first_key)
+        self.assertEqual(self.provider("fal-veo")["warning_code"], "rate_limited")
+        self.settings.clear_provider_warning("fal-veo", "replacement-fal-fixture")
+        self.assertIsNone(self.provider("fal-veo")["warning_code"])
 
     def test_invalid_key_or_provider_does_not_change_settings(self):
         with self.assertRaises(ValueError):
@@ -138,6 +180,19 @@ class StudioSettingsTests(unittest.TestCase):
             self.assertIsNotNone(db.execute("SELECT COUNT(*) FROM idea_generation_requests").fetchone())
         old_settings = StudioSettings(old_store, self.env_path)
         self.assertEqual(old_settings.get_budgets(), {"daily_micros": 0, "video_micros": 0})
+
+    def test_warning_table_adds_support_to_an_existing_v8_database(self):
+        self.settings.set_key("FAL_KEY", "fal-fixture")
+        self.settings.update_provider("fal-veo", True, 5, 200)
+        job = self.new_job()
+        with self.store._connection(write=True) as db:
+            db.execute("DROP TABLE provider_warnings")
+        self.store.initialize()
+        self.store.initialize()
+        self.assertEqual(self.provider("fal-veo")["rate_micros"], 200)
+        self.assertEqual(self.provider("fal-veo")["priority"], 5)
+        self.assertIsNone(self.provider("fal-veo")["warning_code"])
+        self.assertIsNotNone(self.store.get_job(job))
 
 
 if __name__ == "__main__":

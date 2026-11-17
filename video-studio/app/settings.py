@@ -210,6 +210,44 @@ KNOWN_PLATFORMS = {
 }
 
 KEY_NAMES = {provider[2] for provider in DEFAULT_PROVIDERS} | set(KNOWN_PLATFORMS.keys())
+PROVIDER_CATEGORIES = {
+    "llm": "scripting",
+    "image": "character",
+    "video": "animation",
+    "tts": "audio",
+    "publishing": "publishing",
+}
+PROVIDER_WARNING_MESSAGES = {
+    "access_denied": "Provider denied access. Check the API key and model permissions.",
+    "invalid_credential": "Configure a valid API key for this provider.",
+    "insufficient_credit": "Provider account has insufficient credit.",
+    "rate_limited": "Provider rate limit reached.",
+}
+
+
+def provider_blockers(provider):
+    """Configuration checks shared by the provider list and new requests."""
+    if not provider["enabled"] or not provider.get("category_enabled", True):
+        return ("disabled",)
+    blockers = []
+    if not provider["configured"]:
+        blockers.append("needs_key")
+    if provider["type"] != "publishing" and provider["rate_micros"] <= 0:
+        blockers.append("needs_rate")
+    return tuple(blockers)
+
+
+def provider_order(provider):
+    denied = provider.get("warning_code") in {"access_denied", "invalid_credential"}
+    return denied, provider["priority"], provider["name"]
+
+
+def active_categories(key_env, metadata, overrides):
+    """A saved empty list explicitly turns every category off."""
+    categories = overrides.get(key_env)
+    if not isinstance(categories, list):
+        categories = metadata.get("active", ())
+    return set(categories) & set(metadata.get("supported", ()))
 
 
 def _check_whole_number(value, label, minimum=0):
@@ -263,19 +301,19 @@ class StudioSettings:
         except FileNotFoundError:
             return []
 
-    def _write_lines(self, lines):
-        self.env_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    def _write_lines(self, path, lines):
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         temp_path = None
         try:
             with NamedTemporaryFile(
-                mode="w", encoding="utf-8", dir=self.env_path.parent, delete=False,
+                mode="w", encoding="utf-8", dir=path.parent, delete=False,
             ) as handle:
                 temp_path = Path(handle.name)
                 os.fchmod(handle.fileno(), 0o600)
                 handle.writelines(f"{line}\n" for line in lines)
                 handle.flush()
                 os.fsync(handle.fileno())
-            temp_path.replace(self.env_path)
+            temp_path.replace(path)
         finally:
             if temp_path is not None:
                 temp_path.unlink(missing_ok=True)
@@ -315,17 +353,27 @@ class StudioSettings:
                 dict(row)
                 for row in db.execute(
                     """
-                    SELECT name, type, key_env, enabled, priority, billing_unit,
-                        rate_micros, capabilities_json
-                    FROM providers ORDER BY type, priority, name
+                    SELECT p.name, p.type, p.key_env, p.enabled, p.priority, p.billing_unit,
+                        p.rate_micros, p.capabilities_json, w.code AS warning_code,
+                        w.occurred_at AS warning_at
+                    FROM providers AS p LEFT JOIN provider_warnings AS w ON w.provider_name = p.name
+                    ORDER BY p.type, p.priority, p.name
                     """
                 )
             ]
-        keys = _key_values(self._read_lines())
+        _, custom, overrides = self.list_platforms()
+        keys = self.configured_keys()
         for provider in providers:
+            key_env = provider["key_env"]
+            metadata = KNOWN_PLATFORMS.get(key_env) or custom.get(key_env)
+            category = PROVIDER_CATEGORIES.get(provider["type"])
             provider["enabled"] = bool(provider["enabled"])
             provider["capabilities"] = json.loads(provider.pop("capabilities_json"))
-            provider["configured"] = provider["key_env"] in keys
+            provider["configured"] = key_env in keys
+            provider["category_enabled"] = metadata is None or category in active_categories(key_env, metadata, overrides)
+            if not provider["configured"]:
+                provider["warning_code"] = None
+                provider["warning_at"] = None
         return providers
 
     @property
@@ -336,76 +384,74 @@ class StudioSettings:
         saved = None
         custom = {}
         categories = {}
-        if self.platforms_path.exists():
-            try:
-                data = json.loads(self.platforms_path.read_text(encoding="utf-8"))
-                saved = data.get("active")
-                custom = data.get("custom", {})
-                categories = data.get("categories", {})
-            except Exception:
-                saved = None
-        if saved is None:
+        try:
+            data = json.loads(self.platforms_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = {}
+        if isinstance(data, dict):
+            saved = data.get("active")
+            if isinstance(data.get("custom"), dict):
+                custom = data["custom"]
+            if isinstance(data.get("categories"), dict):
+                categories = data["categories"]
+        if not isinstance(saved, list):
             saved = list(DEFAULT_ACTIVE_PLATFORMS)
 
+        KEY_NAMES.update(custom)
         configured_keys = _key_values(self._read_lines())
         for k in configured_keys:
             if k not in saved:
                 saved.append(k)
 
-        for k in custom:
-            KEY_NAMES.add(k)
-
         return saved, custom, categories
+
+    def _write_platforms(self, active, custom, categories):
+        contents = json.dumps({"active": active, "custom": custom, "categories": categories}, indent=2)
+        self._write_lines(self.platforms_path, [contents])
 
     def add_platform(self, key_name, name=None, slug=None):
         key_name = key_name.strip().upper()
         if not re.fullmatch(r"[A-Z0-9_]{3,64}", key_name):
             raise ValueError("Platform key must be 3-64 uppercase letters, numbers, or underscores.")
-        active, custom, categories = self.list_platforms()
-        if key_name not in active:
-            active.append(key_name)
-        if key_name not in KNOWN_PLATFORMS and key_name not in custom:
-            custom[key_name] = {
-                "name": name or key_name,
-                "slug": slug or key_name.lower().replace("_api_key", "").replace("_key", ""),
-                "active": ["scripting"],
-                "supported": ["scripting", "character", "animation", "audio", "publishing"],
-            }
-        KEY_NAMES.add(key_name)
-        self.platforms_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        self.platforms_path.write_text(json.dumps({"active": active, "custom": custom, "categories": categories}, indent=2), encoding="utf-8")
+        with self.store._connection(write=True):
+            active, custom, categories = self.list_platforms()
+            if key_name not in active:
+                active.append(key_name)
+            if key_name not in KNOWN_PLATFORMS and key_name not in custom:
+                custom[key_name] = {
+                    "name": name or key_name,
+                    "slug": slug or key_name.lower().replace("_api_key", "").replace("_key", ""),
+                    "active": ["scripting"],
+                    "supported": list(PROVIDER_CATEGORIES.values()),
+                }
+            self._write_platforms(active, custom, categories)
+            KEY_NAMES.add(key_name)
         return key_name
 
     def remove_platform(self, key_name):
         key_name = key_name.strip().upper()
-        active, custom, categories = self.list_platforms()
-        if key_name in active:
-            active.remove(key_name)
-        if key_name in categories:
-            del categories[key_name]
-        self.platforms_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        self.platforms_path.write_text(json.dumps({"active": active, "custom": custom, "categories": categories}, indent=2), encoding="utf-8")
-        if key_name in KEY_NAMES:
-            self.set_key(key_name, None)
+        with self.store._connection(write=True) as db:
+            active, custom, categories = self.list_platforms()
+            if key_name in KEY_NAMES:
+                self._set_key(db, key_name, "")
+            if key_name in active:
+                active.remove(key_name)
+            categories.pop(key_name, None)
+            self._write_platforms(active, custom, categories)
 
     def update_platform_categories(self, key_name, categories):
         key_name = key_name.strip().upper()
-        active, custom, current_categories = self.list_platforms()
-        valid_cats = {"scripting", "character", "animation", "audio", "publishing"}
-        platform_meta = KNOWN_PLATFORMS.get(key_name) or custom.get(key_name, {})
-        supported = set(platform_meta.get("supported", valid_cats))
-        if isinstance(categories, str):
-            raw = [c.strip().lower() for c in categories.split(",")]
-        else:
-            raw = [c.strip().lower() for c in categories]
-        cleaned = [c for c in raw if c in valid_cats and c in supported]
-        current_categories[key_name] = cleaned
-        self.platforms_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        self.platforms_path.write_text(json.dumps({
-            "active": active,
-            "custom": custom,
-            "categories": current_categories
-        }, indent=2), encoding="utf-8")
+        with self.store._connection(write=True):
+            active, custom, current_categories = self.list_platforms()
+            _check_key_name(key_name)
+            valid_cats = set(PROVIDER_CATEGORIES.values())
+            platform_meta = KNOWN_PLATFORMS.get(key_name) or custom.get(key_name, {})
+            supported = set(platform_meta.get("supported", valid_cats)) & valid_cats
+            raw = categories.split(",") if isinstance(categories, str) else categories
+            normalized = (category.strip().lower() for category in raw)
+            cleaned = list(dict.fromkeys(category for category in normalized if category in supported))
+            current_categories[key_name] = cleaned
+            self._write_platforms(active, custom, current_categories)
         return cleaned
 
     def configured_keys(self):
@@ -426,14 +472,39 @@ class StudioSettings:
             raise ValueError("Enter a single-line API key without spaces.")
         # Serialize filesystem edits across Settings instances with the same database.
         with self.store._connection(write=True) as db:
-            lines = [
-                line for line in self._read_lines()
-                if line.partition("=")[0].strip() != key_env
-            ]
-            if value:
-                lines.append(f"{key_env}={json.dumps(value)}")
-                self._enable_defaults(db, key_env)
-            self._write_lines(lines)
+            self._set_key(db, key_env, value)
+
+    def _set_key(self, db, key_env, value):
+        lines = [line for line in self._read_lines() if line.partition("=")[0].strip() != key_env]
+        if value:
+            lines.append(f"{key_env}={json.dumps(value)}")
+            self._enable_defaults(db, key_env)
+        self._write_lines(self.env_path, lines)
+        db.execute(
+            "DELETE FROM provider_warnings WHERE provider_name IN (SELECT name FROM providers WHERE key_env = ?)",
+            (key_env,),
+        )
+
+    def _is_current_key(self, db, provider_name, key):
+        route = db.execute("SELECT key_env FROM providers WHERE name = ?", (provider_name,)).fetchone()
+        return bool(route and key and self.key(route["key_env"]) == key)
+
+    def record_provider_warning(self, provider_name, key, code, now):
+        if code not in PROVIDER_WARNING_MESSAGES:
+            raise ValueError("Unknown provider warning.")
+        with self.store._connection(write=True) as db:
+            if not self._is_current_key(db, provider_name, key):
+                return
+            db.execute(
+                """INSERT INTO provider_warnings (provider_name, code, occurred_at) VALUES (?, ?, ?)
+                ON CONFLICT (provider_name) DO UPDATE SET code = excluded.code, occurred_at = excluded.occurred_at""",
+                (provider_name, code, now.isoformat()),
+            )
+
+    def clear_provider_warning(self, provider_name, key):
+        with self.store._connection(write=True) as db:
+            if self._is_current_key(db, provider_name, key):
+                db.execute("DELETE FROM provider_warnings WHERE provider_name = ?", (provider_name,))
 
     def update_provider(self, name, enabled, priority, rate_micros):
         if type(enabled) is not bool:

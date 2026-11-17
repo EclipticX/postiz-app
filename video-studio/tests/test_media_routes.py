@@ -26,6 +26,7 @@ def _settings():
         {
             'name': name, 'type': kind, 'priority': priority, 'billing_unit': unit,
             'rate_micros': 100, 'enabled': True, 'configured': True, 'capabilities': capabilities,
+            'category_enabled': True, 'warning_code': None,
         }
         for name, kind, _, priority, unit, capabilities in DEFAULT_PROVIDERS
     ]
@@ -59,6 +60,17 @@ class RoutingTests(unittest.TestCase):
         ):
             with self.subTest(request=request):
                 self.assertEqual(eligible_routes(settings, 'video', request), [])
+
+    def test_video_skips_category_disabled_routes_and_prioritizes_other_routes_after_access_denial(self):
+        settings, providers = _settings()
+        request = ProviderRequest('Scene', reference_image='frame', duration=4)
+        providers['fal-veo']['warning_code'] = 'access_denied'
+        providers['fal-kling']['category_enabled'] = False
+        routes = eligible_routes(settings, 'video', request)
+        self.assertEqual([route['name'] for route in routes], ['evolink-seedance', 'fal-veo'])
+        providers['fal-veo']['configured'] = False
+        routes = eligible_routes(settings, 'video', request)
+        self.assertEqual([route['name'] for route in routes], ['evolink-seedance'])
 
     def test_keyframe_and_voice_require_configured_rate_and_capability(self):
         settings, providers = _settings()

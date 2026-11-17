@@ -85,10 +85,50 @@ class StudioWatchDogTests(unittest.TestCase):
         self.assertEqual(set(issues), {"provider-fal-veo", "provider-claude-sonnet"})
         self.assertIn("API key", issues["provider-fal-veo"]["reason"])
         self.assertIn("estimated rate", issues["provider-claude-sonnet"]["reason"])
-        self.assertEqual(issues["provider-fal-veo"]["status"], "blocked")
+        self.assertEqual(issues["provider-fal-veo"]["status"], "warning")
         self.assertNotIn("test-credential", repr(issues))
         self.settings.update_provider("claude-sonnet", True, 10, 10)
         self.assertIsNone(get_issue(self.store, self.settings, "provider-claude-sonnet"))
+
+    def test_runtime_warning_survives_without_a_failed_job_and_updates_in_place(self):
+        key = "test-fal-provider-key"
+        now = datetime(2026, 11, 10, 3, tzinfo=timezone.utc)
+        self.settings.set_key("FAL_KEY", key)
+        for route in self.settings.list_providers():
+            if route["enabled"]:
+                self.settings.update_provider(route["name"], True, route["priority"], 10)
+        self.settings.record_provider_warning("fal-veo", key, "rate_limited", now)
+        self.settings.record_provider_warning("fal-veo", key, "access_denied", now)
+
+        issue, = list_issues(self.store, self.settings)
+        self.assertEqual(issue["id"], "provider-fal-veo")
+        self.assertEqual(issue["status"], "warning")
+        self.assertIn("denied access", issue["reason"])
+        self.assertNotIn(key, repr(issue))
+        self.assertEqual(get_issue(self.store, self.settings, issue["id"]), issue)
+
+        self.settings.update_platform_categories("FAL_KEY", ["character", "audio"])
+        self.assertIsNone(get_issue(self.store, self.settings, issue["id"]))
+        self.settings.update_platform_categories("FAL_KEY", ["character", "audio", "animation"])
+        self.settings.set_key("FAL_KEY", "replacement-fal-key")
+        self.assertIsNone(get_issue(self.store, self.settings, issue["id"]))
+
+    def test_media_setup_issue_displays_blocked_with_job_and_scene(self):
+        job_id = self.make_job()
+        media_id = self.add_failed_media_task(job_id)
+        for status, reason in (
+            ("queued", "Configure an eligible video route and rate in Settings."),
+            ("failed", "No provider accepted this video request. "
+             "Check provider access, account credit, or rate limits in Providers."),
+        ):
+            with self.subTest(status=status):
+                with self.store._connection(write=True) as db:
+                    db.execute("UPDATE media_tasks SET status = ?, error = ? WHERE id = ?", (status, reason, media_id))
+                issue = get_issue(self.store, self.settings, f"media-{media_id}")
+                self.assertEqual(issue["status"], "blocked")
+                self.assertEqual(issue["reason"], reason)
+                self.assertIn("scene scene-1", issue["item"])
+                self.assertEqual(issue["origin_url"], f"/workspace?job={job_id}")
 
     def test_list_is_bounded_but_an_older_issue_can_still_be_opened(self):
         with self.store._connection(write=True) as db:

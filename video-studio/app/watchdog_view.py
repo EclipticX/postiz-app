@@ -28,7 +28,7 @@ def watchdog_page(issues):
     if not rows:
         rows = '<tr><td colspan="5" class="muted">No issues found in the monitored Studio features.</td></tr>'
     return _page('Watch Dog', _ACTIVE, f'''
-    <p class="intro">Review recorded Studio workflow errors and provider configuration blockers.</p>
+    <p class="intro">Review Studio workflow errors and provider warnings.</p>
     <section class="panel">
       <div class="published-table-wrap" role="region" aria-label="Watch Dog issues" tabindex="0">
         <table class="published-table published-list-table watchdog-table" aria-label="Watch Dog issues">

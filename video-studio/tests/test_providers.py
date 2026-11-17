@@ -246,7 +246,14 @@ class ProviderTests(unittest.TestCase):
 
     def test_errors_keep_secrets_and_ambiguous_submissions_out_of_retries(self):
         adapter = FalAdapter(_KEY, 'fal-elevenlabs')
-        for status, retryable, uncertain in ((302, False, False), (429, True, False), (503, False, True)):
+        for status, code, retryable, uncertain in (
+            (302, None, False, False),
+            (401, 'access_denied', True, False),
+            (402, 'insufficient_credit', True, False),
+            (403, 'access_denied', True, False),
+            (429, 'rate_limited', True, False),
+            (503, None, False, True),
+        ):
             with self.subTest(status=status):
                 rejected = response({'error': _KEY}, status)
                 self.connection.getresponse.return_value = rejected
@@ -254,6 +261,7 @@ class ProviderTests(unittest.TestCase):
                     adapter.submit(ProviderRequest('Narrate'))
                 error = caught.exception
                 self.assertEqual((error.retryable, error.uncertain, error.terminal), (retryable, uncertain, False))
+                self.assertEqual(error.warning_code, code)
                 self.assertNotIn(_KEY, str(error))
                 rejected.read.assert_not_called()
         self.connection.getresponse.side_effect = TimeoutError(_KEY)

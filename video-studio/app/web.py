@@ -266,7 +266,8 @@ def workspace_page(
         heading_action = f'<div class="header-actions"><span class="status">{_label(job["status"])}</span>{action_menu_html}</div>'
 
         plan_warning = (
-            '<p class="muted"><small>Note: Updating prompt will reset generated scenes &amp; keyframes to replan from the new prompt.</small></p>'
+            '<p class="muted"><small>Title changes preserve video progress. Changing the prompt starts a new plan '
+            'and clears the generated media and preview.</small></p>'
             if job.get('plan_json') else ''
         )
         edit_dialog = f'''

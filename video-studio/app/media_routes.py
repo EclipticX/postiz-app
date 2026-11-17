@@ -12,6 +12,7 @@ from time import monotonic
 from urllib.parse import urlsplit
 
 from .providers import ClaudeAdapter, EvoLinkAdapter, FalAdapter, ProviderError
+from .settings import provider_blockers, provider_order
 
 
 _KINDS = {'keyframe': ('image', 'image'), 'video': ('video', 'second'), 'voice': ('tts', '1000_characters')}
@@ -26,11 +27,11 @@ def eligible_routes(settings, kind, request, preferred=None):
     providers = [
         provider for provider in settings.list_providers()
         if provider['type'] == provider_type and provider['billing_unit'] == unit
-        and provider['enabled'] and provider['configured'] and provider['rate_micros'] > 0
+        and not provider_blockers(provider)
         and _supports(provider, kind, request)
     ]
     return sorted(providers, key=lambda provider: (
-        provider['name'] != preferred, provider['priority'], provider['name'],
+        provider['name'] != preferred, *provider_order(provider),
     ))
 
 

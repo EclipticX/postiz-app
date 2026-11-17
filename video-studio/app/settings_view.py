@@ -1,6 +1,9 @@
 from decimal import Decimal
 
-from app.settings import DEFAULT_ACTIVE_PLATFORMS, KNOWN_PLATFORMS
+from app.settings import (
+    DEFAULT_ACTIVE_PLATFORMS, KNOWN_PLATFORMS, PROVIDER_WARNING_MESSAGES,
+    active_categories, provider_blockers, provider_order,
+)
 from app.web import _csrf, _page, _text
 
 
@@ -45,13 +48,11 @@ _PLATFORM_META = {
 }
 
 
-def providers_page(providers, csrf_token, notice='', *, active_tab='', platforms_info=None, configured_keys=None, raw_keys=None):
+def providers_page(providers, csrf_token, notice='', *, active_tab='', platforms_info=None, configured_keys=None):
     if configured_keys is None:
         configured_keys = {route['key_env'] for route in providers if route.get('configured')}
     else:
         configured_keys = set(configured_keys)
-    if raw_keys is None:
-        raw_keys = {}
     if platforms_info:
         active_platforms = platforms_info[0]
         custom_platforms = platforms_info[1]
@@ -72,17 +73,19 @@ def providers_page(providers, csrf_token, notice='', *, active_tab='', platforms
     valid_tabs = [cat[0] for cat in _CATEGORIES] + ['api-keys']
     selected_tab = active_tab if active_tab in valid_tabs else 'scripting'
 
-    # Build category tab counts
-    category_counts = {}
-    for cat_id, _, type_set in _CATEGORIES:
-        category_counts[cat_id] = sum(
-            1 for p in providers if p['type'] in type_set and p['enabled'] and p['configured']
+    blockers = {route['name']: provider_blockers(route) for route in providers}
+    run_order = {
+        cat_id: sorted(
+            (route for route in providers if route['type'] in types and not blockers[route['name']]),
+            key=provider_order,
         )
+        for cat_id, _, types in _CATEGORIES
+    }
 
     # Build Navigation Tabs
     nav_buttons = []
     for cat_id, cat_title, _ in _CATEGORIES:
-        count = category_counts[cat_id]
+        count = len(run_order[cat_id])
         active_cls = ' active' if selected_tab == cat_id else ''
         badge_cls = ' badge-active' if count > 0 else ''
         nav_buttons.append(
@@ -106,16 +109,11 @@ def providers_page(providers, csrf_token, notice='', *, active_tab='', platforms
     for cat_id, _, type_set in _CATEGORIES:
         pane_active = ' active' if selected_tab == cat_id else ''
         cat_providers = [p for p in providers if p['type'] in type_set]
-        ready_providers = sorted(
-            [p for p in cat_providers if p['enabled'] and p['configured']],
-            key=lambda x: x['priority']
-        )
-
-        if ready_providers:
-            run_order_items = ''.join(f'<li>{i}. {_text(p["name"])}</li>' for i, p in enumerate(ready_providers, 1))
+        if run_order[cat_id]:
+            run_order_items = ''.join(f'<li>{i}. {_text(p["name"])}</li>' for i, p in enumerate(run_order[cat_id], 1))
             run_order_content = f'<ol class="run-order-list">{run_order_items}</ol>'
         else:
-            run_order_content = '<p class="run-order-empty">No provider is enabled for this category.</p>'
+            run_order_content = '<p class="run-order-empty">No provider is ready for this category.</p>'
 
         run_order_html = f'''
         <div class="run-order-panel">
@@ -125,20 +123,31 @@ def providers_page(providers, csrf_token, notice='', *, active_tab='', platforms
 
         cards_html = []
         for route in cat_providers:
-            if route['configured'] and route['enabled']:
-                badge = '<span class="pill-badge pill-badge-ready">Ready</span>'
-            elif not route['configured']:
-                badge = '<span class="pill-badge pill-badge-needs-key">Needs key</span>'
-            else:
+            route_blockers = blockers[route['name']]
+            warning = PROVIDER_WARNING_MESSAGES.get(route.get('warning_code'))
+            if 'disabled' in route_blockers:
                 badge = '<span class="pill-badge pill-badge-disabled">Disabled</span>'
+            elif 'needs_key' in route_blockers:
+                badge = '<span class="pill-badge pill-badge-needs-key">Needs key</span>'
+            elif 'needs_rate' in route_blockers:
+                badge = '<span class="pill-badge pill-badge-needs-key">Needs rate</span>'
+            elif warning:
+                badge = '<span class="pill-badge pill-badge-needs-key">Warning</span>'
+            else:
+                badge = '<span class="pill-badge pill-badge-ready" title="Access is checked when the provider runs.">Ready</span>'
 
             missing_banner = ''
             if not route['configured']:
+                key_action = 'Add key' if route['key_env'] in active_platforms else 'Add platform'
                 missing_banner = f'''
                 <div class="missing-key-bar">
                   <span class="missing-key-text">{_text(route['key_env'])} is missing.</span>
-                  <button type="button" class="btn-add-key" data-switch-to-key="{_text(route['key_env'])}">Add key</button>
+                  <button type="button" class="btn-add-key" data-switch-to-key="{_text(route['key_env'])}">{key_action}</button>
                 </div>'''
+            warning_note = (
+                f'<p class="orange-warning">{_text(warning)}</p>'
+                if warning and 'disabled' not in route_blockers else ''
+            )
 
             cards_html.append(f'''
             <div class="provider-card">
@@ -147,6 +156,7 @@ def providers_page(providers, csrf_token, notice='', *, active_tab='', platforms
                 {badge}
               </div>
               {missing_banner}
+              {warning_note}
               <form method="post" action="/settings/providers/{_text(route['name'])}">
                 {_csrf(csrf_token)}
                 <input type="hidden" name="tab" value="{cat_id}">
@@ -222,6 +232,7 @@ def providers_page(providers, csrf_token, notice='', *, active_tab='', platforms
     </dialog>'''
 
     key_cards = []
+    registered_keys = {route['key_env'] for route in providers}
     for name in active_platforms:
         configured = name in configured_keys
         meta = dict(all_platforms_catalog.get(name, {
@@ -232,12 +243,8 @@ def providers_page(providers, csrf_token, notice='', *, active_tab='', platforms
             'models': [],
         }))
         supported_cats = set(meta.get('supported', [c[0] for c in _CATEGORIES]))
-        if name in platform_categories:
-            active_cats = set(platform_categories[name]) & supported_cats
-            if not active_cats:
-                active_cats = set(meta.get('active', [])) & supported_cats
-        else:
-            active_cats = set(meta.get('active', [])) & supported_cats
+        active_cats = active_categories(name, meta, platform_categories)
+        key_scope = 'Tick every category it can do' if name in registered_keys else 'Key storage only'
 
         badge = '<span class="pill-badge pill-badge-saved">Key saved</span>' if configured else '<span class="pill-badge pill-badge-needs-key">Key required</span>'
 
@@ -252,10 +259,13 @@ def providers_page(providers, csrf_token, notice='', *, active_tab='', platforms
                 f'<button type="button" class="category-pill{active_cls}" '
                 f'data-toggle-cat="{cat_id}" data-cat-title="{cat_title}" '
                 f'data-platform="{_text(name)}" aria-pressed="{"true" if is_active else "false"}" '
-                f'title="Toggle {cat_title} for {meta["name"]}">'
+                f'title="Toggle {cat_title} for {_text(meta["name"])}">'
                 f'{check_prefix}{cat_title}</button>'
             )
-        category_pills_html = f'<div class="category-pills-row" data-platform-pills="{_text(name)}">{"".join(pills)}</div>'
+        category_pills_html = (
+            f'<div class="category-pills-row" data-platform-pills="{_text(name)}">{"".join(pills)}</div>'
+            '<p class="orange-warning" role="alert" data-category-error hidden>Could not save categories. Try again.</p>'
+        )
 
         model_dropdowns_html = ''
         if meta.get('models'):
@@ -339,7 +349,7 @@ def providers_page(providers, csrf_token, notice='', *, active_tab='', platforms
                     data-platform-title="{_text(meta['name'])}"
                     title="Remove platform from Studio">✕ Remove</button>
           </div>
-          <p class="provider-card-subtitle">{_text(meta['slug'])} · tick every category it can do</p>
+          <p class="provider-card-subtitle">{_text(meta['slug'])} · {key_scope}</p>
           {category_pills_html}
           {model_dropdowns_html}
           <form class="key-form" method="post" action="/settings/keys/{_text(name)}">
